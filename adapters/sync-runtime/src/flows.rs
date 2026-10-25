@@ -92,6 +92,8 @@ pub enum FlowError {
     Sync(GatedSyncError),
     /// The identity gate or a single-message download failed.
     Fetch(GatedFetchError),
+    /// The token refresh this call waited for failed, for the given reason.
+    Refresh(Arc<FlowError>),
 }
 
 impl fmt::Display for FlowError {
@@ -111,6 +113,7 @@ impl fmt::Display for FlowError {
             Self::Session(error) => write!(formatter, "{error}"),
             Self::Sync(error) => write!(formatter, "{error}"),
             Self::Fetch(error) => write!(formatter, "{error}"),
+            Self::Refresh(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -151,7 +154,7 @@ pub struct Runtime {
     hasher: InstallationHasher,
     /// One Gmail session per account, reused until shortly before its access
     /// token expires.
-    sessions: SessionCache<SharedSession, SystemCacheClock>,
+    sessions: SessionCache<SharedSession, Arc<FlowError>, SystemCacheClock>,
 }
 
 impl fmt::Debug for Runtime {
@@ -264,30 +267,18 @@ impl Runtime {
             .await
     }
 
-    /// Runs `work` with the account's session. When Gmail rejects a cached
-    /// access token (it can lapse early, for example across a sleep, or be
-    /// revoked), the session is forgotten and `work` runs once more with a
-    /// fresh token.
+    /// Runs `work` with the account's session; see [`retry_rejected`].
     async fn with_session<R, F, Fut>(&self, account: &AccountId, work: F) -> Result<R, FlowError>
     where
         F: Fn(SharedSession) -> Fut,
         Fut: Future<Output = Result<R, FlowError>>,
     {
-        let (session, origin) = self.session(account).await?;
-        let result = work(session).await;
-        if !needs_authorization(&result) {
-            return result;
-        }
-        self.sessions.forget(account);
-        if origin == Origin::Fresh {
-            return result;
-        }
-        let (session, _origin) = self.session(account).await?;
-        let result = work(session).await;
-        if needs_authorization(&result) {
-            self.sessions.forget(account);
-        }
-        result
+        retry_rejected(
+            || self.session(account),
+            |used: &SharedSession| self.sessions.forget_if(account, |cached| cached.is(used)),
+            work,
+        )
+        .await
     }
 
     /// Refreshes an access token. The broker refreshes one account's token at
@@ -353,20 +344,30 @@ impl Runtime {
     async fn session(&self, account: &AccountId) -> Result<(SharedSession, Origin), FlowError> {
         self.sessions
             .get_or_refresh(account, || async {
-                let subject = self.subject_of(account)?;
-                let token = self.access_token(&subject).await?;
-                let session = GmailSession::new(
-                    account.clone(),
-                    token.access_token(),
-                    Zeroizing::new(token.subject().to_owned()),
-                )
-                .map_err(FlowError::Session)?;
-                Ok((
-                    SharedSession::new(session),
-                    Duration::from_secs(token.expires_in_seconds()),
-                ))
+                self.new_session(account).await.map_err(Arc::new)
             })
             .await
+            .map_err(FlowError::Refresh)
+    }
+
+    /// Refreshes the account's access token into a new session, with the
+    /// token's lifetime.
+    async fn new_session(
+        &self,
+        account: &AccountId,
+    ) -> Result<(SharedSession, Duration), FlowError> {
+        let subject = self.subject_of(account)?;
+        let token = self.access_token(&subject).await?;
+        let session = GmailSession::new(
+            account.clone(),
+            token.access_token(),
+            Zeroizing::new(token.subject().to_owned()),
+        )
+        .map_err(FlowError::Session)?;
+        Ok((
+            SharedSession::new(session),
+            Duration::from_secs(token.expires_in_seconds()),
+        ))
     }
 
     fn subject_of(&self, account: &AccountId) -> Result<Zeroizing<String>, FlowError> {
@@ -391,6 +392,41 @@ impl Runtime {
             .await
             .map_err(FlowError::Sync)
     }
+}
+
+/// Runs `work` with a session from `session`. When Gmail rejects a cached
+/// access token (it can lapse early, for example across a sleep, or be
+/// revoked), that session is forgotten and `work` runs once more with a fresh
+/// one. A freshly refreshed token that is rejected is not retried. `forget`
+/// receives the rejected session, so it can leave a newer one in place.
+async fn retry_rejected<S, R, Get, GetFut, Forget, Work, WorkFut>(
+    session: Get,
+    forget: Forget,
+    work: Work,
+) -> Result<R, FlowError>
+where
+    S: Clone,
+    Get: Fn() -> GetFut,
+    GetFut: Future<Output = Result<(S, Origin), FlowError>>,
+    Forget: Fn(&S),
+    Work: Fn(S) -> WorkFut,
+    WorkFut: Future<Output = Result<R, FlowError>>,
+{
+    let (first, origin) = session().await?;
+    let result = work(first.clone()).await;
+    if !needs_authorization(&result) {
+        return result;
+    }
+    forget(&first);
+    if origin == Origin::Fresh {
+        return result;
+    }
+    let (second, _origin) = session().await?;
+    let result = work(second.clone()).await;
+    if needs_authorization(&result) {
+        forget(&second);
+    }
+    result
 }
 
 /// Whether Gmail rejected the access token.
@@ -427,8 +463,57 @@ mod tests {
     use tersa_application::mailbox::RemoteMailboxError;
     use tersa_application::sync::{SyncFailure, SyncFailureSource};
 
-    use super::{FlowError, default_sync_policy, needs_authorization};
+    use std::cell::RefCell;
+
+    use super::{FlowError, default_sync_policy, needs_authorization, retry_rejected};
     use crate::gate::{GatedFetchError, GatedSyncError};
+    use crate::session_cache::Origin;
+
+    fn rejected() -> FlowError {
+        FlowError::Fetch(GatedFetchError::Remote(
+            RemoteMailboxError::AuthorizationRequired,
+        ))
+    }
+
+    /// What `retry_rejected` did: sessions handed out, forgotten, and used.
+    #[derive(Debug, Default, PartialEq)]
+    struct Calls {
+        issued: Vec<u32>,
+        forgotten: Vec<u32>,
+        worked: Vec<u32>,
+    }
+
+    /// Runs `retry_rejected` with sessions numbered from 1 (the first from
+    /// `first_origin`, later ones fresh) and `outcomes` for each `work` call.
+    fn retry(
+        first_origin: Origin,
+        outcomes: Vec<Result<(), FlowError>>,
+    ) -> (Result<(), FlowError>, Calls) {
+        let calls = RefCell::new(Calls::default());
+        let outcomes = RefCell::new(outcomes);
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(retry_rejected(
+                || {
+                    let mut calls = calls.borrow_mut();
+                    let next = u32::try_from(calls.issued.len()).expect("few calls") + 1;
+                    calls.issued.push(next);
+                    let origin = if next == 1 {
+                        first_origin
+                    } else {
+                        Origin::Fresh
+                    };
+                    std::future::ready(Ok((next, origin)))
+                },
+                |session: &u32| calls.borrow_mut().forgotten.push(*session),
+                |session| {
+                    calls.borrow_mut().worked.push(session);
+                    std::future::ready(outcomes.borrow_mut().remove(0))
+                },
+            ));
+        (result, calls.into_inner())
+    }
 
     #[test]
     fn the_default_policy_is_valid() {
@@ -457,5 +542,62 @@ mod tests {
             FlowError::UnknownAccount
         )));
         assert!(!needs_authorization(&Ok(())));
+    }
+
+    #[test]
+    fn a_rejected_cached_session_is_forgotten_and_retried_once() {
+        let (result, calls) = retry(Origin::Cached, vec![Err(rejected()), Ok(())]);
+        assert!(result.is_ok());
+        assert_eq!(
+            calls,
+            Calls {
+                issued: vec![1, 2],
+                forgotten: vec![1],
+                worked: vec![1, 2],
+            }
+        );
+    }
+
+    #[test]
+    fn a_rejected_fresh_session_is_forgotten_but_not_retried() {
+        let (result, calls) = retry(Origin::Fresh, vec![Err(rejected())]);
+        assert!(needs_authorization(&result));
+        assert_eq!(
+            calls,
+            Calls {
+                issued: vec![1],
+                forgotten: vec![1],
+                worked: vec![1],
+            }
+        );
+    }
+
+    #[test]
+    fn a_second_rejection_forgets_the_new_session_and_stops() {
+        let (result, calls) = retry(Origin::Cached, vec![Err(rejected()), Err(rejected())]);
+        assert!(needs_authorization(&result));
+        assert_eq!(
+            calls,
+            Calls {
+                issued: vec![1, 2],
+                forgotten: vec![1, 2],
+                worked: vec![1, 2],
+            }
+        );
+    }
+
+    #[test]
+    fn other_failures_keep_the_session() {
+        let offline = FlowError::Fetch(GatedFetchError::Remote(RemoteMailboxError::Transport));
+        let (result, calls) = retry(Origin::Cached, vec![Err(offline)]);
+        assert!(matches!(result, Err(FlowError::Fetch(_))));
+        assert_eq!(
+            calls,
+            Calls {
+                issued: vec![1],
+                forgotten: vec![],
+                worked: vec![1],
+            }
+        );
     }
 }

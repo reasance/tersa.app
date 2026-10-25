@@ -6,6 +6,7 @@
 //! access token expires.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -48,16 +49,33 @@ struct Entry<T> {
     wall: SystemTime,
 }
 
-pub(crate) struct SessionCache<T, C> {
+/// One account's refresh turn. The mutex holds the error of the last refresh
+/// when it failed, and `finished` counts completed refreshes, so a caller can
+/// tell whether one ended while it waited.
+struct Gate<E> {
+    turn: tokio::sync::Mutex<Option<E>>,
+    finished: AtomicU64,
+}
+
+impl<E> Default for Gate<E> {
+    fn default() -> Self {
+        Self {
+            turn: tokio::sync::Mutex::new(None),
+            finished: AtomicU64::new(0),
+        }
+    }
+}
+
+pub(crate) struct SessionCache<T, E, C> {
     clock: C,
     /// How long before its expiry a token is replaced.
     margin: Duration,
     entries: Mutex<HashMap<AccountId, Entry<T>>>,
     /// One refresh at a time per account, so concurrent misses share it.
-    refreshing: Mutex<HashMap<AccountId, Arc<tokio::sync::Mutex<()>>>>,
+    refreshing: Mutex<HashMap<AccountId, Arc<Gate<E>>>>,
 }
 
-impl<T: Clone, C: CacheClock> SessionCache<T, C> {
+impl<T: Clone, E: Clone, C: CacheClock> SessionCache<T, E, C> {
     pub(crate) fn new(clock: C, margin: Duration) -> Self {
         Self {
             clock,
@@ -76,8 +94,10 @@ impl<T: Clone, C: CacheClock> SessionCache<T, C> {
 
     /// The cached value, or a new one from `refresh`, which returns it with
     /// its token's lifetime. Concurrent misses for one account wait for a
-    /// single refresh; a failed refresh caches nothing.
-    pub(crate) async fn get_or_refresh<E, F, Fut>(
+    /// single refresh and share its result, failure included, so a token
+    /// endpoint that cannot be reached is not asked once per caller. A failed
+    /// refresh caches nothing; the next caller tries again.
+    pub(crate) async fn get_or_refresh<F, Fut>(
         &self,
         account: &AccountId,
         refresh: F,
@@ -90,14 +110,33 @@ impl<T: Clone, C: CacheClock> SessionCache<T, C> {
             return Ok((value, Origin::Cached));
         }
         let gate = Arc::clone(lock(&self.refreshing).entry(account.clone()).or_default());
-        let _turn = gate.lock().await;
+        let seen = gate.finished.load(Ordering::SeqCst);
+        let mut turn = gate.turn.lock().await;
         if let Some(value) = self.get(account) {
             return Ok((value, Origin::Cached));
+        }
+        if gate.finished.load(Ordering::SeqCst) != seen
+            && let Some(error) = turn.as_ref()
+        {
+            return Err(error.clone());
         }
         // The token's lifetime starts no earlier than this request.
         let monotonic = self.clock.monotonic();
         let wall = self.clock.wall();
-        let (value, lifetime) = refresh().await?;
+        // A refresh dropped half-way counts as not finished: the next caller
+        // in line runs its own.
+        let refreshed = refresh().await;
+        gate.finished.fetch_add(1, Ordering::SeqCst);
+        let (value, lifetime) = match refreshed {
+            Ok(refreshed) => {
+                *turn = None;
+                refreshed
+            }
+            Err(error) => {
+                *turn = Some(error.clone());
+                return Err(error);
+            }
+        };
         let lifetime = lifetime.saturating_sub(self.margin);
         lock(&self.entries).insert(
             account.clone(),
@@ -110,6 +149,19 @@ impl<T: Clone, C: CacheClock> SessionCache<T, C> {
         Ok((value, Origin::Fresh))
     }
 
+    /// Forgets the account's session if `rejected` says it is the one that
+    /// failed. A newer session another caller refreshed in the meantime stays.
+    pub(crate) fn forget_if(&self, account: &AccountId, rejected: impl Fn(&T) -> bool) {
+        let mut entries = lock(&self.entries);
+        if entries
+            .get(account)
+            .is_some_and(|entry| rejected(&entry.value))
+        {
+            entries.remove(account);
+        }
+    }
+
+    /// Forgets the account's session, whichever it is.
     pub(crate) fn forget(&self, account: &AccountId) {
         lock(&self.entries).remove(account);
     }
@@ -175,7 +227,7 @@ mod tests {
     }
 
     /// Hands out 1, 2, 3, … with a one-hour token and counts the calls.
-    fn issue(count: &Cell<u32>) -> impl Future<Output = Result<(u32, Duration), ()>> {
+    fn issue(count: &Cell<u32>) -> impl Future<Output = Result<(u32, Duration), &'static str>> {
         count.set(count.get() + 1);
         std::future::ready(Ok((count.get(), HOUR)))
     }
@@ -267,6 +319,103 @@ mod tests {
                 Ok((1, Origin::Fresh))
             );
         });
+    }
+
+    #[test]
+    fn only_the_rejected_session_is_forgotten() {
+        let cache = SessionCache::new(TestClock::new(), MARGIN);
+        let count = Cell::new(0);
+        let first = account("acct_a");
+        run(async {
+            cache
+                .get_or_refresh(&first, || issue(&count))
+                .await
+                .unwrap();
+            // Another caller already replaced session 1 with session 2.
+            cache.forget(&first);
+            cache
+                .get_or_refresh(&first, || issue(&count))
+                .await
+                .unwrap();
+            cache.forget_if(&first, |cached| *cached == 1);
+            assert_eq!(
+                cache.get_or_refresh(&first, || issue(&count)).await,
+                Ok((2, Origin::Cached)),
+                "a late rejection of session 1 keeps session 2"
+            );
+            cache.forget_if(&first, |cached| *cached == 2);
+            assert_eq!(
+                cache.get_or_refresh(&first, || issue(&count)).await,
+                Ok((3, Origin::Fresh))
+            );
+        });
+    }
+
+    #[test]
+    fn callers_waiting_on_a_failed_refresh_share_its_error() {
+        let cache = Rc::new(SessionCache::new(TestClock::new(), MARGIN));
+        let attempts = Rc::new(Cell::new(0));
+        let results = run(tokio::task::LocalSet::new().run_until(async {
+            let callers: Vec<_> = (0..3)
+                .map(|_| {
+                    let cache = Rc::clone(&cache);
+                    let attempts = Rc::clone(&attempts);
+                    tokio::task::spawn_local(async move {
+                        cache
+                            .get_or_refresh(&account("acct_a"), || async move {
+                                attempts.set(attempts.get() + 1);
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                Err::<(u32, Duration), _>("offline")
+                            })
+                            .await
+                    })
+                })
+                .collect();
+            let mut results = Vec::new();
+            for caller in callers {
+                results.push(caller.await.unwrap());
+            }
+            results
+        }));
+        assert_eq!(attempts.get(), 1, "one refresh for all three callers");
+        assert_eq!(results, [Err("offline"), Err("offline"), Err("offline")]);
+        let count = Cell::new(0);
+        assert_eq!(
+            run(cache.get_or_refresh(&account("acct_a"), || issue(&count))),
+            Ok((1, Origin::Fresh)),
+            "a later caller tries again"
+        );
+    }
+
+    #[test]
+    fn a_dropped_refresh_lets_the_next_caller_try() {
+        let cache = Rc::new(SessionCache::new(TestClock::new(), MARGIN));
+        let count = Rc::new(Cell::new(0));
+        let result = run(tokio::task::LocalSet::new().run_until(async {
+            let leader = {
+                let cache = Rc::clone(&cache);
+                tokio::task::spawn_local(async move {
+                    cache
+                        .get_or_refresh(&account("acct_a"), || async {
+                            std::future::pending::<Result<(u32, Duration), &str>>().await
+                        })
+                        .await
+                })
+            };
+            let waiter = {
+                let cache = Rc::clone(&cache);
+                let count = Rc::clone(&count);
+                tokio::task::spawn_local(async move {
+                    cache
+                        .get_or_refresh(&account("acct_a"), || issue(&count))
+                        .await
+                })
+            };
+            tokio::task::yield_now().await;
+            leader.abort();
+            waiter.await.unwrap()
+        }));
+        assert_eq!(result, Ok((1, Origin::Fresh)));
     }
 
     #[test]

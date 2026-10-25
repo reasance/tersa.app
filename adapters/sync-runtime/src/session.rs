@@ -114,6 +114,13 @@ impl SharedSession {
     pub fn new(session: GmailSession) -> Self {
         Self(Arc::new(session))
     }
+
+    /// Whether both handles share one session, as opposed to two sessions
+    /// for the same account.
+    #[must_use]
+    pub fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl AccountProfile for SharedSession {
