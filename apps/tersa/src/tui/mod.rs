@@ -49,6 +49,21 @@ pub trait Fetcher: Send + 'static {
 /// How often the loop checks for finished downloads while idle.
 const TICK: Duration = Duration::from_millis(100);
 
+/// Checks that standard input and output are a terminal. Callers run it
+/// before unlocking anything, so `tersa > out.txt` fails without asking for a
+/// passphrase.
+///
+/// # Errors
+///
+/// Returns a message when either is not a terminal.
+pub fn require_terminal() -> Result<(), String> {
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        Ok(())
+    } else {
+        Err("the interface needs a terminal; `tersa inbox` prints plain output".to_owned())
+    }
+}
+
 /// Runs the interface until the user quits.
 ///
 /// # Errors
@@ -61,9 +76,7 @@ pub fn run(
     source: &dyn MailSource,
     fetcher: Option<Box<dyn Fetcher>>,
 ) -> Result<(), String> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err("the interface needs a terminal; `tersa inbox` prints plain output".to_owned());
-    }
+    require_terminal()?;
     let mut app = App::new(account, rows);
     let downloads = fetcher.map(Downloads::start);
     // Installs a panic hook that restores the terminal before reporting.
