@@ -693,7 +693,7 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
 
     /// The open message's lines as laid out, before ratatui sees them.
     /// ratatui drops graphemes that hold control characters, so only these
-    /// show whether SafeText removed them.
+    /// show whether `SafeText` removed them.
     fn laid_out(app: &App) -> Vec<String> {
         let crate::tui::app::Screen::Message(view) = &app.screen else {
             panic!("message screen");

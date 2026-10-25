@@ -550,7 +550,7 @@ mod tests {
         assert!(!worker.sync_due(), "a sync was just asked for");
         worker.last_sync = worker
             .last_sync
-            .map(|(monotonic, wall)| (monotonic - SYNC_EVERY, wall));
+            .map(|(monotonic, wall)| (monotonic, wall - SYNC_EVERY));
         assert!(worker.sync_due(), "five minutes later another one is due");
     }
 
