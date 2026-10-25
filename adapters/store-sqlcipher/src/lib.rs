@@ -32,7 +32,8 @@ mod store {
         AccountLifecycleMetadata, AccountLifecycleStore, DisconnectRecoveryState,
     };
     use tersa_application::mailbox::{
-        AccountPurgeStore, BoxFuture, MailboxReader, MailboxStore, MailboxStoreError, StoreLimit,
+        AccountPurgeStore, BoxFuture, EnvelopeCursor, MailboxReader, MailboxStore,
+        MailboxStoreError, StoreLimit,
     };
     use tersa_domain::mailbox::{
         AccountId, HeaderText, Message, MessageContent, MessageEnvelope, MessageId, ThreadId,
@@ -2344,6 +2345,47 @@ mod store {
         Ok(result)
     }
 
+    /// Lists up to `limit` envelopes after `after`, seeking through the
+    /// `messages_list_order` index rather than skipping rows.
+    fn list_envelopes_after(
+        connection: &Connection,
+        after: Option<&EnvelopeCursor>,
+        limit: StoreLimit,
+    ) -> Result<Vec<MessageEnvelope>, MailboxStoreError> {
+        let mut result = Vec::new();
+        let limit = i64::from(limit.get());
+        let mut push_rows = |rows: &mut rusqlite::Rows<'_>| -> Result<(), MailboxStoreError> {
+            while let Some(row) = rows.next().map_err(store_error)? {
+                result.push(envelope_from_row(row)?);
+            }
+            Ok(())
+        };
+        match after {
+            None => {
+                let mut statement = connection
+                    .prepare("SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, CASE WHEN typeof(received_at) = 'integer' THEN received_at END, CASE WHEN typeof(unread) = 'integer' THEN unread END FROM messages ORDER BY received_at DESC, message_id ASC LIMIT ?1")
+                    .map_err(store_error)?;
+                push_rows(&mut statement.query(params![limit]).map_err(store_error)?)?;
+            }
+            Some(cursor) => {
+                // The `<=` bound lets the index seek; the rest breaks ties.
+                let mut statement = connection
+                    .prepare("SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, CASE WHEN typeof(received_at) = 'integer' THEN received_at END, CASE WHEN typeof(unread) = 'integer' THEN unread END FROM messages WHERE received_at <= ?1 AND (received_at < ?1 OR message_id > ?2) ORDER BY received_at DESC, message_id ASC LIMIT ?3")
+                    .map_err(store_error)?;
+                push_rows(
+                    &mut statement
+                        .query(params![
+                            cursor.received_at().as_millis(),
+                            cursor.message_id().as_str(),
+                            limit
+                        ])
+                        .map_err(store_error)?,
+                )?;
+            }
+        }
+        Ok(result)
+    }
+
     impl MailboxStore for SqlCipherMailboxStore {
         fn mark_message_read<'a>(
             &'a self,
@@ -2548,6 +2590,17 @@ mod store {
             Box::pin(async move {
                 self.checked_account(account)?;
                 self.with_connection(|connection| uncached_ids(connection, message_ids))
+            })
+        }
+        fn list_envelopes_after<'a>(
+            &'a self,
+            account: &'a AccountId,
+            after: Option<&'a EnvelopeCursor>,
+            limit: StoreLimit,
+        ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.with_connection(|connection| list_envelopes_after(connection, after, limit))
             })
         }
         fn thread_envelopes<'a>(
@@ -3586,6 +3639,57 @@ mod store {
         )]
         fn assert_corrupted(result: Result<SqlCipherMailboxStore, MailboxStoreError>) {
             assert!(matches!(result, Err(MailboxStoreError::Corrupted)));
+        }
+
+        #[test]
+        fn keyset_pages_list_every_envelope_once_in_order() {
+            let (_database, store) = open("pages");
+            let envelopes: Vec<_> = (0..23)
+                .map(|index| envelope(&format!("m{index:02}"), "thread", i64::from(index / 3)))
+                .collect();
+            run(store.upsert_envelopes(&account(), &envelopes)).unwrap();
+            let expected: Vec<_> =
+                run(store.list_envelopes(&account(), StoreLimit::new(100).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|item| item.message_id().as_str().to_owned())
+                    .collect();
+            let mut paged = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = run(store.list_envelopes_after(
+                    &account(),
+                    cursor.as_ref(),
+                    StoreLimit::new(4).unwrap(),
+                ))
+                .unwrap();
+                let Some(last) = page.last() else { break };
+                cursor = Some(EnvelopeCursor::after(last));
+                paged.extend(
+                    page.iter()
+                        .map(|item| item.message_id().as_str().to_owned()),
+                );
+            }
+            assert_eq!(
+                paged, expected,
+                "ties on the received time are broken by identifier"
+            );
+            assert_eq!(paged.len(), 23);
+
+            let plan: Vec<String> = store
+                .connection
+                .lock()
+                .unwrap()
+                .prepare("EXPLAIN QUERY PLAN SELECT message_id FROM messages WHERE received_at <= 5 AND (received_at < 5 OR message_id > 'm') ORDER BY received_at DESC, message_id ASC LIMIT 4")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(
+                plan.iter().any(|step| step.contains("messages_list_order")),
+                "{plan:?}"
+            );
         }
 
         #[test]

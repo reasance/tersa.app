@@ -119,6 +119,52 @@ impl PageSize {
     }
 }
 
+/// Where a keyset page of envelopes resumes: just after the envelope with
+/// this received time and identifier, in listing order (received time
+/// descending, then identifier ascending).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvelopeCursor {
+    received_at: UnixTimestampMillis,
+    message_id: MessageId,
+}
+
+impl EnvelopeCursor {
+    /// The cursor just after `envelope`.
+    #[must_use]
+    pub fn after(envelope: &MessageEnvelope) -> Self {
+        Self::new(envelope.received_at(), envelope.message_id().clone())
+    }
+
+    /// The cursor just after the envelope with `received_at` and `message_id`.
+    #[must_use]
+    pub fn new(received_at: UnixTimestampMillis, message_id: MessageId) -> Self {
+        Self {
+            received_at,
+            message_id,
+        }
+    }
+
+    /// The received time of the last envelope already listed.
+    #[must_use]
+    pub fn received_at(&self) -> UnixTimestampMillis {
+        self.received_at
+    }
+
+    /// The identifier of the last envelope already listed.
+    #[must_use]
+    pub fn message_id(&self) -> &MessageId {
+        &self.message_id
+    }
+
+    /// Whether `envelope` comes after this cursor in listing order.
+    #[must_use]
+    pub fn precedes(&self, envelope: &MessageEnvelope) -> bool {
+        let at = envelope.received_at().as_millis();
+        let mine = self.received_at.as_millis();
+        at < mine || (at == mine && envelope.message_id().as_str() > self.message_id.as_str())
+    }
+}
+
 /// Limits one local store listing result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoreLimit(u16);
@@ -319,6 +365,33 @@ pub trait MailboxReader: Send + Sync {
         account: &'a AccountId,
         message_id: &'a MessageId,
     ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>>;
+    /// Lists up to `limit` envelopes that come after `after` in the order of
+    /// [`Self::list_envelopes`], or from the newest when `after` is `None`.
+    /// Paging with the last envelope of each page lists every envelope once.
+    ///
+    /// The default lists the whole cache and skips; stores should seek.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque store error when the account is not authorized, the
+    /// store cannot be read, or persisted values violate domain invariants.
+    fn list_envelopes_after<'a>(
+        &'a self,
+        account: &'a AccountId,
+        after: Option<&'a EnvelopeCursor>,
+        limit: StoreLimit,
+    ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
+        Box::pin(async move {
+            let all = self
+                .list_envelopes(account, StoreLimit(StoreLimit::MAX))
+                .await?;
+            Ok(all
+                .into_iter()
+                .filter(|envelope| after.is_none_or(|cursor| cursor.precedes(envelope)))
+                .take(usize::from(limit.get()))
+                .collect())
+        })
+    }
     /// Returns the identifiers in `message_ids`, in order, for which
     /// [`Self::get_message`] would return `Ok(None)`: no row, or a row without
     /// a cached body. The sync uses it to skip bodies it already holds.
@@ -376,6 +449,14 @@ impl<T: MailboxReader + ?Sized> MailboxReader for &T {
         message_ids: &'a [MessageId],
     ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
         (**self).uncached_message_ids(account, message_ids)
+    }
+    fn list_envelopes_after<'a>(
+        &'a self,
+        account: &'a AccountId,
+        after: Option<&'a EnvelopeCursor>,
+        limit: StoreLimit,
+    ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
+        (**self).list_envelopes_after(account, after, limit)
     }
 }
 
@@ -990,6 +1071,42 @@ mod tests {
                 .get(&(account.clone(), message_id.clone()))
                 .cloned())))
         }
+    }
+
+    #[test]
+    fn the_default_keyset_listing_resumes_after_the_cursor() {
+        let store = FakeStore::default();
+        let account = account();
+        let values = [
+            envelope("old", "thread", 1),
+            envelope("thread-b", "thread", 3),
+            envelope("thread-a", "thread", 3),
+            envelope("middle", "other", 2),
+        ];
+        let mut stored = store.upsert_envelopes(&account, &values);
+        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
+        let mut ids = Vec::new();
+        let mut cursor: Option<EnvelopeCursor> = None;
+        loop {
+            let page = {
+                let mut page = store.list_envelopes_after(
+                    &account,
+                    cursor.as_ref(),
+                    StoreLimit::new(1).unwrap(),
+                );
+                let Poll::Ready(Ok(page)) = poll_once(&mut page) else {
+                    panic!("the fake is immediately ready");
+                };
+                page
+            };
+            let Some(last) = page.last() else { break };
+            cursor = Some(EnvelopeCursor::after(last));
+            ids.extend(
+                page.iter()
+                    .map(|value| value.message_id().as_str().to_owned()),
+            );
+        }
+        assert_eq!(ids, ["thread-a", "thread-b", "middle", "old"]);
     }
 
     #[test]
