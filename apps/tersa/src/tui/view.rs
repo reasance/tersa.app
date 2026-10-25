@@ -68,8 +68,8 @@ fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
         (false, 1) if more.is_empty() => "1 message".to_owned(),
         (false, count) => format!("{count}{more} messages"),
     };
-    let count = if app.older_unreadable {
-        format!("{count} (older ones unreadable)")
+    let count = if app.rows_unreadable {
+        format!("{count} (some could not be read)")
     } else {
         count
     };
@@ -517,13 +517,13 @@ mod tests {
             "older rows are still loading"
         );
         app.more_rows = false;
-        app.older_unreadable = true;
+        app.rows_unreadable = true;
         assert!(
             screen(&mut app, 60, 5)[0]
-                .starts_with(" tersa  acct_1234  ·  2 messages (older ones unreadable)"),
+                .starts_with(" tersa  acct_1234  ·  2 messages (some could not be read)"),
             "older rows could not be read"
         );
-        app.older_unreadable = false;
+        app.rows_unreadable = false;
         assert!(lines[1].starts_with("● "));
         assert!(lines[1].contains("Ann"));
         assert!(lines[1].contains("Hello there · the preview"));

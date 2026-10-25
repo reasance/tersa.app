@@ -430,27 +430,29 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
             Done::Synced(result) => {
                 worker.syncing = false;
                 // Read again as many rows as were loaded, so the selection
-                // and the list stay where they were; later pages follow.
+                // and the list stay where they were; later pages follow. A
+                // failed sync may have stored envelopes before failing, so
+                // the list is read again either way.
                 let loaded = u16::try_from(app.rows.len())
                     .unwrap_or(u16::MAX)
                     .clamp(FIRST_PAGE, StoreLimit::MAX);
-                match result.map(|()| read_page(source, None, loaded)) {
-                    Ok(Ok((rows, more))) => {
+                match read_page(source, None, loaded) {
+                    Ok((rows, more)) => {
                         app.reload(rows, more);
-                        // Bring back a selection the reload pushed one page
-                        // on before the next frame shows another row.
-                        if app.selection_pending() {
+                        // Bring back a selection the reload pushed past the
+                        // rows read, before the next frame shows another row.
+                        while app.selection_pending() && app.more_rows {
                             load_page(app, source);
                         }
-                        app.synced(Ok(()), now);
+                        app.synced(result, now);
                     }
-                    // The sync may have changed the rows already loaded, so
-                    // paging on after them could list mail it removed.
-                    Ok(Err(())) => {
-                        app.older_rows_failed();
-                        app.synced(Err("could not read the local mailbox".to_owned()), now);
+                    // Paging on after rows read before the sync could list
+                    // mail it removed.
+                    Err(()) => {
+                        app.rows_failed();
+                        let read = Err("could not read the local mailbox".to_owned());
+                        app.synced(result.and(read), now);
                     }
-                    Err(error) => app.synced(Err(error), now),
                 }
             }
         }
@@ -467,7 +469,7 @@ fn load_page(app: &mut App, source: &dyn MailSource) -> bool {
             app.append(rows);
         }
         // The top bar says so; a status line would vanish at the next key.
-        Err(()) => app.older_rows_failed(),
+        Err(()) => app.rows_failed(),
     }
     true
 }
@@ -881,7 +883,7 @@ mod tests {
             "older mail was never searched"
         );
         app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert!(app.older_unreadable, "a key press does not clear it");
+        assert!(app.rows_unreadable, "a key press does not clear it");
     }
 
     #[test]
@@ -904,16 +906,16 @@ mod tests {
         let mut app = App::new(SafeText::single_line("acct"), rows);
         app.more_rows = more;
         source.1.set(true);
-        finished_sync(&mut app, &source);
+        finished_sync(&mut app, &source, Ok(()));
         assert!(
             !app.more_rows,
             "rows loaded before the sync are no cursor for after it"
         );
-        assert!(app.older_unreadable);
+        assert!(app.rows_unreadable);
         assert!(matches!(app.sync, SyncState::Failed(_)));
     }
 
-    fn finished_sync(app: &mut App, source: &dyn MailSource) {
+    fn finished_sync(app: &mut App, source: &dyn MailSource, result: Result<(), String>) {
         let (jobs, _) = tokio::sync::mpsc::unbounded_channel();
         let (done_sender, done) = mpsc::channel();
         let mut worker = Worker {
@@ -924,12 +926,29 @@ mod tests {
             syncing: true,
             last_sync: Some((Instant::now(), SystemTime::now())),
         };
-        done_sender.send(Done::Synced(Ok(()))).expect("send");
+        done_sender.send(Done::Synced(result)).expect("send");
         assert!(finish_work(&mut worker, app, source, 0));
     }
 
     fn selected_id(app: &App) -> Option<&str> {
         app.shown_row(app.selected).map(|row| row.id.as_str())
+    }
+
+    #[test]
+    fn a_failed_sync_still_reads_the_list_again() {
+        let mut source = Pages::new(50);
+        let mut app = App::new(
+            SafeText::single_line("acct"),
+            source.page(None, FIRST_PAGE).expect("page"),
+        );
+        // Envelopes stored before a later step of the sync failed.
+        source
+            .rows
+            .insert(0, Row::sample("new", "Zed", "Fresh", true));
+        finished_sync(&mut app, &source, Err("bodies failed".to_owned()));
+        assert_eq!(app.rows.len(), 51);
+        assert_eq!(app.rows[0].id.as_str(), "new");
+        assert!(matches!(app.sync, SyncState::Failed(_)));
     }
 
     #[test]
@@ -943,7 +962,7 @@ mod tests {
         for _ in 0..300 {
             app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         }
-        finished_sync(&mut app, &source);
+        finished_sync(&mut app, &source, Ok(()));
         assert_eq!(app.rows.len(), 600);
         assert!(app.more_rows);
         assert_eq!(selected_id(&app), Some("m00300"));
@@ -961,11 +980,13 @@ mod tests {
             app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         }
         assert_eq!(selected_id(&app), Some("m00599"));
-        // The sync stored one newer message, so 600 rows end one row earlier.
-        source
-            .rows
-            .insert(0, Row::sample("new", "Zed", "Fresh", true));
-        finished_sync(&mut app, &source);
+        // The sync stored more newer messages than one page holds, so the
+        // 600 rows read again end before the selected one.
+        let newer: Vec<Row> = (0..600)
+            .map(|index| Row::sample(&format!("new{index}"), "Zed", "Fresh", true))
+            .collect();
+        source.rows.splice(0..0, newer);
+        finished_sync(&mut app, &source, Ok(()));
         assert_eq!(
             selected_id(&app),
             Some("m00599"),

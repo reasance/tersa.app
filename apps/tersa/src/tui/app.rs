@@ -204,9 +204,9 @@ pub struct App {
     pub repaint: bool,
     /// Whether older rows may still be in the cache, not yet loaded.
     pub more_rows: bool,
-    /// Set when older rows could not be read; the top bar says so until the
-    /// next reload.
-    pub older_unreadable: bool,
+    /// Set when rows could not be read, older ones or the list again after a
+    /// sync; the top bar says so until the next reload.
+    pub rows_unreadable: bool,
     /// The row selected before a reload pushed it past the reloaded rows; it
     /// is selected again when its page arrives, unless a key comes first.
     pending_selection: Option<MessageId>,
@@ -237,7 +237,7 @@ impl App {
             preference: BodyPreference::Html,
             repaint: false,
             more_rows: false,
-            older_unreadable: false,
+            rows_unreadable: false,
             pending_selection: None,
             counting_matches: false,
         }
@@ -286,7 +286,7 @@ impl App {
         let selected = self.shown_row(self.selected).map(|row| row.id.clone());
         self.rows = rows;
         self.more_rows = more;
-        self.older_unreadable = false;
+        self.rows_unreadable = false;
         self.pending_selection = None;
         self.refilter();
         if let Some(id) = selected {
@@ -305,10 +305,10 @@ impl App {
         self.pending_selection.is_some()
     }
 
-    /// Stops loading older rows after a failed read.
-    pub fn older_rows_failed(&mut self) {
+    /// Stops loading rows after a failed read.
+    pub fn rows_failed(&mut self) {
         self.more_rows = false;
-        self.older_unreadable = true;
+        self.rows_unreadable = true;
         self.count_matches();
     }
 
@@ -318,7 +318,7 @@ impl App {
             return;
         }
         // Rows not searched yet, or never readable, may hold more matches.
-        let more = if self.more_rows || self.older_unreadable {
+        let more = if self.more_rows || self.rows_unreadable {
             "+"
         } else {
             ""
