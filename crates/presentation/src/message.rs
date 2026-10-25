@@ -115,25 +115,29 @@ pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage
             attachments: Vec::new(),
         };
     };
-    let plain = message
+    // A `multipart/mixed` message lists every inline text part as body, as in
+    // text, an inline image, then more text. All of them are shown, in order.
+    let plain: Vec<&str> = message
         .text_bodies()
         .filter(|part| !part.is_text_html())
-        .find_map(readable);
-    let html = message
+        .filter_map(readable)
+        .collect();
+    let html_parts: Vec<&MessagePart<'_>> = message
         .html_bodies()
-        .filter(|part| part.is_text_html())
-        .find_map(readable);
-    let chosen = match (preference, plain, html) {
-        (BodyPreference::Html, _, Some(html)) | (BodyPreference::Plain, None, Some(html)) => {
-            Some(BodyFormat::Html).zip(Some(html))
+        .filter(|part| readable(part).is_some())
+        .collect();
+    let has_html = html_parts.iter().any(|part| part.is_text_html());
+    let format = match (preference, plain.is_empty(), has_html) {
+        (BodyPreference::Html, _, true) | (BodyPreference::Plain, true, true) => {
+            Some(BodyFormat::Html)
         }
-        (_, Some(plain), _) => Some(BodyFormat::Plain).zip(Some(plain)),
-        (_, None, None) => None,
+        (_, false, _) => Some(BodyFormat::Plain),
+        (_, true, false) => None,
     };
-    let (body, links) = match chosen {
-        Some((BodyFormat::Plain, text)) => (plain_text(text), Vec::new()),
-        Some((BodyFormat::Html, text)) => {
-            let converted = html_to_text(text);
+    let (body, links) = match format {
+        Some(BodyFormat::Plain) => (plain_text(&joined_plain(&plain)), Vec::new()),
+        Some(BodyFormat::Html) => {
+            let converted = html_to_text(&joined_html(&html_parts));
             (converted.text, converted.links)
         }
         None => (String::new(), Vec::new()),
@@ -159,8 +163,8 @@ pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage
         to: addresses(message.to()),
         cc: addresses(message.cc()),
         body: SafeText::multi_line(&body),
-        format: chosen.map(|(format, _)| format),
-        has_alternative: plain.is_some() && html.is_some(),
+        format,
+        has_alternative: !plain.is_empty() && has_html,
         links: links
             .iter()
             .map(|link| SafeText::single_line(link))
@@ -170,10 +174,60 @@ pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage
 }
 
 /// A text part's non-blank content. The body lists also hold inline
-/// binaries (images, SVG source), and a first text part can be blank.
+/// binaries (images, SVG source), and a text part can be blank.
 fn readable<'a>(part: &'a MessagePart<'a>) -> Option<&'a str> {
     part.text_contents()
         .filter(|text| part.is_text() && !text.trim().is_empty())
+}
+
+/// The plain-text parts, a blank line apart. The result stops growing past
+/// the output cap, so [`plain_text`] then marks it truncated.
+fn joined_plain(parts: &[&str]) -> String {
+    let mut joined = String::new();
+    for part in parts {
+        if joined.len() > MAX_PLAIN_OUTPUT {
+            break;
+        }
+        if !joined.is_empty() {
+            joined.push_str("\n\n");
+        }
+        joined.push_str(part);
+    }
+    joined
+}
+
+/// The HTML body parts as one document, so links are numbered across all of
+/// them. A plain-text part among them is escaped and kept preformatted. The
+/// result stops growing past the converter's input cap, which then marks it
+/// truncated.
+fn joined_html(parts: &[&MessagePart<'_>]) -> String {
+    let mut joined = String::new();
+    for part in parts {
+        if joined.len() > html::MAX_HTML_INPUT {
+            break;
+        }
+        let Some(text) = readable(part) else {
+            continue;
+        };
+        if !joined.is_empty() {
+            joined.push_str("<p></p>");
+        }
+        if part.is_text_html() {
+            joined.push_str(text);
+        } else {
+            joined.push_str("<pre>");
+            for character in text.chars() {
+                match character {
+                    '&' => joined.push_str("&amp;"),
+                    '<' => joined.push_str("&lt;"),
+                    '>' => joined.push_str("&gt;"),
+                    other => joined.push(other),
+                }
+            }
+            joined.push_str("</pre>");
+        }
+    }
+    joined
 }
 
 /// Normalizes line endings, trims trailing spaces, keeps at most one blank
@@ -346,6 +400,45 @@ Content-Transfer-Encoding: base64\r\n\r\n/9j/4AAQ\r\n\
 --x\r\nContent-Type: text/plain\r\n\r\nsecond\r\n--x--\r\n";
         let rendered = render_message(blank_first, BodyPreference::Plain);
         assert_eq!(rendered.body.as_str(), "second");
+    }
+
+    #[test]
+    fn every_inline_text_part_is_shown_in_order() {
+        // Apple Mail style: text, an inline image, more text.
+        let mixed = b"Subject: s\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n\
+--x\r\nContent-Type: text/plain\r\n\r\nSee the photo:\r\n\
+--x\r\nContent-Type: image/jpeg\r\nContent-Disposition: inline\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n/9j/4AAQ\r\n\
+--x\r\nContent-Type: text/plain\r\n\r\nThanks, Bob\r\n--x--\r\n";
+        for preference in [BodyPreference::Plain, BodyPreference::Html] {
+            let rendered = render_message(mixed, preference);
+            assert_eq!(rendered.body.as_str(), "See the photo:\n\nThanks, Bob");
+            assert_eq!(rendered.format, Some(BodyFormat::Plain));
+        }
+
+        // An alternative body followed by a plain footer, as mailing lists add.
+        let footer = b"Subject: s\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n\
+--x\r\nContent-Type: multipart/alternative; boundary=y\r\n\r\n\
+--y\r\nContent-Type: text/plain\r\n\r\nBody\r\n\
+--y\r\nContent-Type: text/html\r\n\r\n<p><a href=\"https://a.example\">Body</a></p>\r\n\
+--y--\r\n\
+--x\r\nContent-Type: text/plain\r\n\r\n-- \r\nlist <footer> & co\r\n--x--\r\n";
+        let plain = render_message(footer, BodyPreference::Plain);
+        assert_eq!(plain.body.as_str(), "Body\n\n--\nlist <footer> & co");
+        assert!(plain.has_alternative);
+        let html = render_message(footer, BodyPreference::Html);
+        assert_eq!(html.format, Some(BodyFormat::Html));
+        assert!(
+            html.body.as_str().starts_with("Body"),
+            "{:?}",
+            html.body.as_str()
+        );
+        assert!(
+            html.body.as_str().contains("list <footer> & co"),
+            "{:?}",
+            html.body.as_str()
+        );
+        assert_eq!(html.links.len(), 1);
     }
 
     #[test]
