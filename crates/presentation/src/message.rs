@@ -11,7 +11,12 @@
 use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 
-use mail_parser::{Address, MessageParser, MessagePart, MimeHeaders};
+use mail_parser::decoders::DecodeFnc;
+use mail_parser::parsers::MessageStream;
+use mail_parser::{
+    Address, ContentType, GetHeader, HeaderName, HeaderValue, MessageParser, MessagePart,
+    MimeHeaders,
+};
 
 use crate::html::{self, html_parts_to_text};
 use crate::terminal::SafeText;
@@ -26,8 +31,15 @@ pub const MAX_PLAIN_OUTPUT: usize = html::MAX_TEXT_OUTPUT;
 /// shown. `mail-parser` builds every part before returning, with no limit of
 /// its own, so a 64 MiB message of tiny parts would allocate millions.
 pub const MAX_MIME_PARTS: usize = 5_000;
-/// How deep `mail-parser` parses messages attached to messages.
+/// How deep `mail-parser` 0.11.9 parses encoded messages attached to messages.
 const NESTED_DEPTH: usize = 3;
+/// The most bytes of a message given to `mail-parser`. Whatever the counting
+/// below misses, this bounds what one message can cost, at about 25 bytes of
+/// parser structures per input byte. Text bodies come first and the
+/// converters keep far less, so a longer message loses only attachments.
+pub const MAX_PARSED_LEN: usize = 4 * 1024 * 1024;
+const CUT: &str = "[… the rest of this message is over 4 MiB and is not shown, \
+                   including any attachments there]";
 const TRUNCATED: &str = "[… message truncated]";
 const UNREADABLE: &str = "This message could not be read.";
 const TOO_MANY_PARTS: &str = "This message has too many parts to show.";
@@ -110,7 +122,9 @@ impl fmt::Debug for RenderedMessage {
 /// Renders a raw RFC 5322 message for the terminal.
 #[must_use]
 pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage {
-    if part_bound(raw, NESTED_DEPTH, MAX_MIME_PARTS) > MAX_MIME_PARTS {
+    let cut = raw.len() > MAX_PARSED_LEN;
+    let raw = &raw[..raw.len().min(MAX_PARSED_LEN)];
+    if count_parts(raw, NESTED_DEPTH, MAX_MIME_PARTS) > MAX_MIME_PARTS {
         // Only the headers are parsed, which costs no more than their size.
         let headers = MessageParser::default().parse_headers(raw);
         return RenderedMessage {
@@ -170,6 +184,16 @@ pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage
         }
         None => (String::new(), Vec::new()),
     };
+    let body = if cut {
+        let mut body = body;
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(CUT);
+        body
+    } else {
+        body
+    };
     let attachments = message
         .attachments()
         .take(MAX_ATTACHMENTS)
@@ -201,112 +225,150 @@ pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage
     }
 }
 
-/// An upper bound on the parts `mail-parser` builds for `raw`, counted
-/// without building them; it stops counting once it passes `limit`.
+/// The parts `mail-parser` 0.11.9 builds for `raw`, counted without building
+/// them; counting stops once it passes `limit`.
 ///
-/// Every part after the first starts at a boundary line, and a boundary line
-/// starts with `--`, so the lines that do bound the parts at this level. A
-/// quoted-printable attached message keeps its boundary lines readable here,
-/// but a base64 one hides them, so such a part is decoded and counted too, as
-/// deep as `mail-parser` goes. That is any part declared `message/rfc822` or
-/// `message/global`, or with no type, which a digest treats as a message.
-fn part_bound(raw: &[u8], depth: usize, limit: usize) -> usize {
-    let mut count = 1;
-    let mut headers = PartHeaders::default();
-    let mut in_headers = true;
-    // Where the body of a base64 attached message starts.
-    let mut nested_body: Option<usize> = None;
-    let mut offset = 0;
-    while offset < raw.len() && count <= limit {
-        let end = raw[offset..]
-            .iter()
-            .position(|&byte| byte == b'\n')
-            .map_or(raw.len(), |position| offset + position + 1);
-        let line = &raw[offset..end];
-        let content = line.trim_ascii_end();
-        if content.starts_with(b"--") {
-            if let Some(start) = nested_body.take() {
-                count += nested_bound(&raw[start..offset], depth, limit - count);
+/// This walks `raw` with the parser's own public stream functions in the
+/// order `MessageParser::parse` does: the same header parser, the same
+/// boundary search (a boundary counts anywhere in a line), the same
+/// transfer-encoding decoders, and the same nesting into attached messages,
+/// up to [`NESTED_DEPTH`] for encoded ones. `mail-parser` is pinned to that
+/// version, and a test checks the count against real parses.
+fn count_parts(raw: &[u8], depth: usize, limit: usize) -> usize {
+    let parser = MessageParser::default();
+    let mut stream = MessageStream::new(raw);
+    let mut count = 0;
+    let mut state = Walk::default();
+    // Each entry is the state to restore and whether it was pushed when
+    // entering an unencoded attached message.
+    let mut stack: Vec<(Walk, bool)> = Vec::new();
+    let mut headers = Vec::new();
+    'outer: loop {
+        if count > limit {
+            break;
+        }
+        headers.clear();
+        if !stream.parse_headers(&parser, &mut headers) {
+            // Headers with no body still make one part.
+            if count == 0 && !headers.is_empty() {
+                count = 1;
             }
-            count += 1;
-            headers = PartHeaders::default();
-            in_headers = true;
-        } else if in_headers {
-            if content.is_empty() {
-                in_headers = false;
-                if depth > 0 && headers.is_encoded_message() {
-                    nested_body = Some(end);
-                }
-            } else {
-                headers.line(content);
+            break;
+        }
+        count += 1;
+        let content_type = headers
+            .header_value(&HeaderName::ContentType)
+            .and_then(HeaderValue::as_content_type);
+        let (multipart, mut message) = classify(content_type, state.digest);
+        if multipart
+            && let Some(boundary) = content_type.and_then(|kind| kind.attribute("boundary"))
+        {
+            if stream.seek_next_part(boundary.as_bytes()) {
+                let digest = content_type.and_then(ContentType::subtype) == Some("digest");
+                stack.push((std::mem::take(&mut state), false));
+                state = Walk {
+                    message: false,
+                    digest,
+                    boundary: Some(boundary.as_bytes().to_vec()),
+                };
+                stream.skip_crlf();
+                continue;
+            }
+            message = false;
+        }
+        let decode = match transfer_decoder(&headers) {
+            Some(decode) => decode,
+            None if message => {
+                // An unencoded attached message is parsed in place.
+                let boundary = state.boundary.take();
+                stack.push((std::mem::take(&mut state), true));
+                state = Walk {
+                    message: true,
+                    digest: false,
+                    boundary,
+                };
+                continue;
+            }
+            None => MessageStream::mime_part,
+        };
+        let (end, bytes) = decode(&mut stream, state.boundary.as_deref().unwrap_or_default());
+        if end == usize::MAX {
+            // The parser keeps an undecodable part as text.
+            message = false;
+            let (_, found) = stream.seek_part_end(state.boundary.as_deref());
+            if !found {
+                state.boundary = None;
             }
         }
-        offset = end;
-    }
-    if let Some(start) = nested_body
-        && count <= limit
-    {
-        count += nested_bound(&raw[start..], depth, limit - count);
+        if message && depth > 0 {
+            count += count_parts(&bytes, depth - 1, limit.saturating_sub(count));
+        }
+        if state.boundary.is_some() {
+            loop {
+                if state.message {
+                    // The attached message ended; its parent goes on.
+                    match stack.pop() {
+                        Some((mut parent, true)) => {
+                            parent.boundary = state.boundary.take();
+                            state = parent;
+                        }
+                        _ => break 'outer,
+                    }
+                }
+                if !stream.is_multipart_end() {
+                    break;
+                }
+                let Some((parent, _)) = stack.pop() else {
+                    break 'outer;
+                };
+                state = parent;
+                if let Some(boundary) = state.boundary.as_deref()
+                    && stream.seek_next_part_offset(boundary).is_some()
+                {
+                    continue;
+                }
+                break 'outer;
+            }
+        } else if stream.offset() >= raw.len() {
+            break;
+        }
     }
     count
 }
 
-/// The parts inside a base64 attached message whose body is `encoded`.
-fn nested_bound(encoded: &[u8], depth: usize, limit: usize) -> usize {
-    mail_parser::decoders::base64::base64_decode(encoded)
-        .map_or(0, |decoded| part_bound(&decoded, depth - 1, limit))
+/// The decoder `mail-parser` uses for a part's transfer encoding, or `None`
+/// when the part is not base64 or quoted-printable.
+fn transfer_decoder<'x>(headers: &Vec<mail_parser::Header<'_>>) -> Option<DecodeFnc<'x>> {
+    match headers.header_value(&HeaderName::ContentTransferEncoding) {
+        Some(HeaderValue::Text(encoding)) if encoding.eq_ignore_ascii_case("base64") => {
+            Some(MessageStream::decode_base64_mime)
+        }
+        Some(HeaderValue::Text(encoding)) if encoding.eq_ignore_ascii_case("quoted-printable") => {
+            Some(MessageStream::decode_quoted_printable_mime)
+        }
+        _ => None,
+    }
 }
 
-/// What [`part_bound`] needs from one part's headers.
+/// Where [`count_parts`] is: inside an attached message or a digest, and
+/// the boundary that ends the current part.
 #[derive(Default)]
-struct PartHeaders {
-    /// The header being read, lowercased, kept short; folded lines join it.
-    current: Vec<u8>,
-    typed: bool,
+struct Walk {
     message: bool,
-    base64: bool,
+    digest: bool,
+    boundary: Option<Vec<u8>>,
 }
 
-impl PartHeaders {
-    /// The most bytes of one header kept: its name and the start of its value.
-    const KEPT: usize = 128;
-
-    fn line(&mut self, line: &[u8]) {
-        if !line.starts_with(b" ") && !line.starts_with(b"\t") {
-            self.finish();
-        }
-        for &byte in line
-            .iter()
-            .take(Self::KEPT.saturating_sub(self.current.len()))
-        {
-            self.current.push(byte.to_ascii_lowercase());
-        }
-    }
-
-    fn finish(&mut self) {
-        let header = std::mem::take(&mut self.current);
-        let Some(colon) = header.iter().position(|&byte| byte == b':') else {
-            return;
-        };
-        let value: Vec<u8> = header[colon + 1..]
-            .iter()
-            .copied()
-            .filter(|byte| !byte.is_ascii_whitespace())
-            .collect();
-        match header[..colon].trim_ascii() {
-            b"content-type" => {
-                self.typed = true;
-                self.message =
-                    value.starts_with(b"message/rfc822") || value.starts_with(b"message/global");
-            }
-            b"content-transfer-encoding" => self.base64 = value.starts_with(b"base64"),
-            _ => {}
-        }
-    }
-
-    fn is_encoded_message(&mut self) -> bool {
-        self.finish();
-        self.base64 && (self.message || !self.typed)
+/// Whether a part is a multipart, and whether it is an attached message,
+/// as `mail-parser` decides: an untyped part of a digest is a message.
+fn classify(content_type: Option<&ContentType<'_>>, in_digest: bool) -> (bool, bool) {
+    match content_type {
+        Some(kind) => match kind.ctype() {
+            "multipart" => (true, false),
+            "message" => (false, matches!(kind.subtype(), Some("rfc822" | "global"))),
+            _ => (false, false),
+        },
+        None => (false, in_digest),
     }
 }
 
@@ -430,10 +492,25 @@ fn addresses(header: Option<&Address<'_>>) -> SafeText {
 
 #[cfg(test)]
 mod tests {
+    use mail_parser::{MessageParser, PartType};
+
     use super::{
-        BodyFormat, BodyPreference, MAX_MIME_PARTS, MAX_PLAIN_OUTPUT, TOO_MANY_PARTS, TRUNCATED,
-        render_message,
+        BodyFormat, BodyPreference, CUT, MAX_MIME_PARTS, MAX_PARSED_LEN, MAX_PLAIN_OUTPUT,
+        NESTED_DEPTH, TOO_MANY_PARTS, TRUNCATED, count_parts, render_message,
     };
+
+    /// Every part `mail-parser` built, nested messages included.
+    fn built_parts(message: &mail_parser::Message<'_>) -> usize {
+        message.parts.len()
+            + message
+                .parts
+                .iter()
+                .map(|part| match &part.body {
+                    PartType::Message(nested) => built_parts(nested),
+                    _ => 0,
+                })
+                .sum::<usize>()
+    }
 
     /// A multipart message with `parts` tiny text parts.
     fn many_parts(parts: usize) -> String {
@@ -777,8 +854,6 @@ Content-Transfer-Encoding: base64\r\n\r\n/9j/4AAQ\r\n\
         for content_type in [
             "Content-Type: message/rfc822",
             "Content-Type:\r\n Message/RFC822",
-            // No type: a digest would parse it as a message, so it counts.
-            "Content-Disposition: attachment",
         ] {
             let raw = format!(
                 "Subject: outer\r\nContent-Type: multipart/mixed; boundary=o\r\n\r\n\
@@ -800,5 +875,162 @@ Content-Transfer-Encoding: base64\r\n\r\n/9j/4AAQ\r\n\
         );
         let rendered = render_message(small.as_bytes(), BodyPreference::Plain);
         assert!(rendered.body.as_str().starts_with("see attached"));
+
+        // An untyped part of a mixed message is text, not a message, so the
+        // parser never opens it and neither does the count.
+        let untyped = format!(
+            "Subject: outer\r\nContent-Type: multipart/mixed; boundary=o\r\n\r\n\
+--o\r\nContent-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n--o--\r\n",
+            base64_lines(inner.as_bytes())
+        );
+        assert_eq!(count_parts(untyped.as_bytes(), NESTED_DEPTH, usize::MAX), 2);
+    }
+
+    /// Wraps `inner` as the body of a part attached to an outer message.
+    fn attached(headers: &str, body: &str) -> String {
+        format!(
+            "Subject: outer\r\nContent-Type: multipart/mixed; boundary=o\r\n\r\n\
+--o\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n\
+--o\r\n{headers}\r\n\r\n{body}\r\n--o--\r\n"
+        )
+    }
+
+    #[test]
+    fn floods_written_the_ways_the_parser_still_reads_are_counted() {
+        // Boundaries in the middle of a line.
+        let mut mid_line =
+            String::from("Subject: s\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n");
+        for _ in 0..MAX_MIME_PARTS {
+            mid_line.push_str("x--b\r\nContent-Type: text/plain\r\n\r\n");
+        }
+        // A quoted-printable attached message is not listed: the parser's
+        // decoder stops at its first `--` line, so it never builds a flood;
+        // the comparison test below covers that decoder.
+        let encoded = base64_lines(many_parts(MAX_MIME_PARTS).as_bytes());
+        // The encoding after a run of spaces, as an encoded word, and the type
+        // after a long parameter.
+        let spaced = attached(
+            &format!(
+                "Content-Type: message/rfc822\r\nContent-Transfer-Encoding:{}base64",
+                " ".repeat(200)
+            ),
+            &encoded,
+        );
+        let worded = attached(
+            "Content-Type: message/rfc822\r\nContent-Transfer-Encoding: =?utf-8?Q?base64?=",
+            &encoded,
+        );
+        let late_type = attached(
+            &format!(
+                "Content-Type: message/rfc822; x-pad=\"{}\"\r\nContent-Transfer-Encoding: base64",
+                "p".repeat(200)
+            ),
+            &encoded,
+        );
+        for (name, raw) in [
+            ("mid-line boundaries", &mid_line),
+            ("spaced encoding", &spaced),
+            ("encoded-word encoding", &worded),
+            ("long type", &late_type),
+        ] {
+            let parsed = MessageParser::default()
+                .parse(raw.as_bytes())
+                .expect("parses");
+            let built = built_parts(&parsed);
+            let counted = count_parts(raw.as_bytes(), NESTED_DEPTH, usize::MAX);
+            assert!(
+                counted >= built && built > MAX_MIME_PARTS,
+                "{name}: counted {counted}, built {built}"
+            );
+            assert_eq!(
+                render_message(raw.as_bytes(), BodyPreference::Plain)
+                    .body
+                    .as_str(),
+                TOO_MANY_PARTS,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_count_matches_what_the_parser_builds() {
+        const FRAGMENTS: [&str; 22] = [
+            "\r\n",
+            "\r\n\r\n",
+            "Subject: s\r\n",
+            "Content-Type: multipart/mixed; boundary=b\r\n",
+            "Content-Type: multipart/digest; boundary=b\r\n",
+            "Content-Type: multipart/alternative; boundary=\"c\"\r\n",
+            "Content-Type: message/rfc822\r\n",
+            "Content-Type: message/global\r\n",
+            "Content-Type: text/plain\r\n",
+            "Content-Transfer-Encoding: base64\r\n",
+            "Content-Transfer-Encoding: quoted-printable\r\n",
+            "--b\r\n",
+            "--b--\r\n",
+            "x--b\r\n",
+            "--c\r\n",
+            "--c--\r\n",
+            "=2D-b\r\n",
+            "=\r\n",
+            "text ",
+            // `Content-Type: multipart/mixed; boundary=b`, a blank line, `--b`.
+            "Q29udGVudC1UeXBlOiBtdWx0aXBhcnQvbWl4ZWQ7IGJvdW5kYXJ5PWINCg0KLS1iDQo=\r\n",
+            "LS1iDQoNCngNCi0tYi0tDQo=\r\n",
+            "-",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut skipped = 0;
+        for _ in 0..4_000 {
+            let mut raw = String::new();
+            for _ in 0..40 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                raw.push_str(FRAGMENTS[usize::try_from(state % 22).expect("index")]);
+            }
+            // mail-parser has debug assertions that some malformed input
+            // trips; release builds skip them. Those inputs are not compared.
+            let Ok(built) = std::panic::catch_unwind(|| {
+                MessageParser::default()
+                    .parse(raw.as_bytes())
+                    .map_or(0, |message| built_parts(&message))
+            }) else {
+                skipped += 1;
+                continue;
+            };
+            let counted = count_parts(raw.as_bytes(), NESTED_DEPTH, usize::MAX);
+            assert_eq!(counted, built, "{raw:?}");
+        }
+        assert!(
+            skipped < 100,
+            "{skipped} inputs tripped the parser's debug assertions"
+        );
+    }
+
+    #[test]
+    fn only_the_first_part_of_a_huge_message_is_parsed() {
+        let mut raw = String::from(
+            "Subject: big\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nthe text\r\n\
+--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"a.pdf\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n",
+        );
+        while raw.len() <= MAX_PARSED_LEN {
+            raw.push_str(&"QUFB".repeat(19));
+            raw.push_str("\r\n");
+        }
+        raw.push_str("--b\r\nContent-Type: image/png\r\nContent-Disposition: attachment; filename=\"late.png\"\r\n\r\nx\r\n--b--\r\n");
+        let rendered = render_message(raw.as_bytes(), BodyPreference::Plain);
+        assert_eq!(rendered.subject.as_str(), "big");
+        assert!(rendered.body.as_str().starts_with("the text"));
+        assert!(rendered.body.as_str().ends_with(CUT));
+        assert!(
+            rendered
+                .attachments
+                .iter()
+                .all(|attachment| attachment.name.as_str() != "late.png"),
+            "parts past the cut are not parsed"
+        );
     }
 }
