@@ -319,6 +319,32 @@ pub trait MailboxReader: Send + Sync {
         account: &'a AccountId,
         message_id: &'a MessageId,
     ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>>;
+    /// Returns the identifiers in `message_ids`, in order, for which
+    /// [`Self::get_message`] would return `Ok(None)`: no row, or a row without
+    /// a cached body. The sync uses it to skip bodies it already holds.
+    ///
+    /// The default reads each message; stores should answer without loading
+    /// bodies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque store error when the account is not authorized, the
+    /// store cannot be read, or persisted values violate domain invariants.
+    fn uncached_message_ids<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message_ids: &'a [MessageId],
+    ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
+        Box::pin(async move {
+            let mut uncached = Vec::new();
+            for id in message_ids {
+                if self.get_message(account, id).await?.is_none() {
+                    uncached.push(id.clone());
+                }
+            }
+            Ok(uncached)
+        })
+    }
 }
 
 impl<T: MailboxReader + ?Sized> MailboxReader for &T {
@@ -343,6 +369,13 @@ impl<T: MailboxReader + ?Sized> MailboxReader for &T {
         message_id: &'a MessageId,
     ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
         (**self).get_message(account, message_id)
+    }
+    fn uncached_message_ids<'a>(
+        &'a self,
+        account: &'a AccountId,
+        message_ids: &'a [MessageId],
+    ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
+        (**self).uncached_message_ids(account, message_ids)
     }
 }
 

@@ -2495,6 +2495,16 @@ mod store {
                 self.load_complete_message(message_id)
             })
         }
+        fn uncached_message_ids<'a>(
+            &'a self,
+            account: &'a AccountId,
+            message_ids: &'a [MessageId],
+        ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.with_connection(|connection| uncached_ids(connection, message_ids))
+            })
+        }
         fn thread_envelopes<'a>(
             &'a self,
             account: &'a AccountId,
@@ -2506,6 +2516,26 @@ mod store {
                 self.list(Some(thread_id), limit)
             })
         }
+    }
+
+    /// The identifiers without a cached body, without reading any body.
+    fn uncached_ids(
+        connection: &Connection,
+        ids: &[MessageId],
+    ) -> Result<Vec<MessageId>, MailboxStoreError> {
+        let mut statement = connection
+            .prepare("SELECT 1 FROM messages WHERE message_id = ?1 AND content IS NOT NULL")
+            .map_err(store_error)?;
+        let mut uncached = Vec::new();
+        for id in ids {
+            if !statement
+                .exists(params![id.as_str()])
+                .map_err(store_error)?
+            {
+                uncached.push(id.clone());
+            }
+        }
+        Ok(uncached)
     }
 
     impl MailboxReader for SqlCipherMailboxReader {
@@ -5108,6 +5138,18 @@ mod store {
                     .unwrap()
                     .unwrap(),
                 cached
+            );
+            // "retained" and "tie-a" hold bodies; "tie-b" is an envelope only,
+            // and "missing" has no row.
+            let asked =
+                ["tie-b", "retained", "missing", "tie-a"].map(|id| MessageId::new(id).unwrap());
+            assert_eq!(
+                run(store.uncached_message_ids(&account(), &asked))
+                    .unwrap()
+                    .iter()
+                    .map(MessageId::as_str)
+                    .collect::<Vec<_>>(),
+                ["tie-b", "missing"]
             );
             assert_eq!(
                 run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
