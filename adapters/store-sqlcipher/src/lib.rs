@@ -3022,10 +3022,6 @@ mod store {
         Ok(())
     }
 
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "rusqlite Result::map_err supplies owned errors"
-    )]
     fn classify_open(error: rusqlite::Error) -> OpenFailure {
         match error {
             rusqlite::Error::SqliteFailure(sqlite, _)
@@ -3042,7 +3038,10 @@ mod store {
             | rusqlite::Error::InvalidQuery
             | rusqlite::Error::QueryReturnedNoRows
             | rusqlite::Error::Utf8Error(..) => OpenFailure::Corrupted,
-            _ => OpenFailure::Storage,
+            other => {
+                report_storage_failure(&other);
+                OpenFailure::Storage
+            }
         }
     }
 
@@ -3205,10 +3204,6 @@ mod store {
         let bytes = token.as_bytes();
         (1..=4096).contains(&bytes.len()) && bytes.iter().all(|byte| (0x21..=0x7e).contains(byte))
     }
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "rusqlite Result::map_err supplies owned errors"
-    )]
     fn store_error(error: rusqlite::Error) -> MailboxStoreError {
         match error {
             rusqlite::Error::SqliteFailure(sqlite, _)
@@ -3219,9 +3214,34 @@ mod store {
             {
                 MailboxStoreError::Corrupted
             }
-            _ => MailboxStoreError::Storage,
+            other => {
+                report_storage_failure(&other);
+                MailboxStoreError::Storage
+            }
         }
     }
+
+    /// In tests, prints why `SQLite` failed, with its extended result code, so
+    /// an intermittent `Storage` failure shows its cause; the test harness
+    /// shows the output of failing tests only. Release builds print nothing,
+    /// because messages can name paths and mailbox content never belongs in
+    /// logs.
+    #[cfg(test)]
+    fn report_storage_failure(error: &rusqlite::Error) {
+        if let rusqlite::Error::SqliteFailure(sqlite, message) = error {
+            eprintln!(
+                "SQLite storage failure: extended code {} ({:?}): {}",
+                sqlite.extended_code,
+                sqlite.code,
+                message.as_deref().unwrap_or("no message")
+            );
+        } else {
+            eprintln!("SQLite storage failure: {error}");
+        }
+    }
+
+    #[cfg(not(test))]
+    const fn report_storage_failure(_error: &rusqlite::Error) {}
     fn corrupted(_error: rusqlite::Error) -> MailboxStoreError {
         MailboxStoreError::Corrupted
     }
