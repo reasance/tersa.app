@@ -34,11 +34,22 @@ impl Row {
 }
 
 /// The display name from a `Name <address>` header, or the address.
+///
+/// A display name that itself contains `@` could pose as another address, as
+/// in `"security@bank.example" <attacker@evil.example>`, so the real address
+/// is shown instead.
 fn sender_name(from: &str) -> &str {
     let from = from.trim();
     match from.rsplit_once('<') {
-        Some((name, _)) if !name.trim().is_empty() => name.trim().trim_matches('"').trim(),
-        Some((_, address)) => address.trim_end_matches('>').trim(),
+        Some((name, address)) => {
+            let name = name.trim().trim_matches('"').trim();
+            let address = address.trim_end_matches('>').trim();
+            if name.is_empty() || name.contains('@') {
+                address
+            } else {
+                name
+            }
+        }
         None => from,
     }
 }
@@ -363,6 +374,11 @@ mod tests {
         assert_eq!(sender_name("\"Bob, Jr\" <bob@example.com>"), "Bob, Jr");
         assert_eq!(sender_name("<carol@example.com>"), "carol@example.com");
         assert_eq!(sender_name("dave@example.com"), "dave@example.com");
+        assert_eq!(
+            sender_name("\"security@bank.example\" <attacker@evil.example>"),
+            "attacker@evil.example",
+            "a name that looks like an address gives way to the address"
+        );
     }
 
     #[test]
