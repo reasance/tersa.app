@@ -40,25 +40,46 @@ pub struct HtmlText {
 /// Converts HTML to plain text.
 #[must_use]
 pub fn html_to_text(html: &str) -> HtmlText {
-    let (input, input_truncated) = if html.len() > MAX_HTML_INPUT {
-        (floor_char_boundary(html, MAX_HTML_INPUT), true)
-    } else {
-        (html, false)
-    };
+    html_parts_to_text(&[html])
+}
+
+/// Converts several HTML documents to one text, in order, a blank line
+/// apart. Each document is parsed on its own, so markup one leaves open (an
+/// unclosed comment, `<script>`, or hidden element) cannot hide the next.
+/// Links are numbered across all of them, and the input and output caps apply
+/// to the whole.
+#[must_use]
+pub fn html_parts_to_text<S: AsRef<str>>(parts: &[S]) -> HtmlText {
     let mut writer = Writer::default();
-    let mut rest = input;
-    while !rest.is_empty() && !writer.full {
-        rest = match rest.find('<') {
-            None => {
-                writer.text(rest);
-                ""
-            }
-            Some(0) => writer.markup(rest),
-            Some(at) => {
-                writer.text(&rest[..at]);
-                &rest[at..]
-            }
+    let mut budget = MAX_HTML_INPUT;
+    let mut input_truncated = false;
+    for part in parts {
+        if writer.full || input_truncated {
+            break;
+        }
+        let part = part.as_ref();
+        let input = if part.len() > budget {
+            input_truncated = true;
+            floor_char_boundary(part, budget)
+        } else {
+            part
         };
+        budget -= input.len();
+        writer.start_document();
+        let mut rest = input;
+        while !rest.is_empty() && !writer.full {
+            rest = match rest.find('<') {
+                None => {
+                    writer.text(rest);
+                    ""
+                }
+                Some(0) => writer.markup(rest),
+                Some(at) => {
+                    writer.text(&rest[..at]);
+                    &rest[at..]
+                }
+            };
+        }
     }
     if input_truncated && !writer.full {
         writer.paragraph();
@@ -374,6 +395,19 @@ impl Writer {
 
     fn paragraph(&mut self) {
         self.line_break(2);
+    }
+
+    /// Ends whatever the previous document left open, keeping the output and
+    /// the numbered links, and starts the next one on a new paragraph.
+    fn start_document(&mut self) {
+        self.close_link();
+        self.list_depth = 0;
+        self.quote_depth = 0;
+        self.pre_depth = 0;
+        self.hiding_disabled = false;
+        if self.started {
+            self.paragraph();
+        }
     }
 
     fn finish(mut self) -> HtmlText {
@@ -800,7 +834,7 @@ fn floor_char_boundary(text: &str, max: usize) -> &str {
 mod tests {
     use std::fmt::Write as _;
 
-    use super::{MAX_LINKS, html_to_text};
+    use super::{MAX_LINKS, MAX_TEXT_OUTPUT, html_parts_to_text, html_to_text};
 
     fn text(html: &str) -> String {
         html_to_text(html).text
@@ -1048,5 +1082,24 @@ mod tests {
         let started = std::time::Instant::now();
         let _ = html_to_text(&html);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn several_documents_share_links_and_caps() {
+        let converted = html_parts_to_text(&[
+            "<ul><li><a href=\"https://a.example\">one</a>",
+            "<blockquote><p><a href=\"https://a.example\">again</a> <a href=\"https://b.example\">two</a>",
+            "<p>after</p>",
+        ]);
+        assert_eq!(
+            converted.text, "• one [1]\n\n> again [1] two [2]\n\nafter",
+            "nesting ends with each document; a repeated link keeps its number"
+        );
+        assert_eq!(converted.links, ["https://a.example", "https://b.example"]);
+
+        let big = "<p>word</p>".repeat(40_000);
+        let many = html_parts_to_text(&[big.as_str(), big.as_str(), big.as_str()]);
+        assert!(many.text.len() <= MAX_TEXT_OUTPUT + 64);
+        assert!(many.text.ends_with("[… message truncated]"));
     }
 }

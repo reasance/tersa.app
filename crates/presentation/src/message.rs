@@ -8,11 +8,12 @@
 //! decoded by `mail-parser`. HTML bodies go through [`crate::html`], so nothing
 //! remote is ever fetched. Every string leaves this module as [`SafeText`].
 
+use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 
 use mail_parser::{Address, MessageParser, MessagePart, MimeHeaders};
 
-use crate::html::{self, html_to_text};
+use crate::html::{self, html_parts_to_text};
 use crate::terminal::SafeText;
 
 /// The most addresses shown per header.
@@ -164,7 +165,7 @@ pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage
     let (body, links) = match format {
         Some(BodyFormat::Plain) => (plain_text(&joined_plain(&plain)), Vec::new()),
         Some(BodyFormat::Html) => {
-            let converted = html_to_text(&joined_html(&html_parts));
+            let converted = html_parts_to_text(&html_documents(&html_parts));
             (converted.text, converted.links)
         }
         None => (String::new(), Vec::new()),
@@ -332,38 +333,40 @@ fn joined_plain(parts: &[&str]) -> String {
     joined
 }
 
-/// The HTML body parts as one document, so links are numbered across all of
-/// them. A plain-text part among them is escaped and kept preformatted. The
-/// result stops growing past the converter's input cap, which then marks it
-/// truncated.
-fn joined_html(parts: &[&MessagePart<'_>]) -> String {
-    let mut joined = String::new();
+/// The HTML body parts as documents for [`html_parts_to_text`], which parses
+/// each on its own and numbers links across them. A plain-text part among
+/// them is escaped and kept preformatted. Collecting stops past the
+/// converter's input cap, which then marks the text truncated.
+fn html_documents<'a>(parts: &[&'a MessagePart<'a>]) -> Vec<Cow<'a, str>> {
+    let mut documents = Vec::new();
+    let mut total = 0;
     for part in parts {
-        if joined.len() > html::MAX_HTML_INPUT {
+        if total > html::MAX_HTML_INPUT {
             break;
         }
         let Some(text) = readable(part) else {
             continue;
         };
-        if !joined.is_empty() {
-            joined.push_str("<p></p>");
-        }
-        if part.is_text_html() {
-            joined.push_str(text);
+        let document = if part.is_text_html() {
+            Cow::Borrowed(text)
         } else {
-            joined.push_str("<pre>");
+            let mut escaped = String::with_capacity(text.len() + 11);
+            escaped.push_str("<pre>");
             for character in text.chars() {
                 match character {
-                    '&' => joined.push_str("&amp;"),
-                    '<' => joined.push_str("&lt;"),
-                    '>' => joined.push_str("&gt;"),
-                    other => joined.push(other),
+                    '&' => escaped.push_str("&amp;"),
+                    '<' => escaped.push_str("&lt;"),
+                    '>' => escaped.push_str("&gt;"),
+                    other => escaped.push(other),
                 }
             }
-            joined.push_str("</pre>");
-        }
+            escaped.push_str("</pre>");
+            Cow::Owned(escaped)
+        };
+        total += document.len();
+        documents.push(document);
     }
-    joined
+    documents
 }
 
 /// Normalizes line endings, trims trailing spaces, keeps at most one blank
@@ -726,6 +729,28 @@ Content-Transfer-Encoding: base64\r\n\r\n/9j/4AAQ\r\n\
                 );
             }
         }
+    }
+
+    #[test]
+    fn markup_left_open_in_one_html_part_does_not_hide_the_next() {
+        let raw = b"Subject: s\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n\
+--x\r\nContent-Type: text/html\r\n\r\n<p>Reset your <a href=\"https://a.example\">password</a></p><!--\r\n\
+--x\r\nContent-Type: text/html\r\n\r\n<p>This message failed <a href=\"https://b.example\">authentication</a>.</p><script>\r\n\
+--x\r\nContent-Type: text/html\r\n\r\n<div hidden><p>third</p>\r\n\
+--x\r\nContent-Type: text/plain\r\n\r\nfooter\r\n--x--\r\n";
+        let rendered = render_message(raw, BodyPreference::Html);
+        assert_eq!(rendered.format, Some(BodyFormat::Html));
+        let body = rendered.body.as_str();
+        // An unclosed hidden element shows its content, as in one document.
+        for shown in [
+            "Reset your password [1]",
+            "This message failed authentication [2].",
+            "third",
+            "footer",
+        ] {
+            assert!(body.contains(shown), "{shown:?} in {body:?}");
+        }
+        assert_eq!(rendered.links.len(), 2);
     }
 
     #[test]
