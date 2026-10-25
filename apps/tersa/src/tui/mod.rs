@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
-use tersa_application::mailbox::MessageId;
+use tersa_application::mailbox::{MessageId, StoreLimit};
 use tersa_presentation::terminal::SafeText;
 
 pub use app::Row;
@@ -31,12 +31,13 @@ use app::{App, Request, SyncState};
 
 /// Where the interface reads cached mail from.
 pub trait MailSource {
-    /// The cached rows, newest first.
+    /// Up to `limit` cached rows after `after`, newest first, or from the
+    /// newest when `after` is `None`.
     ///
     /// # Errors
     ///
     /// Returns `Err(())` when the local store cannot be read.
-    fn rows(&self) -> Result<Vec<Row>, ()>;
+    fn page(&self, after: Option<&Row>, limit: u16) -> Result<Vec<Row>, ()>;
 
     /// The cached raw message `id`; `Ok(None)` when only the envelope is
     /// cached.
@@ -64,6 +65,12 @@ pub trait Remote: Send + 'static {
 
 /// How often the loop checks for finished work while idle.
 const TICK: Duration = Duration::from_millis(100);
+
+/// Rows read before the first frame.
+const FIRST_PAGE: u16 = 100;
+
+/// Rows read per page afterwards, one page per pass while no key waits.
+const PAGE: u16 = 500;
 
 /// How often the account syncs on its own.
 const SYNC_EVERY: Duration = Duration::from_secs(5 * 60);
@@ -103,9 +110,11 @@ pub fn run(
 ) -> Result<(), String> {
     require_terminal()?;
     let rows = source
-        .rows()
+        .page(None, FIRST_PAGE)
         .map_err(|()| "could not read the local mailbox".to_owned())?;
+    let more = rows.len() == usize::from(FIRST_PAGE);
     let mut app = App::new(account, rows);
+    app.more_rows = more;
     let worker = remote.map(Worker::start);
     // Installs a panic hook that restores the terminal before reporting.
     let mut terminal = match ratatui::try_init() {
@@ -334,7 +343,12 @@ fn event_loop(
         if app.quit {
             return Ok(());
         }
-        if !event::poll(TICK).map_err(terminal_error)? {
+        if app.more_rows {
+            dirty |= load_page(app, source);
+        }
+        // While pages remain, only look for a key that is already waiting.
+        let wait = if app.more_rows { Duration::ZERO } else { TICK };
+        if !event::poll(wait).map_err(terminal_error)? {
             continue;
         }
         let key = match event::read().map_err(terminal_error)? {
@@ -415,14 +429,21 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
             }
             Done::Synced(result) => {
                 worker.syncing = false;
+                // Read again as many rows as were loaded, so the selection
+                // and the list stay where they were; later pages follow.
+                let loaded = u16::try_from(app.rows.len())
+                    .unwrap_or(u16::MAX)
+                    .clamp(FIRST_PAGE, StoreLimit::MAX);
                 let reloaded = result.and_then(|()| {
                     source
-                        .rows()
+                        .page(None, loaded)
                         .map_err(|()| "could not read the local mailbox".to_owned())
                 });
                 match reloaded {
                     Ok(rows) => {
+                        let more = rows.len() == usize::from(loaded);
                         app.reload(rows);
+                        app.more_rows = more;
                         app.synced(Ok(()), now);
                     }
                     Err(error) => app.synced(Err(error), now),
@@ -431,6 +452,22 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
         }
     }
     changed
+}
+
+/// Reads the page after the last loaded row; returns whether it changed the
+/// list.
+fn load_page(app: &mut App, source: &dyn MailSource) -> bool {
+    match source.page(app.rows.last(), PAGE) {
+        Ok(rows) => {
+            app.more_rows = rows.len() == usize::from(PAGE);
+            app.append(rows);
+        }
+        Err(()) => {
+            app.more_rows = false;
+            app.status = Some("Older messages could not be read from the local cache.".to_owned());
+        }
+    }
+    true
 }
 
 /// Fails the sync and downloads a stopped worker still owed; returns whether
@@ -472,9 +509,11 @@ mod tests {
     use tersa_presentation::terminal::SafeText;
 
     use super::app::{Body, Screen};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use super::{
-        App, Done, MailSource, Pending, Remote, Row, SYNC_EVERY, SyncState, WORKER_GONE, Worker,
-        finish_work,
+        App, Done, FIRST_PAGE, MailSource, Pending, Remote, Row, SYNC_EVERY, SyncState,
+        WORKER_GONE, Worker, finish_work, load_page,
     };
 
     /// Records the order work finishes in; syncs wait for the test.
@@ -673,13 +712,126 @@ mod tests {
     struct Empty;
 
     impl MailSource for Empty {
-        fn rows(&self) -> Result<Vec<Row>, ()> {
+        fn page(&self, _after: Option<&Row>, _limit: u16) -> Result<Vec<Row>, ()> {
             Ok(Vec::new())
         }
 
         fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
             Ok(None)
         }
+    }
+
+    /// A cache of `total` rows, newest first, that counts its reads.
+    struct Pages {
+        rows: Vec<Row>,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl Pages {
+        fn new(total: usize) -> Self {
+            let rows = (0..total)
+                .map(|index| {
+                    let envelope = tersa_application::mailbox::MessageEnvelope::new(
+                        id(&format!("m{index:05}")),
+                        tersa_application::mailbox::ThreadId::new("t").expect("thread"),
+                        tersa_application::mailbox::HeaderText::new("Ann <ann@example.com>")
+                            .expect("from"),
+                        tersa_application::mailbox::HeaderText::new(if index % 2 == 0 {
+                            "even"
+                        } else {
+                            "odd"
+                        })
+                        .expect("subject"),
+                        tersa_application::mailbox::HeaderText::new("preview").expect("preview"),
+                        tersa_application::mailbox::UnixTimestampMillis::new(
+                            1_000_000 - i64::try_from(index).expect("small"),
+                        )
+                        .expect("time"),
+                        false,
+                    );
+                    Row::from_envelope(&envelope)
+                })
+                .collect();
+            Self {
+                rows,
+                reads: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl MailSource for Pages {
+        fn page(&self, after: Option<&Row>, limit: u16) -> Result<Vec<Row>, ()> {
+            self.reads.set(self.reads.get() + 1);
+            let start = after.map_or(0, |after| {
+                self.rows
+                    .iter()
+                    .position(|row| row.id == after.id)
+                    .map_or(self.rows.len(), |position| position + 1)
+            });
+            Ok(self.rows[start..]
+                .iter()
+                .take(usize::from(limit))
+                .cloned()
+                .collect())
+        }
+
+        fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn older_rows_load_a_page_at_a_time_and_join_the_search() {
+        let source = Pages::new(1_234);
+        let first = source.page(None, FIRST_PAGE).expect("page");
+        let mut app = App::new(SafeText::single_line("acct"), first);
+        app.more_rows = true;
+        // Searching before the older rows arrive still covers them later.
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "odd".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        while app.more_rows {
+            assert!(load_page(&mut app, &source));
+        }
+        assert_eq!(source.reads.get(), 1 + 3, "100, then 500, 500 and 134");
+        assert_eq!(app.rows.len(), 1_234);
+        let ids: Vec<&str> = app.rows.iter().map(|row| row.id.as_str()).collect();
+        let expected: Vec<String> = (0..1_234).map(|index| format!("m{index:05}")).collect();
+        assert_eq!(ids, expected, "every row once, in order");
+        assert_eq!(app.shown.len(), 617, "the search covers every page");
+    }
+
+    #[test]
+    fn a_sync_reloads_as_many_rows_as_were_loaded() {
+        let source = Pages::new(1_234);
+        let mut app = App::new(
+            SafeText::single_line("acct"),
+            source.page(None, 600).expect("page"),
+        );
+        app.more_rows = true;
+        for _ in 0..300 {
+            app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        let (jobs, _) = tokio::sync::mpsc::unbounded_channel();
+        let (done_sender, done) = mpsc::channel();
+        let mut worker = Worker {
+            jobs,
+            done,
+            fetching: HashSet::new(),
+            open: tokio::sync::watch::channel(None).0,
+            syncing: true,
+            last_sync: Some((Instant::now(), SystemTime::now())),
+        };
+        done_sender.send(Done::Synced(Ok(()))).expect("send");
+        assert!(finish_work(&mut worker, &mut app, &source, 0));
+        assert_eq!(app.rows.len(), 600);
+        assert!(app.more_rows);
+        assert_eq!(
+            app.shown_row(app.selected).map(|row| row.id.as_str()),
+            Some("m00300")
+        );
     }
 
     #[test]

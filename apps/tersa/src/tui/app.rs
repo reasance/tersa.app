@@ -202,6 +202,8 @@ pub struct App {
     pub preference: BodyPreference,
     /// Set when the screen changes, so the next draw repaints every cell.
     pub repaint: bool,
+    /// Whether older rows may still be in the cache, not yet loaded.
+    pub more_rows: bool,
 }
 
 impl App {
@@ -225,6 +227,7 @@ impl App {
             // and its links are numbered rather than inlined.
             preference: BodyPreference::Html,
             repaint: false,
+            more_rows: false,
         }
     }
 
@@ -248,6 +251,16 @@ impl App {
 
     /// Replaces the rows after a sync, keeping the selection and any open
     /// message.
+    /// Adds older rows after the loaded ones, keeping the selection.
+    pub fn append(&mut self, rows: Vec<Row>) {
+        let words = self.search_words();
+        let start = self.rows.len();
+        self.rows.extend(rows);
+        let rows = &self.rows;
+        self.shown
+            .extend((start..rows.len()).filter(|&index| rows[index].matches(&words)));
+    }
+
     pub fn reload(&mut self, rows: Vec<Row>) {
         let selected = self.shown_row(self.selected).map(|row| row.id.clone());
         self.rows = rows;
@@ -257,14 +270,17 @@ impl App {
         }
     }
 
-    fn refilter(&mut self) {
-        let words: Vec<String> = self
-            .search
+    fn search_words(&self) -> Vec<String> {
+        self.search
             .query
             .to_lowercase()
             .split_whitespace()
             .map(str::to_owned)
-            .collect();
+            .collect()
+    }
+
+    fn refilter(&mut self) {
+        let words = self.search_words();
         self.shown = self
             .rows
             .iter()

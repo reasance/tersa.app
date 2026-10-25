@@ -7,7 +7,9 @@
 use std::process::{Command as Process, Stdio};
 use std::sync::Arc;
 
-use tersa_application::mailbox::{AccountId, MailboxReader, MessageId, StoreLimit};
+use tersa_application::mailbox::{
+    AccountId, EnvelopeCursor, MailboxReader, MessageId, StoreLimit, UnixTimestampMillis,
+};
 use tersa_application::sync::SyncReport;
 use tersa_keys::RootKey;
 use tersa_presentation::terminal::SafeText;
@@ -363,9 +365,6 @@ pub fn inbox(context: &Context, raw: Option<&str>, limit: u16) -> Result<(), Str
     Ok(())
 }
 
-/// The most messages the interface loads; paging arrives with T2d.
-const TUI_MESSAGES: u16 = 500;
-
 /// Opens the full-screen interface on the first account's cached mail. The
 /// installation lock is held for the whole session.
 pub fn tui(context: &Context) -> Result<(), String> {
@@ -388,7 +387,6 @@ pub fn tui(context: &Context) -> Result<(), String> {
         store,
         account: account.clone(),
         executor: executor()?,
-        limit: StoreLimit::new(TUI_MESSAGES).map_err(|_error| "invalid limit".to_owned())?,
     };
     // Network work needs the OAuth client; without it the interface still
     // reads the cache.
@@ -439,13 +437,27 @@ struct StoreSource<S> {
     store: S,
     account: AccountId,
     executor: tokio::runtime::Runtime,
-    limit: StoreLimit,
 }
 
 impl<S: MailboxReader> crate::tui::MailSource for StoreSource<S> {
-    fn rows(&self) -> Result<Vec<crate::tui::Row>, ()> {
+    fn page(
+        &self,
+        after: Option<&crate::tui::Row>,
+        limit: u16,
+    ) -> Result<Vec<crate::tui::Row>, ()> {
+        let limit = StoreLimit::new(limit).map_err(|_error| ())?;
+        let cursor = after
+            .map(|row| {
+                UnixTimestampMillis::new(row.received_at_millis)
+                    .map(|at| EnvelopeCursor::new(at, row.id.clone()))
+            })
+            .transpose()
+            .map_err(|_error| ())?;
         self.executor
-            .block_on(self.store.list_envelopes(&self.account, self.limit))
+            .block_on(
+                self.store
+                    .list_envelopes_after(&self.account, cursor.as_ref(), limit),
+            )
             .map(|envelopes| {
                 envelopes
                     .iter()
