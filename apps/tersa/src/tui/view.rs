@@ -26,6 +26,8 @@ const DATE_WIDTH: usize = 6;
 /// a pathological body (half a megabyte of one-character lines) to a few
 /// megabytes of layout.
 const MAX_MESSAGE_LINES: usize = 20_000;
+/// The wrappers stop one line past the cap, so a cut shows as a longer layout.
+const LINE_BUDGET: usize = MAX_MESSAGE_LINES + 1;
 
 fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
@@ -281,8 +283,6 @@ fn message_lines(view: &MessageView, row: Option<&Row>, columns: usize) -> Vec<S
     }
     if lines.len() > MAX_MESSAGE_LINES {
         lines.truncate(MAX_MESSAGE_LINES);
-    }
-    if lines.len() == MAX_MESSAGE_LINES {
         lines.push(Line::styled(
             "[… the rest of this message is too long to show]",
             dim(),
@@ -331,7 +331,7 @@ fn rendered_lines(
         lines.push(Line::styled("Links", bold()));
         let indent = format!("[{}] ", rendered.links.len()).len();
         for (number, link) in rendered.links.iter().enumerate() {
-            let room = MAX_MESSAGE_LINES.saturating_sub(lines.len());
+            let room = LINE_BUDGET.saturating_sub(lines.len());
             if room == 0 {
                 break;
             }
@@ -377,7 +377,7 @@ fn header(lines: &mut Vec<StyledLine>, label: &str, value: &str, columns: usize)
     }
     let prefix = format!("{label}: ");
     let indent = width(&prefix);
-    let room = MAX_MESSAGE_LINES.saturating_sub(lines.len());
+    let room = LINE_BUDGET.saturating_sub(lines.len());
     let wrapped = wrap(value, columns.saturating_sub(indent).max(1), room);
     for (number, part) in wrapped.into_iter().enumerate() {
         let lead = if number == 0 {
@@ -390,7 +390,7 @@ fn header(lines: &mut Vec<StyledLine>, label: &str, value: &str, columns: usize)
 }
 
 fn push_wrapped(lines: &mut Vec<StyledLine>, text: &str, columns: usize, style: Style) {
-    let room = MAX_MESSAGE_LINES.saturating_sub(lines.len());
+    let room = LINE_BUDGET.saturating_sub(lines.len());
     lines.extend(
         wrap(text, columns, room)
             .into_iter()
@@ -650,6 +650,25 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
     }
 
     #[test]
+    fn a_message_that_exactly_fills_the_bound_is_not_marked_cut() {
+        let laid_out_len = |body_lines: usize| {
+            let mut raw = b"Subject: long\r\n\r\n".to_vec();
+            raw.extend(b"x\n".repeat(body_lines));
+            let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "long", true)]);
+            app.show_message(MessageId::new("m").expect("id"), Ok(Some(raw)));
+            let _ = screen(&mut app, 40, 5);
+            laid_out(&app)
+        };
+        let headers = laid_out_len(1).len() - 1;
+        let full = laid_out_len(20_000 - headers);
+        assert_eq!(full.len(), 20_000);
+        assert!(!full.iter().any(|line| line.contains("too long to show")));
+        let over = laid_out_len(20_001 - headers);
+        assert_eq!(over.len(), 20_001);
+        assert!(over[20_000].contains("too long to show"));
+    }
+
+    #[test]
     fn many_long_links_in_a_narrow_pane_stay_within_the_bound() {
         // 500 links of 2 KB at two columns would wrap to 512,000 lines.
         let mut anchors = String::new();
@@ -670,6 +689,22 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
         let lines = &view.layout.as_ref().expect("laid out").1;
         assert_eq!(lines.len(), 20_001);
         assert!(lines[20_000].to_string().contains("too long to show"));
+    }
+
+    /// The open message's lines as laid out, before ratatui sees them.
+    /// ratatui drops graphemes that hold control characters, so only these
+    /// show whether SafeText removed them.
+    fn laid_out(app: &App) -> Vec<String> {
+        let crate::tui::app::Screen::Message(view) = &app.screen else {
+            panic!("message screen");
+        };
+        view.layout
+            .as_ref()
+            .expect("laid out")
+            .1
+            .iter()
+            .map(ToString::to_string)
+            .collect()
     }
 
     fn assert_no_controls(lines: &[String]) {
@@ -700,6 +735,7 @@ Content-Disposition: attachment; filename=\"\u{1b}[2Jevil\u{202e}fdp.exe\"\r\n\r
         let lines = screen(&mut app, 60, 30);
         assert!(lines.join("\n").contains("Attachments"), "{lines:?}");
         assert_no_controls(&lines);
+        assert_no_controls(&laid_out(&app));
 
         app.show_message(MessageId::new("m").expect("id"), Ok(None));
         app.downloaded(
@@ -709,6 +745,7 @@ Content-Disposition: attachment; filename=\"\u{1b}[2Jevil\u{202e}fdp.exe\"\r\n\r
         let lines = screen(&mut app, 60, 12);
         assert!(lines.join("\n").contains("could not be downloaded"));
         assert_no_controls(&lines);
+        assert_no_controls(&laid_out(&app));
     }
 
     #[test]
