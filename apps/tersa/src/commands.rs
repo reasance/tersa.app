@@ -433,10 +433,10 @@ impl crate::tui::Remote for Network {
 }
 
 /// Reads cached mail for the interface from one account's store.
-struct StoreSource<S> {
-    store: S,
-    account: AccountId,
-    executor: tokio::runtime::Runtime,
+pub(crate) struct StoreSource<S> {
+    pub(crate) store: S,
+    pub(crate) account: AccountId,
+    pub(crate) executor: tokio::runtime::Runtime,
 }
 
 impl<S: MailboxReader> crate::tui::MailSource for StoreSource<S> {

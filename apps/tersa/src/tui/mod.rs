@@ -9,6 +9,8 @@
 //! ratatui's test backend.
 
 mod app;
+#[cfg(test)]
+mod perf;
 mod view;
 mod wrap;
 
@@ -457,15 +459,12 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
 /// Reads the page after the last loaded row; returns whether it changed the
 /// list.
 fn load_page(app: &mut App, source: &dyn MailSource) -> bool {
-    match source.page(app.rows.last(), PAGE) {
-        Ok(rows) => {
-            app.more_rows = rows.len() == usize::from(PAGE);
-            app.append(rows);
-        }
-        Err(()) => {
-            app.more_rows = false;
-            app.status = Some("Older messages could not be read from the local cache.".to_owned());
-        }
+    if let Ok(rows) = source.page(app.rows.last(), PAGE) {
+        app.more_rows = rows.len() == usize::from(PAGE);
+        app.append(rows);
+    } else {
+        app.more_rows = false;
+        app.status = Some("Older messages could not be read from the local cache.".to_owned());
     }
     true
 }

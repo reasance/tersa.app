@@ -18,7 +18,8 @@ use crate::identity::IdentityHash;
 
 #[doc(inline)]
 pub use tersa_domain::mailbox::{
-    AccountId, HeaderText, Message, MessageEnvelope, MessageId, ThreadId, UnixTimestampMillis,
+    AccountId, HeaderText, Message, MessageContent, MessageEnvelope, MessageId, ThreadId,
+    UnixTimestampMillis,
 };
 
 /// Owns a `Send` future without selecting an async runtime.
@@ -661,7 +662,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Wake, Waker};
-    use tersa_domain::mailbox::MessageContent;
 
     struct NonDebugItem(&'static str);
 
