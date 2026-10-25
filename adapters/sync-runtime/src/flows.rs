@@ -333,7 +333,7 @@ impl Runtime {
             let store = self.installation.open_store(account)?;
             gated_fetch(account, session, &self.hasher, store, message_id)
                 .await
-                .map(|message| message.content().as_bytes().to_vec())
+                .map(|message| message.into_content().into_bytes())
                 .map_err(FlowError::Fetch)
         })
         .await

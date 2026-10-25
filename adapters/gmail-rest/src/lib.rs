@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::fmt;
 use std::pin::Pin;
 use std::time::Duration;
@@ -107,6 +108,16 @@ impl GmailMailbox {
         request: Request,
         limit: usize,
     ) -> Result<T, RemoteMailboxError> {
+        let body = self.request_body(request, limit).await?;
+        serde_json::from_slice(&body).map_err(|_error| RemoteMailboxError::InvalidResponse)
+    }
+
+    /// The successful response body of `request`, unparsed.
+    async fn request_body(
+        &self,
+        request: Request,
+        limit: usize,
+    ) -> Result<Vec<u8>, RemoteMailboxError> {
         let response = self
             .transport
             .get(request, limit)
@@ -115,7 +126,7 @@ impl GmailMailbox {
         if !(200..300).contains(&response.status) {
             return Err(map_status(response.status, &response.body));
         }
-        serde_json::from_slice(&response.body).map_err(|_error| RemoteMailboxError::InvalidResponse)
+        Ok(response.body)
     }
 
     async fn metadata(&self, id: &MessageId) -> Result<GmailMetadata, RemoteMailboxError> {
@@ -176,16 +187,21 @@ impl RemoteMailbox for GmailMailbox {
         Box::pin(async move {
             self.checked_account(account)?;
             let envelope = envelope_from(self.metadata(message_id).await?, message_id)?;
-            let raw: GmailRaw = self
-                .request_json(
+            let body = self
+                .request_body(
                     message_request(message_id, MessageFormat::Raw)?,
                     RAW_JSON_LIMIT,
                 )
                 .await?;
-            if raw.id != message_id.as_str() || raw.thread_id != envelope.thread_id().as_str() {
-                return Err(RemoteMailboxError::InvalidResponse);
-            }
-            let content = decode_raw_with_limit(&raw.raw, MessageContent::MAX_LEN)?;
+            let content = {
+                let raw: GmailRaw<'_> = serde_json::from_slice(&body)
+                    .map_err(|_error| RemoteMailboxError::InvalidResponse)?;
+                if raw.id != message_id.as_str() || raw.thread_id != envelope.thread_id().as_str() {
+                    return Err(RemoteMailboxError::InvalidResponse);
+                }
+                decode_raw_with_limit(&raw.raw, MessageContent::MAX_LEN)?
+            };
+            drop(body);
             MessageContent::new(content)
                 .map_err(|_error| RemoteMailboxError::InvalidResponse)
                 .map(|content| Message::new(envelope, content))
@@ -445,12 +461,15 @@ struct GmailMetadata {
     payload: Payload,
 }
 
+/// Borrows the base64 text from the response body: it has no JSON escapes,
+/// so the largest field is never copied before it is decoded.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GmailRaw {
+struct GmailRaw<'a> {
     id: String,
     thread_id: String,
-    raw: String,
+    #[serde(borrow)]
+    raw: Cow<'a, str>,
 }
 
 #[derive(Default, Deserialize)]
