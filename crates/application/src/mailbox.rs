@@ -669,9 +669,6 @@ mod tests {
     fn account() -> AccountId {
         AccountId::new("account").unwrap()
     }
-    fn named_account(name: &str) -> AccountId {
-        AccountId::new(name).unwrap()
-    }
     fn envelope(id: &str, thread: &str, at: i64) -> MessageEnvelope {
         MessageEnvelope::new(
             MessageId::new(id).unwrap(),
@@ -681,12 +678,6 @@ mod tests {
             HeaderText::new("preview-sentinel").unwrap(),
             UnixTimestampMillis::new(at).unwrap(),
             false,
-        )
-    }
-    fn message(id: &str, thread: &str, at: i64) -> Message {
-        Message::new(
-            envelope(id, thread, at),
-            MessageContent::new(b"body-sentinel".to_vec()).unwrap(),
         )
     }
 
@@ -1108,117 +1099,5 @@ mod tests {
             );
         }
         assert_eq!(ids, ["thread-a", "thread-b", "middle", "old"]);
-    }
-
-    #[test]
-    fn fake_store_round_trips_messages_and_documents_stable_ordering() {
-        let store = FakeStore::default();
-        let account = account();
-        let values = [
-            envelope("old", "thread", 1),
-            envelope("thread-b", "thread", 3),
-            envelope("thread-a", "thread", 3),
-            envelope("middle", "other", 2),
-        ];
-        let mut stored = store.upsert_envelopes(&account, &values);
-        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
-        let mut listed = store.list_envelopes(&account, StoreLimit::new(500).unwrap());
-        let Poll::Ready(Ok(listed)) = poll_once(&mut listed) else {
-            panic!("the fake is immediately ready");
-        };
-        assert_eq!(
-            listed
-                .iter()
-                .map(|value| value.message_id().as_str())
-                .collect::<Vec<_>>(),
-            ["thread-a", "thread-b", "middle", "old"]
-        );
-        let thread = ThreadId::new("thread").unwrap();
-        let mut threaded = store.thread_envelopes(&account, &thread, StoreLimit::new(2).unwrap());
-        let Poll::Ready(Ok(threaded)) = poll_once(&mut threaded) else {
-            panic!("the fake is immediately ready");
-        };
-        assert_eq!(
-            threaded
-                .iter()
-                .map(|value| value.message_id().as_str())
-                .collect::<Vec<_>>(),
-            ["old", "thread-a"]
-        );
-        let value = message("complete", "thread", 4);
-        let expected = value.clone();
-        let mut stored = store.put_message(&account, &value);
-        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
-        let mut found = store.message(&account, value.envelope().message_id());
-        assert_eq!(poll_once(&mut found), Poll::Ready(Ok(Some(expected))));
-    }
-
-    #[test]
-    fn fake_store_upserts_by_account_and_message_id() {
-        let store = FakeStore::default();
-        let account = account();
-        let initial = [
-            envelope("replace", "thread", 1),
-            envelope("preserve", "thread", 2),
-        ];
-        let mut stored = store.upsert_envelopes(&account, &initial);
-        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
-
-        let replacement = [envelope("replace", "thread", 4)];
-        let mut stored = store.upsert_envelopes(&account, &replacement);
-        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
-
-        let mut listed = store.list_envelopes(&account, StoreLimit::new(10).unwrap());
-        let Poll::Ready(Ok(listed)) = poll_once(&mut listed) else {
-            panic!("the fake is immediately ready");
-        };
-        assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].message_id().as_str(), "replace");
-        assert_eq!(listed[0].received_at().as_millis(), 4);
-        assert_eq!(listed[1].message_id().as_str(), "preserve");
-    }
-
-    #[test]
-    fn fake_store_isolates_envelopes_and_complete_messages_by_account() {
-        let store = FakeStore::default();
-        let first = named_account("first-account");
-        let second = named_account("second-account");
-        let first_envelope = envelope("shared-id", "thread", 1);
-        let second_envelope = envelope("shared-id", "thread", 2);
-        let first_values = [first_envelope.clone()];
-        let mut stored = store.upsert_envelopes(&first, &first_values);
-        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
-        let second_values = [second_envelope.clone()];
-        let mut stored = store.upsert_envelopes(&second, &second_values);
-        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
-
-        let mut first_listed = store.list_envelopes(&first, StoreLimit::new(10).unwrap());
-        assert_eq!(
-            poll_once(&mut first_listed),
-            Poll::Ready(Ok(vec![first_envelope]))
-        );
-        let mut second_listed = store.list_envelopes(&second, StoreLimit::new(10).unwrap());
-        assert_eq!(
-            poll_once(&mut second_listed),
-            Poll::Ready(Ok(vec![second_envelope]))
-        );
-
-        let first_message = message("shared-message", "thread", 3);
-        let second_message = message("shared-message", "thread", 4);
-        let mut stored = store.put_message(&first, &first_message);
-        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
-        let mut stored = store.put_message(&second, &second_message);
-        assert_eq!(poll_once(&mut stored), Poll::Ready(Ok(())));
-        let id = MessageId::new("shared-message").unwrap();
-        let mut found = store.message(&first, &id);
-        assert_eq!(
-            poll_once(&mut found),
-            Poll::Ready(Ok(Some(first_message.clone())))
-        );
-        let mut found = store.message(&second, &id);
-        assert_eq!(
-            poll_once(&mut found),
-            Poll::Ready(Ok(Some(second_message.clone())))
-        );
     }
 }

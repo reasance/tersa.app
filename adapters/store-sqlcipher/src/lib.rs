@@ -5273,8 +5273,21 @@ mod store {
             );
             run(store.put_message(&account(), &message)).unwrap();
             run(store.put_message(&account(), &message)).unwrap();
-            let changed = envelope("m1", "t2", 20);
+            let changed = MessageEnvelope::new(
+                MessageId::new("m1").unwrap(),
+                ThreadId::new("t2").unwrap(),
+                HeaderText::new("new from").unwrap(),
+                HeaderText::new("new subject").unwrap(),
+                HeaderText::new("new preview").unwrap(),
+                UnixTimestampMillis::new(20).unwrap(),
+                true,
+            );
             run(store.upsert_envelopes(&account(), std::slice::from_ref(&changed))).unwrap();
+            assert_eq!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap())).unwrap(),
+                vec![changed.clone()],
+                "the upsert replaces the envelope's fields"
+            );
             assert_eq!(
                 run(store.message(&account(), changed.message_id()))
                     .unwrap()
@@ -5928,6 +5941,28 @@ mod store {
                     .collect::<Vec<_>>(),
                 vec!["a", "b"]
             );
+            run(store.upsert_envelopes(
+                &account(),
+                &[
+                    envelope("early", "thread", 5),
+                    envelope("older", "other", 1),
+                ],
+            ))
+            .unwrap();
+            let threaded = run(store.thread_envelopes(
+                &account(),
+                values[0].thread_id(),
+                StoreLimit::new(2).unwrap(),
+            ))
+            .unwrap();
+            assert_eq!(
+                threaded
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                vec!["early", "a"],
+                "a thread lists only its rows, oldest first, and the limit drops the newest"
+            );
             store.fail_next_mutation();
             assert_eq!(
                 run(store
@@ -5948,7 +5983,7 @@ mod store {
                 run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
                     .unwrap()
                     .len(),
-                3
+                5
             );
         }
 

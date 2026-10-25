@@ -37,12 +37,6 @@ pub struct HtmlText {
     pub links: Vec<String>,
 }
 
-/// Converts HTML to plain text.
-#[must_use]
-pub fn html_to_text(html: &str) -> HtmlText {
-    html_parts_to_text(&[html])
-}
-
 /// Converts several HTML documents to one text, in order, a blank line
 /// apart. Each document is parsed on its own, so markup one leaves open (an
 /// unclosed comment, `<script>`, or hidden element) cannot hide the next.
@@ -849,7 +843,11 @@ fn floor_char_boundary(text: &str, max: usize) -> &str {
 mod tests {
     use std::fmt::Write as _;
 
-    use super::{MAX_LINKS, MAX_TEXT_OUTPUT, html_parts_to_text, html_to_text};
+    use super::{HtmlText, MAX_LINKS, MAX_TEXT_OUTPUT, html_parts_to_text};
+
+    fn html_to_text(html: &str) -> HtmlText {
+        html_parts_to_text(&[html])
+    }
 
     fn text(html: &str) -> String {
         html_to_text(html).text
