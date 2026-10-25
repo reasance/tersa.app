@@ -39,7 +39,7 @@ impl CacheClock for SystemCacheClock {
 pub(crate) enum Origin {
     /// Reused from the cache.
     Cached,
-    /// Refreshed for this call.
+    /// Refreshed for this call, or by the refresh it waited for.
     Fresh,
 }
 
@@ -112,12 +112,18 @@ impl<T: Clone, E: Clone, C: CacheClock> SessionCache<T, E, C> {
         let gate = Arc::clone(lock(&self.refreshing).entry(account.clone()).or_default());
         let seen = gate.finished.load(Ordering::SeqCst);
         let mut turn = gate.turn.lock().await;
+        let refreshed_meanwhile = gate.finished.load(Ordering::SeqCst) != seen;
         if let Some(value) = self.get(account) {
-            return Ok((value, Origin::Cached));
+            // A token refreshed while this caller waited is as new as the
+            // leader's: a rejection is not retried with yet another one.
+            let origin = if refreshed_meanwhile {
+                Origin::Fresh
+            } else {
+                Origin::Cached
+            };
+            return Ok((value, origin));
         }
-        if gate.finished.load(Ordering::SeqCst) != seen
-            && let Some(error) = turn.as_ref()
-        {
+        if refreshed_meanwhile && let Some(error) = turn.as_ref() {
             return Err(error.clone());
         }
         // The token's lifetime starts no earlier than this request.
@@ -448,9 +454,10 @@ mod tests {
             results,
             [
                 Ok((1, Origin::Fresh)),
-                Ok((1, Origin::Cached)),
-                Ok((1, Origin::Cached))
-            ]
+                Ok((1, Origin::Fresh)),
+                Ok((1, Origin::Fresh))
+            ],
+            "waiters got the token just refreshed, not an old one"
         );
     }
 }
