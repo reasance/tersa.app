@@ -75,6 +75,21 @@ const REDRAW_EVERY: Duration = Duration::from_secs(30);
 /// any thread, so the interface must not keep drawing after one.
 static PANICKED: AtomicBool = AtomicBool::new(false);
 
+/// Checks that standard input and output are a terminal. Callers run it
+/// before unlocking anything, so `tersa > out.txt` fails without asking for a
+/// passphrase.
+///
+/// # Errors
+///
+/// Returns a message when either is not a terminal.
+pub fn require_terminal() -> Result<(), String> {
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        Ok(())
+    } else {
+        Err("the interface needs a terminal; `tersa inbox` prints plain output".to_owned())
+    }
+}
+
 /// Runs the interface until the user quits.
 ///
 /// # Errors
@@ -86,9 +101,7 @@ pub fn run(
     source: &dyn MailSource,
     remote: Option<Box<dyn Remote>>,
 ) -> Result<(), String> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err("the interface needs a terminal; `tersa inbox` prints plain output".to_owned());
-    }
+    require_terminal()?;
     let rows = source
         .rows()
         .map_err(|()| "could not read the local mailbox".to_owned())?;

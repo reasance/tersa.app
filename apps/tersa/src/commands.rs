@@ -369,6 +369,7 @@ const TUI_MESSAGES: u16 = 500;
 /// Opens the full-screen interface on the first account's cached mail. The
 /// installation lock is held for the whole session.
 pub fn tui(context: &Context) -> Result<(), String> {
+    crate::tui::require_terminal()?;
     let locked = require_installation(context)?;
     let account = locked
         .installation

@@ -14,6 +14,7 @@ mail-parser.workspace = true
 tersa-application = { path = "../application", version = "=0.0.0" }
 tersa-domain = { path = "../domain", version = "=0.0.0" }
 unicode-segmentation.workspace = true
+unicode-width.workspace = true
 
 [lints]
 workspace = true

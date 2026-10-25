@@ -27,14 +27,16 @@
 //!   and U+E0000–U+E0FFF.
 //!
 //! The line and paragraph separators U+2028 and U+2029 become ordinary line
-//! breaks. Marks stacked on one character, as in "zalgo" text, are capped so
-//! they cannot draw over neighboring lines: each grapheme cluster keeps at most
-//! [`MAX_COMBINING_RUN`] generic combining marks and [`MAX_GRAPHEME_CHARS`]
-//! code points in all.
+//! breaks. Marks stacked on one character, as in "zalgo" text, are capped:
+//! each grapheme cluster keeps at most [`MAX_COMBINING_RUN`] zero-width marks,
+//! from any script, and [`MAX_GRAPHEME_CHARS`] code points in all. A terminal
+//! may still draw a few marks outside the cell, but no character can pile up
+//! enough of them to cover the lines around it.
 
 use std::fmt;
 
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthChar;
 
 /// Text that is safe to write to a terminal.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -73,7 +75,9 @@ impl fmt::Display for SafeText {
     }
 }
 
-/// The most generic combining marks kept on one character.
+/// The most zero-width marks kept on one character. Real text needs up to
+/// four: Hebrew with a dot, a point, and a cantillation mark, or a Devanagari
+/// conjunct of four consonants.
 pub const MAX_COMBINING_RUN: usize = 4;
 
 /// The most code points kept in one grapheme cluster. Real text stays well
@@ -94,11 +98,11 @@ fn sanitize(input: &str, layout: impl Fn(char) -> Option<char>) -> String {
     }
     let mut output = String::with_capacity(kept.len());
     for grapheme in kept.graphemes(true) {
-        let mut generic = 0;
+        let mut marks = 0;
         for character in grapheme.chars().take(MAX_GRAPHEME_CHARS) {
-            if is_generic_combining(character) {
-                generic += 1;
-                if generic > MAX_COMBINING_RUN {
+            if is_mark(character) {
+                marks += 1;
+                if marks > MAX_COMBINING_RUN {
                     continue;
                 }
             }
@@ -108,17 +112,11 @@ fn sanitize(input: &str, layout: impl Fn(char) -> Option<char>) -> String {
     output
 }
 
-/// Combining marks from the script-neutral blocks that stack in "zalgo"
-/// text. Script-specific marks, which real words need, are left alone.
-const fn is_generic_combining(character: char) -> bool {
-    matches!(
-        character,
-        '\u{300}'..='\u{36f}'
-            | '\u{1ab0}'..='\u{1aff}'
-            | '\u{1dc0}'..='\u{1dff}'
-            | '\u{20d0}'..='\u{20ff}'
-            | '\u{fe20}'..='\u{fe2f}'
-    )
+/// Whether `character` takes no column of its own. After the invisible
+/// characters are gone, that leaves the nonspacing and enclosing marks of every
+/// script, which are what stack in "zalgo" text, and the medial Hangul jamo.
+fn is_mark(character: char) -> bool {
+    character.width() == Some(0)
 }
 
 /// Whether `character` survives sanitizing.
@@ -150,7 +148,7 @@ pub(crate) const fn is_allowed(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_GRAPHEME_CHARS, SafeText};
+    use super::{MAX_COMBINING_RUN, MAX_GRAPHEME_CHARS, SafeText};
 
     #[test]
     fn strips_escape_sequences_and_controls() {
@@ -194,14 +192,24 @@ mod tests {
     #[test]
     fn interleaved_script_marks_do_not_reset_the_cap() {
         let hostile = format!("x{}y", "\u{301}\u{301}\u{301}\u{301}\u{5b0}".repeat(2000));
-        // The first ten code points hold eight generic marks; four survive.
         assert_eq!(
             SafeText::multi_line(&hostile).as_str(),
-            "x\u{301}\u{301}\u{301}\u{301}\u{5b0}y"
+            "x\u{301}\u{301}\u{301}\u{301}y"
         );
-        let only_script = format!("x{}", "\u{5b0}".repeat(500));
+        // Marks outside the generic combining blocks count too: Hebrew points,
+        // Thai tone marks, and enclosing marks.
+        for mark in ['\u{5b0}', '\u{e49}', '\u{489}'] {
+            let stacked = format!("x{}y", mark.to_string().repeat(500));
+            assert_eq!(
+                SafeText::single_line(&stacked).as_str(),
+                format!("x{}y", mark.to_string().repeat(MAX_COMBINING_RUN)),
+                "{mark:?}"
+            );
+        }
+        // Spacing marks take a column, so only the code point cap holds them.
+        let spacing = format!("\u{915}{}", "\u{93e}".repeat(500));
         assert_eq!(
-            SafeText::single_line(&only_script).as_str().chars().count(),
+            SafeText::single_line(&spacing).as_str().chars().count(),
             MAX_GRAPHEME_CHARS
         );
         // Hebrew with points and cantillation, a Devanagari conjunct with a

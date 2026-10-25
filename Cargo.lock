@@ -2311,6 +2311,7 @@ dependencies = [
  "tersa-application",
  "tersa-domain",
  "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
