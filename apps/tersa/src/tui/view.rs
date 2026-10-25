@@ -435,18 +435,44 @@ mod tests {
 
     #[test]
     fn hostile_text_never_reaches_the_screen_as_controls() {
-        let mut app = App::new(
-            SafeText::single_line("acct"),
-            vec![row(
-                "\u{1b}]52;c;cGF5bG9hZA==\u{7}Evil",
-                "\u{1b}[2J\u{202e}gnp.exe\u{9b}31m",
-                true,
-            )],
+        use tersa_application::mailbox::{
+            HeaderText, MessageEnvelope, MessageId, ThreadId, UnixTimestampMillis,
+        };
+        let envelope = MessageEnvelope::new(
+            MessageId::new("m").expect("id"),
+            ThreadId::new("t").expect("thread"),
+            // Envelope headers cannot hold controls, but Gmail's escaped
+            // previews decode to them, and bidi controls pass both.
+            HeaderText::new("Evil\u{202e}gnp.exe <e@example.com>").expect("from"),
+            HeaderText::new("\u{2066}Invoice\u{2069}\u{200b}").expect("subject"),
+            HeaderText::new("&#27;]52;c;cGF5bG9hZA==&#7;pre&#155;31mview&#8238;").expect("preview"),
+            UnixTimestampMillis::new(1_760_990_000_000).expect("time"),
+            true,
         );
+        let hostile = Row::from_envelope(&envelope);
+        // ratatui also drops graphemes that hold control characters, so only
+        // the row itself shows whether SafeText removed them.
+        assert_eq!(hostile.preview.as_str(), "]52;c;cGF5bG9hZA==pre31mview");
+        for field in [&hostile.sender, &hostile.subject, &hostile.preview] {
+            assert!(
+                !field
+                    .as_str()
+                    .chars()
+                    .any(|character| character.is_control()
+                        || ('\u{202a}'..='\u{202e}').contains(&character)
+                        || ('\u{2066}'..='\u{2069}').contains(&character)
+                        || character == '\u{200b}'),
+                "{:?}",
+                field.as_str()
+            );
+        }
+        // Bidi controls are printable to ratatui, so the screen check matters.
+        let mut app = App::new(SafeText::single_line("acct"), vec![hostile]);
         for line in screen(&mut app, 80, 4) {
             assert!(
                 !line.chars().any(|character| character.is_control()
-                    || ('\u{202a}'..='\u{202e}').contains(&character)),
+                    || ('\u{202a}'..='\u{202e}').contains(&character)
+                    || ('\u{2066}'..='\u{2069}').contains(&character)),
                 "{line:?}"
             );
         }
