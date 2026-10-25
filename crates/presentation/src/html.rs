@@ -298,7 +298,11 @@ impl Writer {
             .or_else(|| target.strip_prefix("https://"))
             .or_else(|| target.strip_prefix("http://"))
             .unwrap_or(&target);
-        if shown.is_empty() || shown == target || shown == bare {
+        let same = |text: &str, address: &str| {
+            text.trim_end_matches('/')
+                .eq_ignore_ascii_case(address.trim_end_matches('/'))
+        };
+        if shown.is_empty() || same(shown, &target) || same(shown, bare) {
             return;
         }
         let index = match self.links.iter().position(|known| *known == target) {
@@ -350,8 +354,19 @@ impl Writer {
             return;
         }
         if self.started && self.pending_breaks > 0 {
-            for _ in 0..self.pending_breaks {
+            // A blank line between two quoted lines stays inside the quote.
+            let quoted_gap = self.quote_depth > 0
+                && self
+                    .out
+                    .rsplit('\n')
+                    .next()
+                    .is_some_and(|line| line.starts_with('>'));
+            for remaining in (0..self.pending_breaks).rev() {
                 self.push_raw("\n");
+                if quoted_gap && remaining > 0 {
+                    let marks = "> ".repeat(self.quote_depth.min(MAX_INDENT));
+                    self.push_raw(marks.trim_end());
+                }
             }
         }
         if self.at_line_start() || !self.started {
@@ -883,9 +898,13 @@ mod tests {
     fn unsafe_or_redundant_links_get_no_number() {
         let converted = html_to_text(
             "<a href=\"javascript:alert(1)\">x</a> <a href=\"https://e.com\">https://e.com</a> \
-             <a href=\"https://e.com\">e.com</a> <a href=\"data:text/html,hi\">d</a> <a>none</a>",
+             <a href=\"https://e.com\">e.com</a> <a href=\"data:text/html,hi\">d</a> <a>none</a> \
+             <a href=\"https://E.com\">https://e.com/</a>",
         );
-        assert_eq!(converted.text, "x https://e.com e.com d none");
+        assert_eq!(
+            converted.text,
+            "x https://e.com e.com d none https://e.com/"
+        );
         assert!(converted.links.is_empty());
     }
 
@@ -897,7 +916,7 @@ mod tests {
         );
         assert_eq!(
             text("<blockquote><p>quoted</p><p>more</p></blockquote>after"),
-            "> quoted\n\n> more\n\nafter"
+            "> quoted\n>\n> more\n\nafter"
         );
         assert_eq!(
             text("<table><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></table>"),

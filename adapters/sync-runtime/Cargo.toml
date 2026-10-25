@@ -28,6 +28,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tersa-application = { workspace = true, features = ["test-util"] }
+tersa-domain.workspace = true
 
 [lints]
 workspace = true

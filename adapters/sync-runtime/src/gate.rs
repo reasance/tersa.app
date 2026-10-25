@@ -14,7 +14,10 @@ use tersa_application::identity::{
     AccountIdentityHasher, AccountIdentityStore, AccountProfile, GateError, IdentityDecision,
     IdentityHash, IdentityReconcile, decide, normalize_subject,
 };
-use tersa_application::mailbox::{AccountId, MailboxStore, MailboxStoreError, RemoteMailbox};
+use tersa_application::mailbox::{
+    AccountId, MailboxStore, MailboxStoreError, Message, MessageId, RemoteMailbox,
+    RemoteMailboxError,
+};
 use tersa_application::sync::{SyncCoordinator, SyncFailure, SyncPolicy, SyncReport};
 
 /// Reports why a gated sync stopped before or during the bounded sync.
@@ -37,6 +40,30 @@ impl fmt::Display for GatedSyncError {
 }
 
 impl std::error::Error for GatedSyncError {}
+
+/// Reports why a gated single-message fetch failed.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum GatedFetchError {
+    /// The account-identity gate blocked the fetch; nothing was written.
+    Gate(GateError),
+    /// Gmail did not return the message.
+    Remote(RemoteMailboxError),
+    /// Caching the fetched message failed.
+    Store(MailboxStoreError),
+}
+
+impl fmt::Display for GatedFetchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gate(_) => formatter.write_str("the account-identity gate blocked the download"),
+            Self::Remote(error) => write!(formatter, "Gmail did not return the message ({error})"),
+            Self::Store(_) => formatter.write_str("the downloaded message could not be cached"),
+        }
+    }
+}
+
+impl std::error::Error for GatedFetchError {}
 
 /// Resolves the account-identity gate before any sync write.
 ///
@@ -176,6 +203,45 @@ where
         .map_err(GatedSyncError::Sync)
 }
 
+/// Downloads one complete message through the identity gate and caches it.
+///
+/// The gate runs first, exactly as for [`gated_sync`], and its committed hash
+/// fences the cache write, so a message can never be stored under a
+/// different account. The message is cached only when its envelope row
+/// still exists; it is returned either way. The same external serialization
+/// rule as [`gated_sync`] applies.
+///
+/// # Errors
+///
+/// Returns [`GatedFetchError::Gate`] when the gate blocks (no write occurred),
+/// [`GatedFetchError::Remote`] when Gmail fails, and
+/// [`GatedFetchError::Store`] when caching fails.
+pub async fn gated_fetch<S, St, H>(
+    account: &AccountId,
+    session: S,
+    hasher: &H,
+    store: St,
+    message_id: &MessageId,
+) -> Result<Message, GatedFetchError>
+where
+    S: AccountProfile + RemoteMailbox,
+    St: MailboxStore + AccountIdentityStore,
+    H: AccountIdentityHasher,
+{
+    let fence = run_identity_gate(account, &session, hasher, &store)
+        .await
+        .map_err(GatedFetchError::Gate)?;
+    let message = session
+        .fetch_message(account, message_id)
+        .await
+        .map_err(GatedFetchError::Remote)?;
+    store
+        .cache_message_if_present(account, &message, &fence)
+        .await
+        .map_err(GatedFetchError::Store)?;
+    Ok(message)
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::unwrap_used, reason = "tests construct valid fixtures")]
@@ -198,7 +264,7 @@ mod tests {
     use tersa_application::token::AccountSubject;
     use zeroize::Zeroizing;
 
-    use super::{GatedSyncError, gated_sync, run_identity_gate};
+    use super::{GatedFetchError, GatedSyncError, gated_fetch, gated_sync, run_identity_gate};
 
     fn subject(value: &str) -> AccountSubject {
         AccountSubject::from_raw_for_test(Zeroizing::new(value.to_owned()))
@@ -426,9 +492,10 @@ mod tests {
             &'a self,
             _account: &'a AccountId,
             _message: &'a Message,
-            _fence: &'a IdentityHash,
+            fence: &'a IdentityHash,
         ) -> BoxFuture<'a, Result<bool, MailboxStoreError>> {
-            Box::pin(async { Ok(false) })
+            self.sync_fences.lock().unwrap().push(*fence.as_bytes());
+            Box::pin(async { Ok(true) })
         }
         fn message<'a>(
             &'a self,
@@ -716,5 +783,92 @@ mod tests {
         ));
         assert!(report.is_ok());
         assert_eq!(*sync_fences.lock().unwrap(), vec![[9; 32]]);
+    }
+
+    /// A session whose mailbox returns one fixed message.
+    struct FetchingProfile(AccountSubject);
+
+    impl AccountProfile for FetchingProfile {
+        fn subject(&self) -> &AccountSubject {
+            &self.0
+        }
+    }
+
+    impl RemoteMailbox for FetchingProfile {
+        fn list_recent_envelopes<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _size: PageSize,
+            _page_token: Option<&'a PageToken>,
+        ) -> BoxFuture<'a, Result<Page<MessageEnvelope>, RemoteMailboxError>> {
+            Box::pin(async { Ok(Page::new(Vec::new(), None)) })
+        }
+        fn fetch_message<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            message_id: &'a MessageId,
+        ) -> BoxFuture<'a, Result<Message, RemoteMailboxError>> {
+            let envelope = MessageEnvelope::new(
+                message_id.clone(),
+                ThreadId::new("thread").unwrap(),
+                tersa_application::mailbox::HeaderText::new("from").unwrap(),
+                tersa_application::mailbox::HeaderText::new("subject").unwrap(),
+                tersa_application::mailbox::HeaderText::new("preview").unwrap(),
+                tersa_application::mailbox::UnixTimestampMillis::new(1).unwrap(),
+                true,
+            );
+            let content =
+                tersa_domain::mailbox::MessageContent::new(b"Subject: s\r\n\r\nbody".to_vec())
+                    .unwrap();
+            Box::pin(async move { Ok(Message::new(envelope, content)) })
+        }
+    }
+
+    #[test]
+    fn a_blocked_gate_never_downloads_or_caches() {
+        let store = FakeStore::with_stored([5; 32]);
+        let cache_fences = store.fence_probe();
+        let error = drive(gated_fetch(
+            &account(),
+            FetchingProfile(subject("user-sub")),
+            &FakeHasher::failing(),
+            store,
+            &MessageId::new("m1").unwrap(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, GatedFetchError::Gate(_)));
+        assert!(cache_fences.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_passing_gate_downloads_and_caches_under_the_verified_fence() {
+        let store = FakeStore::with_stored([5; 32]);
+        let cache_fences = store.fence_probe();
+        let message = drive(gated_fetch(
+            &account(),
+            FetchingProfile(subject("user-sub")),
+            &FakeHasher::ok([5; 32]),
+            store,
+            &MessageId::new("m1").unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(message.content().as_bytes(), b"Subject: s\r\n\r\nbody");
+        assert_eq!(*cache_fences.lock().unwrap(), vec![[5; 32]]);
+    }
+
+    #[test]
+    fn a_remote_failure_is_reported_after_the_gate() {
+        let error = drive(gated_fetch(
+            &account(),
+            FakeProfile(subject("user-sub")),
+            &FakeHasher::ok([5; 32]),
+            FakeStore::default(),
+            &MessageId::new("m1").unwrap(),
+        ))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GatedFetchError::Remote(RemoteMailboxError::NotFound)
+        ));
     }
 }

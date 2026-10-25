@@ -13,6 +13,7 @@ pub const USAGE: &str = "\
 tersa — a privacy-first Gmail client for the terminal
 
 Usage:
+  tersa                           Open the full-screen interface
   tersa account add               Sign in with Google and add an account
   tersa account list              List added accounts
   tersa account remove <account>  Revoke access and delete local data
@@ -20,12 +21,11 @@ Usage:
   tersa inbox [<account>] [--limit <n>]
                                   Print cached recent mail
   tersa doctor                    Check configuration and storage
-  tersa help | --version
-
-The full-screen interface arrives in a later release.";
+  tersa help | --version";
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Command {
+    Tui,
     Help,
     Version,
     AccountAdd,
@@ -48,7 +48,8 @@ pub fn parse<I: IntoIterator<Item = OsString>>(arguments: I) -> Result<Command, 
         .collect::<Result<Vec<_>, _>>()?;
     let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
     match words.as_slice() {
-        [] | ["help" | "-h" | "--help"] => Ok(Command::Help),
+        [] => Ok(Command::Tui),
+        ["help" | "-h" | "--help"] => Ok(Command::Help),
         ["--version" | "-V" | "version"] => Ok(Command::Version),
         ["account", "add"] => Ok(Command::AccountAdd),
         ["account", "list"] => Ok(Command::AccountList),
@@ -96,7 +97,8 @@ mod tests {
 
     #[test]
     fn parses_every_command() {
-        assert_eq!(run(&[]), Ok(Command::Help));
+        assert_eq!(run(&[]), Ok(Command::Tui));
+        assert_eq!(run(&["help"]), Ok(Command::Help));
         assert_eq!(run(&["--version"]), Ok(Command::Version));
         assert_eq!(run(&["account", "add"]), Ok(Command::AccountAdd));
         assert_eq!(run(&["account", "list"]), Ok(Command::AccountList));

@@ -7,7 +7,7 @@
 use std::process::{Command as Process, Stdio};
 use std::sync::Arc;
 
-use tersa_application::mailbox::{AccountId, MailboxReader, StoreLimit};
+use tersa_application::mailbox::{AccountId, MailboxReader, MessageId, StoreLimit};
 use tersa_application::sync::SyncReport;
 use tersa_keys::RootKey;
 use tersa_presentation::terminal::SafeText;
@@ -353,12 +353,107 @@ pub fn inbox(context: &Context, raw: Option<&str>, limit: u16) -> Result<(), Str
         let marker = if envelope.is_unread() { '*' } else { ' ' };
         println!(
             "{marker} {}  {:<28}  {}",
-            crate::dates::format_utc(envelope.received_at().as_millis()),
+            crate::dates::format_local(envelope.received_at().as_millis()),
             truncate(&SafeText::single_line(envelope.from().as_str()), 28),
             SafeText::single_line(envelope.subject().as_str()),
         );
     }
     Ok(())
+}
+
+/// The most messages the interface loads; paging arrives with T2c.
+const TUI_MESSAGES: u16 = 500;
+
+/// Opens the full-screen interface on the first account's cached mail. The
+/// installation lock is held for the whole session.
+pub fn tui(context: &Context) -> Result<(), String> {
+    crate::tui::require_terminal()?;
+    let locked = require_installation(context)?;
+    let account = locked
+        .installation
+        .accounts()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| NO_ACCOUNTS.to_owned())?;
+    let store = locked
+        .installation
+        .open_store(&account)
+        .map_err(|error| error.to_string())?;
+    let executor = executor()?;
+    let limit = StoreLimit::new(TUI_MESSAGES).map_err(|_error| "invalid limit".to_owned())?;
+    let envelopes = executor
+        .block_on(store.list_envelopes(&account, limit))
+        .map_err(|_error| "could not read the local mailbox".to_owned())?;
+    let rows = envelopes
+        .iter()
+        .map(crate::tui::Row::from_envelope)
+        .collect();
+    let source = StoreSource {
+        store,
+        account: account.clone(),
+        executor,
+        ids: envelopes
+            .iter()
+            .map(|envelope| envelope.message_id().clone())
+            .collect(),
+    };
+    // Downloads need the OAuth client; without it the interface still reads
+    // the cache.
+    let fetcher = runtime(context, Arc::clone(&locked.installation))
+        .ok()
+        .and_then(|runtime| {
+            Some(Box::new(StoreFetcher {
+                runtime,
+                executor: self::executor().ok()?,
+                account: account.clone(),
+                ids: source.ids.clone(),
+            }) as Box<dyn crate::tui::Fetcher>)
+        });
+    crate::tui::run(
+        SafeText::single_line(account.as_str()),
+        rows,
+        &source,
+        fetcher,
+    )
+}
+
+/// Downloads full messages for the interface through the identity gate.
+struct StoreFetcher {
+    runtime: Runtime,
+    executor: tokio::runtime::Runtime,
+    account: AccountId,
+    ids: Vec<MessageId>,
+}
+
+impl crate::tui::Fetcher for StoreFetcher {
+    fn fetch(&mut self, index: usize) -> Result<Vec<u8>, String> {
+        let id = self
+            .ids
+            .get(index)
+            .ok_or_else(|| "unknown message".to_owned())?;
+        self.executor
+            .block_on(self.runtime.fetch_message(&self.account, id))
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Reads cached messages for the interface from one account's store.
+struct StoreSource<S> {
+    store: S,
+    account: AccountId,
+    executor: tokio::runtime::Runtime,
+    ids: Vec<MessageId>,
+}
+
+impl<S: MailboxReader> crate::tui::MailSource for StoreSource<S> {
+    fn message(&self, index: usize) -> Result<Option<Vec<u8>>, ()> {
+        let id = self.ids.get(index).ok_or(())?;
+        self.executor
+            .block_on(self.store.get_message(&self.account, id))
+            .map(|message| message.map(|message| message.content().as_bytes().to_vec()))
+            .map_err(|_error| ())
+    }
 }
 
 fn truncate(text: &SafeText, width: usize) -> String {

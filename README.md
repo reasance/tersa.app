@@ -36,8 +36,9 @@ tersa has no releases yet. From a checkout:
    passphrase = false
    ```
 
-3. Run `cargo run -p tersa -- account add`, then `… -- inbox`. `tersa doctor`
-   shows where files live and what is configured.
+3. Run `cargo run -p tersa -- account add`, then `cargo run -p tersa` to open
+   the interface (`?` lists the keys) or `… -- inbox` for plain output.
+   `tersa doctor` shows where files live and what is configured.
 
 ## Project status
 

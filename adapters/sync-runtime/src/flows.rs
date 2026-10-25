@@ -8,14 +8,14 @@ use core::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tersa_application::mailbox::{AccountId, PageSize, StoreLimit};
+use tersa_application::mailbox::{AccountId, MessageId, PageSize, StoreLimit};
 use tersa_application::oauth::{MonotonicClock, SystemMonotonicClock, SystemWallClock};
 use tersa_application::sync::{SyncPolicy, SyncReport};
 use tersa_gmail_rest::GmailTokenTransport;
 use tersa_token_broker_core::{BrokerCore, BrokerError, BrokerToken, GetRandomEntropy};
 use zeroize::Zeroizing;
 
-use crate::gate::{GatedSyncError, gated_sync};
+use crate::gate::{GatedFetchError, GatedSyncError, gated_fetch, gated_sync};
 use crate::installation::{
     Installation, InstallationError, InstallationHasher, InstallationTokens,
 };
@@ -80,6 +80,8 @@ pub enum FlowError {
     Session(GmailSessionError),
     /// The identity gate or the sync failed.
     Sync(GatedSyncError),
+    /// The identity gate or a single-message download failed.
+    Fetch(GatedFetchError),
 }
 
 impl fmt::Display for FlowError {
@@ -98,6 +100,7 @@ impl fmt::Display for FlowError {
             Self::Installation(error) => write!(formatter, "{error}"),
             Self::Session(error) => write!(formatter, "{error}"),
             Self::Sync(error) => write!(formatter, "{error}"),
+            Self::Fetch(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -263,6 +266,37 @@ impl Runtime {
         let _ = self.broker.delete_stored_tokens(&subject);
         self.installation.remove_account(account)?;
         Ok(revocation)
+    }
+
+    /// Downloads one complete message through the identity gate, caches it,
+    /// and returns its raw RFC 5322 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlowError`] for an unknown account, a token failure, or a
+    /// gate, download, or cache failure.
+    pub async fn fetch_message(
+        &self,
+        account: &AccountId,
+        message_id: &MessageId,
+    ) -> Result<Vec<u8>, FlowError> {
+        let subject = self.subject_of(account)?;
+        let token = self
+            .broker
+            .refresh_access_token(&subject)
+            .await
+            .map_err(FlowError::Token)?;
+        let session = GmailSession::new(
+            account.clone(),
+            token.access_token(),
+            Zeroizing::new(token.subject().to_owned()),
+        )
+        .map_err(FlowError::Session)?;
+        let store = self.installation.open_store(account)?;
+        let message = gated_fetch(account, session, &self.hasher, store, message_id)
+            .await
+            .map_err(FlowError::Fetch)?;
+        Ok(message.content().as_bytes().to_vec())
     }
 
     fn subject_of(&self, account: &AccountId) -> Result<Zeroizing<String>, FlowError> {

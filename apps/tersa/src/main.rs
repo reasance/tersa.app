@@ -11,6 +11,7 @@ mod commands;
 mod config;
 mod dates;
 mod prompt;
+mod tui;
 
 use std::process::ExitCode;
 
@@ -52,6 +53,7 @@ fn run(command: Command) -> Result<(), String> {
     let context = Context { paths, config };
     match command {
         Command::Help | Command::Version => Ok(()),
+        Command::Tui => commands::tui(&context),
         Command::AccountAdd => commands::account_add(&context),
         Command::AccountList => commands::account_list(&context),
         Command::AccountRemove(account) => commands::account_remove(&context, &account),

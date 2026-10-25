@@ -2,50 +2,93 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Minimal UTC date formatting without a date library.
+//! Date formatting in the system time zone.
 
-/// Formats Unix milliseconds as `YYYY-MM-DD HH:MM` in UTC.
-pub fn format_utc(millis: i64) -> String {
-    let seconds = millis.div_euclid(1000);
-    let days = seconds.div_euclid(86_400);
-    let second_of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
-        second_of_day / 3600,
-        second_of_day % 3600 / 60
-    )
+use std::sync::OnceLock;
+
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
+
+fn system() -> &'static TimeZone {
+    static ZONE: OnceLock<TimeZone> = OnceLock::new();
+    ZONE.get_or_init(TimeZone::system)
 }
 
-/// Converts days since 1970-01-01 to a proleptic Gregorian date
-/// (Howard Hinnant's `civil_from_days`).
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let shifted = days + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
+/// `YYYY-MM-DD HH:MM` in local time.
+pub fn format_local(millis: i64) -> String {
+    format_in(millis, system(), "%Y-%m-%d %H:%M")
+}
+
+/// A compact list date: the time today, the day this year, else the year.
+pub fn short(millis: i64, now_millis: i64) -> String {
+    short_in(millis, now_millis, system())
+}
+
+/// A full date for message headers, such as `Tue 21 Oct 2026 14:05`.
+pub fn long(millis: i64) -> String {
+    format_in(millis, system(), "%a %-d %b %Y %H:%M")
+}
+
+fn format_in(millis: i64, zone: &TimeZone, pattern: &str) -> String {
+    match Timestamp::from_millisecond(millis) {
+        Ok(instant) => instant.to_zoned(zone.clone()).strftime(pattern).to_string(),
+        Err(_) => "?".to_owned(),
+    }
+}
+
+fn short_in(millis: i64, now_millis: i64, zone: &TimeZone) -> String {
+    let (Ok(instant), Ok(now)) = (
+        Timestamp::from_millisecond(millis),
+        Timestamp::from_millisecond(now_millis),
+    ) else {
+        return "?".to_owned();
     };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    (year, month, day)
+    let (instant, now) = (instant.to_zoned(zone.clone()), now.to_zoned(zone.clone()));
+    let pattern = if instant.date() == now.date() {
+        "%H:%M"
+    } else if instant.year() == now.year() {
+        "%-d %b"
+    } else {
+        "%Y"
+    };
+    instant.strftime(pattern).to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::format_utc;
+    use jiff::tz::TimeZone;
+
+    use super::{format_in, short_in};
+
+    const OCT_21_2026_1405_UTC: i64 = 1_792_591_500_000;
 
     #[test]
     fn formats_known_instants() {
-        assert_eq!(format_utc(0), "1970-01-01 00:00");
-        assert_eq!(format_utc(951_782_400_000), "2000-02-29 00:00");
-        assert_eq!(format_utc(1_791_072_000_000), "2026-10-04 00:00");
-        assert_eq!(format_utc(-1), "1969-12-31 23:59");
+        let utc = TimeZone::UTC;
+        assert_eq!(format_in(0, &utc, "%Y-%m-%d %H:%M"), "1970-01-01 00:00");
+        assert_eq!(
+            format_in(951_782_400_000, &utc, "%Y-%m-%d %H:%M"),
+            "2000-02-29 00:00"
+        );
+        assert_eq!(
+            format_in(OCT_21_2026_1405_UTC, &utc, "%a %-d %b %Y %H:%M"),
+            "Wed 21 Oct 2026 14:05"
+        );
+        assert_eq!(format_in(i64::MAX, &utc, "%Y"), "?");
+    }
+
+    #[test]
+    fn short_dates_depend_on_distance() {
+        let utc = TimeZone::UTC;
+        let now = OCT_21_2026_1405_UTC;
+        assert_eq!(short_in(now - 3_600_000, now, &utc), "13:05");
+        assert_eq!(short_in(now - 86_400_000 * 20, now, &utc), "1 Oct");
+        assert_eq!(short_in(now - 86_400_000 * 400, now, &utc), "2025");
+    }
+
+    #[test]
+    fn the_zone_shifts_the_wall_clock() {
+        let rome = TimeZone::fixed(jiff::tz::offset(2));
+        assert_eq!(format_in(OCT_21_2026_1405_UTC, &rome, "%H:%M"), "16:05");
     }
 }

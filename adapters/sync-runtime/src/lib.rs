@@ -20,7 +20,7 @@ mod session;
 pub use flows::{
     AddedAccount, FlowError, OAuthClient, Revocation, Runtime, SIGN_IN_TIMEOUT, default_sync_policy,
 };
-pub use gate::{GatedSyncError, gated_sync};
+pub use gate::{GatedFetchError, GatedSyncError, gated_fetch, gated_sync};
 pub use installation::{
     Installation, InstallationError, InstallationHasher, InstallationLock, InstallationTokens,
     LockError, has_local_data,
