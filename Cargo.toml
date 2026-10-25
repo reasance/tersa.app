@@ -30,6 +30,9 @@ chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["
 getrandom = "0.3.4"
 hmac = "=0.12.1"
 hkdf = "=0.12.4"
+# MIME, charsets, and encoded words for message display (full_encoding adds
+# legacy charsets through encoding_rs).
+mail-parser = { version = "=0.11.9", default-features = false, features = ["full_encoding"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["native-tls"] }
 rusqlite = { version = "=0.39.0", default-features = false }
 rustix = { version = "=1.1.4", default-features = false, features = ["fs", "std"] }
@@ -42,6 +45,10 @@ tersa-domain = { path = "crates/domain", version = "=0.0.0" }
 tersa-keys = { path = "crates/keys", version = "=0.0.0" }
 tersa-presentation = { path = "crates/presentation", version = "=0.0.0" }
 tokio = { version = "=1.54.1", default-features = false, features = ["rt", "net", "sync", "time"] }
+# Grapheme clusters, to cap the marks stacked on one character in SafeText.
+unicode-segmentation = "=1.13.3"
+# Zero-width marks, to count every combining mark in a SafeText grapheme cluster.
+unicode-width = "=0.2.2"
 url = "2.5.8"
 zeroize = "1.9.0"
 

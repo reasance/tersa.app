@@ -31,8 +31,8 @@ impl std::error::Error for MailboxViewModelError {}
 /// Holds one owned mailbox row with the stable metadata field parity.
 ///
 /// Values are projected verbatim: no date formatting and no output escaping,
-/// which remain the output adapter's responsibility. `body_text` / `body_html`
-/// are optional display payloads derived from a cached complete message.
+/// which remain the output adapter's responsibility. Message bodies are
+/// rendered by [`crate::message::render_message`].
 #[derive(Clone, Eq, PartialEq)]
 pub struct MessageRowViewModel {
     /// The opaque message identifier.
@@ -45,13 +45,6 @@ pub struct MessageRowViewModel {
     pub subject: String,
     /// The provider preview/snippet text.
     pub preview: String,
-    /// Optional plain-text body for display when a cached complete message is present.
-    pub body_text: Option<String>,
-    /// Optional unsanitized HTML extracted from a `text/html` part.
-    ///
-    /// The current UI does not decode or render this field. Any future renderer
-    /// requires a separately approved `SafeHtml` boundary.
-    pub body_html: Option<String>,
     /// Milliseconds since the Unix epoch.
     pub received_at_millis: i64,
     /// Whether the message is unread.
@@ -68,31 +61,9 @@ impl MessageRowViewModel {
             from: message.from().as_str().to_owned(),
             subject: message.subject().as_str().to_owned(),
             preview: message.preview().as_str().to_owned(),
-            body_text: None,
-            body_html: None,
             received_at_millis: message.received_at().as_millis(),
             unread: message.is_unread(),
         }
-    }
-
-    /// Projects one metadata message and attaches plain + HTML display bodies.
-    #[must_use]
-    pub fn from_message_with_body(
-        message: &MailboxMetadataMessage,
-        body_bytes: Option<&[u8]>,
-    ) -> Self {
-        let mut row = Self::from_message(message);
-        if let Some(bytes) = body_bytes {
-            let text = display_text_from_rfc5322(bytes);
-            if !text.is_empty() {
-                row.body_text = Some(text);
-            }
-            let html = display_html_from_rfc5322(bytes);
-            if !html.is_empty() {
-                row.body_html = Some(html);
-            }
-        }
-        row
     }
 }
 
@@ -105,231 +76,9 @@ impl fmt::Debug for MessageRowViewModel {
             .field("from", &"[REDACTED]")
             .field("subject", &"[REDACTED]")
             .field("preview", &"[REDACTED]")
-            .field("body_text", &self.body_text.as_ref().map(|_| "[REDACTED]"))
-            .field("body_html", &self.body_html.as_ref().map(|_| "[REDACTED]"))
             .field("received_at_millis", &self.received_at_millis)
             .field("unread", &self.unread)
             .finish()
-    }
-}
-
-/// Maximum characters of body text exposed to the UI from a cached raw message.
-const MAX_DISPLAY_BODY_CHARS: usize = 32_768;
-
-/// Derives bounded plain-text display content from a cached RFC 5322 message.
-///
-/// Conservative offline extraction only:
-/// - prefers the first `text/plain` MIME part and stops at the next boundary
-/// - fully decodes quoted-printable (`=XX` and soft line breaks)
-/// - never renders HTML, never loads remote resources
-///
-/// This is not a full MIME library: base64 parts, nested multiparts beyond the
-/// first plain part, and HTML-only messages fall back to best-effort text.
-#[must_use]
-pub fn display_text_from_rfc5322(raw: &[u8]) -> String {
-    let text = String::from_utf8_lossy(raw);
-    decode_mime_text_part(text.as_ref(), "content-type: text/plain", true)
-}
-
-/// Derives bounded unsanitized HTML from a cached RFC 5322 message.
-///
-/// Extracts the first `text/html` MIME part (quoted-printable decoded). The
-/// current UI must not decode or render this output. This function does not
-/// sanitize HTML tags; any future renderer requires a separately approved
-/// `SafeHtml` boundary.
-#[must_use]
-pub fn display_html_from_rfc5322(raw: &[u8]) -> String {
-    let text = String::from_utf8_lossy(raw);
-    decode_mime_text_part(text.as_ref(), "content-type: text/html", false)
-}
-
-fn decode_mime_text_part(
-    message: &str,
-    content_type_marker: &str,
-    fallback_top_level: bool,
-) -> String {
-    let Some((part_headers, part_body)) =
-        extract_mime_part(message, content_type_marker, fallback_top_level)
-    else {
-        return String::new();
-    };
-    let decoded = if part_is_quoted_printable(part_headers) || looks_quoted_printable(part_body) {
-        decode_quoted_printable(part_body)
-    } else if part_is_base64(part_headers) {
-        // Base64 bodies are common for HTML; leave undecoded rather than
-        // emitting unreadable binary-looking text in the UI.
-        return String::new();
-    } else {
-        part_body.to_owned()
-    };
-    let normalized = decoded.replace("\r\n", "\n").replace('\r', "\n");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    trimmed.chars().take(MAX_DISPLAY_BODY_CHARS).collect()
-}
-
-fn strip_rfc5322_headers(message: &str) -> (&str, &str) {
-    if let Some(index) = message.find("\r\n\r\n") {
-        return (&message[..index], &message[index + 4..]);
-    }
-    if let Some(index) = message.find("\n\n") {
-        return (&message[..index], &message[index + 2..]);
-    }
-    ("", message)
-}
-
-/// Returns `(part_headers, part_body)` for the first MIME part matching `marker`.
-///
-/// When `fallback_top_level` is true and no matching part is found, the top-level
-/// body is returned (single-part plain messages). HTML extraction never falls
-/// back to the top-level body unless it is itself marked as HTML.
-fn extract_mime_part<'a>(
-    message: &'a str,
-    content_type_marker: &str,
-    fallback_top_level: bool,
-) -> Option<(&'a str, &'a str)> {
-    let (top_headers, top_body) = strip_rfc5322_headers(message);
-    let lowered = message.to_ascii_lowercase();
-    let top_lower = top_headers.to_ascii_lowercase();
-
-    if let Some(part_at) = lowered.find(content_type_marker) {
-        let after_type = &message[part_at..];
-        let (part_headers, part_body) = strip_rfc5322_headers(after_type);
-        let boundary = mime_boundary(top_headers).or_else(|| mime_boundary(message));
-        let part_body = if let Some(boundary) = boundary {
-            let marker = format!("--{boundary}");
-            if let Some(end) = part_body.find(&marker) {
-                &part_body[..end]
-            } else {
-                part_body
-            }
-        } else {
-            // No boundary: cut before a sibling part header when present.
-            let part_lower = part_body.to_ascii_lowercase();
-            let sibling = [
-                "content-type: text/html",
-                "content-type: text/plain",
-                "------=",
-            ]
-            .into_iter()
-            .filter_map(|needle| {
-                // Skip the current part's own residual headers if any.
-                part_lower.find(needle).filter(|&at| at > 0)
-            })
-            .min();
-            if let Some(at) = sibling {
-                &part_body[..at]
-            } else {
-                part_body
-            }
-        };
-        return Some((part_headers, part_body));
-    }
-
-    if fallback_top_level {
-        // Single-part plain (or unmarked) body.
-        if top_lower.contains("content-type: text/html") {
-            return None;
-        }
-        return Some((top_headers, top_body));
-    }
-
-    // HTML requested: allow single-part HTML top-level messages.
-    if top_lower.contains("content-type: text/html") {
-        return Some((top_headers, top_body));
-    }
-    None
-}
-
-fn part_is_base64(headers: &str) -> bool {
-    headers
-        .to_ascii_lowercase()
-        .contains("content-transfer-encoding: base64")
-}
-
-fn mime_boundary(headers_or_message: &str) -> Option<String> {
-    let lowered = headers_or_message.to_ascii_lowercase();
-    let key = "boundary=";
-    let idx = lowered.find(key)?;
-    let rest = headers_or_message[idx + key.len()..].trim_start();
-    let rest = rest
-        .strip_prefix('"')
-        .or_else(|| rest.strip_prefix('\''))
-        .unwrap_or(rest);
-    let end = rest
-        .find(|c: char| {
-            c == '"' || c == '\'' || c == ';' || c == '\r' || c == '\n' || c.is_whitespace()
-        })
-        .unwrap_or(rest.len());
-    let boundary = rest[..end].trim();
-    if boundary.is_empty() {
-        None
-    } else {
-        Some(boundary.to_owned())
-    }
-}
-
-fn part_is_quoted_printable(headers: &str) -> bool {
-    headers
-        .to_ascii_lowercase()
-        .contains("content-transfer-encoding: quoted-printable")
-}
-
-fn looks_quoted_printable(body: &str) -> bool {
-    // LinkedIn digests and many marketing mails ship soft breaks / =XX without
-    // always being easy to re-parse from part headers alone.
-    body.contains("=\r\n")
-        || body.contains("=\n")
-        || body.contains("=20")
-        || body.contains("=3D")
-        || body.contains("=C2=")
-        || body.contains("=F0=")
-}
-
-/// RFC 2045 quoted-printable decoder (soft breaks + `=HH` hex bytes).
-fn decode_quoted_printable(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'=' {
-            if i + 1 < bytes.len() && (bytes[i + 1] == b'\n') {
-                i += 2;
-                continue;
-            }
-            if i + 2 < bytes.len() && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
-                i += 3;
-                continue;
-            }
-            if i + 2 < bytes.len()
-                && bytes[i + 1].is_ascii_hexdigit()
-                && bytes[i + 2].is_ascii_hexdigit()
-            {
-                let hi = hex_nibble(bytes[i + 1]);
-                let lo = hex_nibble(bytes[i + 2]);
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
-            // Lone '=' — keep as-is (malformed input).
-            out.push(b'=');
-            i += 1;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => 0,
     }
 }
 
@@ -649,60 +398,11 @@ mod tests {
     }
 
     #[test]
-    fn display_text_strips_headers_and_prefers_plain_part() {
-        let raw = b"From: a@b\r\nSubject: s\r\n\r\nHello body\r\n";
-        assert_eq!(display_text_from_rfc5322(raw), "Hello body");
-
-        let multipart = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n\
---b\r\nContent-Type: text/html\r\n\r\n<html>x</html>\r\n\
---b\r\nContent-Type: text/plain\r\n\r\nPlain body\r\n--b--\r\n";
-        assert_eq!(display_text_from_rfc5322(multipart), "Plain body");
-    }
-
-    #[test]
-    fn display_text_decodes_quoted_printable_and_stops_before_html() {
-        let raw = b"Content-Type: multipart/alternative; boundary=\"----=_Part_1\"\r\n\r\n\
-------=_Part_1\r\n\
-Content-Type: text/plain;charset=UTF-8\r\n\
-Content-Transfer-Encoding: quoted-printable\r\n\
-\r\n\
-You appeared in 19 searches this week.=20\r\n\
-It's a Dutch company: =F0=9F=87=B3=F0=9F=87=B1\r\n\
-link?x=3D1\r\n\
-------=_Part_1\r\n\
-Content-Type: text/html;charset=UTF-8\r\n\
-Content-Transfer-Encoding: quoted-printable\r\n\
-\r\n\
-<html xmlns=3D\"http://www.w3.org/1999/xhtml\">body</html>\r\n\
-------=_Part_1--\r\n";
-        let text = display_text_from_rfc5322(raw);
-        assert!(text.contains("You appeared in 19 searches this week."));
-        assert!(text.contains("It's a Dutch company:"));
-        assert!(text.contains("link?x=1"));
-        assert!(!text.contains("=20"));
-        assert!(!text.contains("=3D"));
-        assert!(!text.contains("<html"));
-        assert!(!text.contains("Content-Type: text/html"));
-
-        let html = display_html_from_rfc5322(raw);
-        assert!(html.contains("<html xmlns=\"http://www.w3.org/1999/xhtml\">body</html>"));
-        assert!(!html.contains("=3D"));
-        assert!(!html.contains("You appeared in 19 searches"));
-    }
-
-    #[test]
-    fn row_projection_carries_preview_and_optional_body() {
+    fn row_projection_carries_preview() {
         let document = inbox_document(vec![envelope("m1", 1)]);
         let message = &document.messages()[0];
         let row = MessageRowViewModel::from_message(message);
         assert_eq!(row.preview, "preview-m1");
-        assert!(row.body_text.is_none());
-
-        let with_body = MessageRowViewModel::from_message_with_body(
-            message,
-            Some(b"From: x\r\n\r\nCached body"),
-        );
-        assert_eq!(with_body.body_text.as_deref(), Some("Cached body"));
     }
 
     fn run<T>(future: impl Future<Output = T>) -> T {
