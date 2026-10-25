@@ -16,6 +16,7 @@ mod gate;
 mod installation;
 mod loopback;
 mod session;
+mod session_cache;
 
 pub use flows::{
     AddedAccount, FlowError, OAuthClient, Revocation, Runtime, SIGN_IN_TIMEOUT, default_sync_policy,
@@ -26,4 +27,4 @@ pub use installation::{
     LockError, has_local_data,
 };
 pub use loopback::{Loopback, LoopbackError};
-pub use session::{GmailSession, GmailSessionError};
+pub use session::{GmailSession, GmailSessionError, SharedSession};

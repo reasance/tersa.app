@@ -13,6 +13,7 @@
 //! ```
 
 use core::fmt;
+use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ use tersa_keys::{
     derive_account_key, derive_installation_key, registry_dedup_tag,
 };
 use tersa_store_sqlcipher::registry::{MAX_ACCOUNTS, RegistryError, SqlCipherRegistry};
-use tersa_store_sqlcipher::{DatabaseKey, SqlCipherMailboxStore};
+use tersa_store_sqlcipher::{DatabaseKey, IntegrityScan, SqlCipherMailboxStore};
 use tersa_token_broker_core::{RefreshTokenStore, RefreshTokenStoreError, ValidatedSubject};
 use zeroize::Zeroizing;
 
@@ -55,6 +56,13 @@ impl fmt::Display for InstallationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Directory => formatter.write_str("the data directory is unusable"),
+            // Development builds before T2c keyed databases differently and
+            // there is no migration: say how to start over.
+            Self::Registry(RegistryError::Corrupted) => formatter.write_str(
+                "the account registry cannot be read: it is damaged, the key is wrong, or it \
+                 was written by a development build before October 2026; move the data \
+                 directory aside (`tersa doctor` shows it) and add the account again",
+            ),
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Store(_) => formatter.write_str("the account database failed"),
             Self::Key(error) => write!(formatter, "{error}"),
@@ -89,6 +97,10 @@ pub struct Installation {
     root: RootKey,
     registry: SqlCipherRegistry,
     allocation: Mutex<()>,
+    /// Accounts whose database this process has opened with the full
+    /// integrity scan. Later opens skip it: it reads the whole database, and
+    /// stores are opened for every download, sync, and token refresh.
+    scanned: Mutex<HashSet<AccountId>>,
 }
 
 impl fmt::Debug for Installation {
@@ -187,6 +199,7 @@ impl Installation {
             root,
             registry,
             allocation: Mutex::new(()),
+            scanned: Mutex::new(HashSet::new()),
         })
     }
 
@@ -237,6 +250,24 @@ impl Installation {
         self.open_store_unchecked(account)
     }
 
+    /// Opens a registered account's store without the integrity scan, for
+    /// the interface's first read: the first frame does not wait for a scan
+    /// whose cost grows with the cache. The first [`Self::open_store`] of the
+    /// session still runs it, and `SQLCipher` authenticates every page read.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::open_store`].
+    pub fn open_store_for_display(
+        &self,
+        account: &AccountId,
+    ) -> Result<SqlCipherMailboxStore, InstallationError> {
+        if !self.registry.accounts()?.contains(account) {
+            return Err(InstallationError::UnknownAccount);
+        }
+        self.open_store_with(account, IntegrityScan::Skip)
+    }
+
     /// Deletes an account's local data, then its registry entry.
     ///
     /// Data goes first so a failed deletion leaves the account registered and
@@ -261,7 +292,15 @@ impl Installation {
             Err(_error) => return Err(InstallationError::Directory),
         }
         self.registry.remove(account)?;
+        self.scanned_accounts().remove(account);
         Ok(())
+    }
+
+    /// The scanned set holds no invariant a panic could break; recover it.
+    fn scanned_accounts(&self) -> std::sync::MutexGuard<'_, HashSet<AccountId>> {
+        self.scanned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn account_dir(&self, account: &AccountId) -> PathBuf {
@@ -269,17 +308,37 @@ impl Installation {
         self.data_dir.join(ACCOUNTS_DIR).join(hex(&digest))
     }
 
+    /// Opens the account's store, scanning its database the first time in
+    /// this process.
     fn open_store_unchecked(
         &self,
         account: &AccountId,
     ) -> Result<SqlCipherMailboxStore, InstallationError> {
+        let scan = if self.scanned_accounts().contains(account) {
+            IntegrityScan::Skip
+        } else {
+            IntegrityScan::Full
+        };
+        let store = self.open_store_with(account, scan)?;
+        if scan == IntegrityScan::Full {
+            self.scanned_accounts().insert(account.clone());
+        }
+        Ok(store)
+    }
+
+    fn open_store_with(
+        &self,
+        account: &AccountId,
+        scan: IntegrityScan,
+    ) -> Result<SqlCipherMailboxStore, InstallationError> {
         let directory = self.account_dir(account);
         ensure_private_dir(&directory)?;
         let key = derive_account_key(&self.root, account, AccountKeyPurpose::SqlCipherDatabaseV1)?;
-        Ok(SqlCipherMailboxStore::open(
+        Ok(SqlCipherMailboxStore::open_with_scan(
             account.clone(),
             directory.join(MAIL_FILE),
             DatabaseKey::from_zeroizing(key.into_bytes()),
+            scan,
         )?)
     }
 
@@ -517,6 +576,30 @@ mod tests {
         tokens.delete(&subject("sub-1")).expect("delete");
         assert_eq!(tokens.load(&subject("sub-1")).expect("load"), None);
         tokens.delete(&subject("unknown")).expect("idempotent");
+    }
+
+    #[test]
+    fn each_database_is_scanned_once_per_process() {
+        let dir = TempDir::new("scan");
+        let installation = Arc::new(Installation::open(&dir.0, root()).expect("open"));
+        InstallationTokens(Arc::clone(&installation))
+            .store(&subject("sub-1"), &Zeroizing::new("token".to_owned()))
+            .expect("store");
+        let account = installation
+            .account_for_subject("sub-1")
+            .expect("find")
+            .expect("registered");
+        assert!(installation.scanned_accounts().contains(&account));
+        installation.open_store(&account).expect("reopen");
+        installation
+            .open_store_for_display(&account)
+            .expect("display");
+        assert_eq!(installation.scanned_accounts().len(), 1);
+        installation.remove_account(&account).expect("remove");
+        assert!(
+            installation.scanned_accounts().is_empty(),
+            "a re-added account is scanned again"
+        );
     }
 
     #[test]

@@ -305,6 +305,11 @@ impl MessageContent {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+    /// Returns the decoded bytes without copying them.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
 }
 
 impl fmt::Debug for MessageContent {
@@ -339,6 +344,11 @@ impl Message {
     #[must_use]
     pub fn content(&self) -> &MessageContent {
         &self.content
+    }
+    /// Returns the decoded content, dropping the envelope.
+    #[must_use]
+    pub fn into_content(self) -> MessageContent {
+        self.content
     }
 }
 

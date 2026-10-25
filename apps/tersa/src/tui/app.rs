@@ -5,7 +5,8 @@
 //! Interface state and key handling, free of terminal I/O so it can be tested.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tersa_application::mailbox::MessageEnvelope;
+use tersa_application::mailbox::{MessageEnvelope, MessageId};
+use tersa_application::mailbox_search::MailboxSearchQuery;
 use tersa_presentation::html::decode_entities;
 use tersa_presentation::message::{BodyFormat, BodyPreference, RenderedMessage, render_message};
 use tersa_presentation::terminal::SafeText;
@@ -13,23 +14,78 @@ use tersa_presentation::terminal::SafeText;
 /// One inbox row, already sanitized.
 #[derive(Clone, Debug)]
 pub struct Row {
+    pub id: MessageId,
     pub sender: SafeText,
     pub subject: SafeText,
     pub preview: SafeText,
     pub received_at_millis: i64,
     pub unread: bool,
+    /// The lowercased text a search looks through: the full sender, the
+    /// subject, and the preview.
+    haystack: String,
 }
 
 impl Row {
     pub fn from_envelope(envelope: &MessageEnvelope) -> Self {
-        Self {
-            sender: SafeText::single_line(sender_name(envelope.from().as_str())),
-            subject: SafeText::single_line(envelope.subject().as_str()),
+        let from = SafeText::single_line(envelope.from().as_str());
+        Self::new(
+            envelope.message_id().clone(),
+            &from,
+            SafeText::single_line(sender_name(from.as_str())),
+            SafeText::single_line(envelope.subject().as_str()),
             // Gmail's previews arrive HTML-escaped (`&#39;`, `&amp;`).
-            preview: SafeText::single_line(&decode_entities(envelope.preview().as_str())),
-            received_at_millis: envelope.received_at().as_millis(),
-            unread: envelope.is_unread(),
+            SafeText::single_line(&decode_entities(envelope.preview().as_str())),
+            envelope.received_at().as_millis(),
+            envelope.is_unread(),
+        )
+    }
+
+    fn new(
+        id: MessageId,
+        from: &SafeText,
+        sender: SafeText,
+        subject: SafeText,
+        preview: SafeText,
+        received_at_millis: i64,
+        unread: bool,
+    ) -> Self {
+        let haystack = format!(
+            "{}\n{}\n{}",
+            from.as_str(),
+            subject.as_str(),
+            preview.as_str()
+        )
+        .to_lowercase();
+        Self {
+            id,
+            sender,
+            subject,
+            preview,
+            received_at_millis,
+            unread,
+            haystack,
         }
+    }
+
+    /// Whether every lowercased word appears in this row.
+    fn matches(&self, words: &[String]) -> bool {
+        words
+            .iter()
+            .all(|word| self.haystack.contains(word.as_str()))
+    }
+
+    #[cfg(test)]
+    pub fn sample(id: &str, sender: &str, subject: &str, unread: bool) -> Self {
+        let sender = SafeText::single_line(sender);
+        Self::new(
+            MessageId::new(id).expect("id"),
+            &sender,
+            sender.clone(),
+            SafeText::single_line(subject),
+            SafeText::single_line("the preview"),
+            1_760_990_000_000,
+            unread,
+        )
     }
 }
 
@@ -73,10 +129,8 @@ pub enum Body {
 /// An open message and its scroll position.
 #[derive(Debug)]
 pub struct MessageView {
-    pub index: usize,
+    pub id: MessageId,
     pub body: Body,
-    /// Raw bytes kept so the format can be switched without another read.
-    raw: Option<Vec<u8>>,
     pub preference: BodyPreference,
     pub scroll: usize,
     /// Wrapped lines for the last width drawn, rebuilt when the width changes.
@@ -90,11 +144,37 @@ pub enum Screen {
     Message(MessageView),
 }
 
+/// The background sync, as the top bar reports it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SyncState {
+    /// No sync has run in this session, or none is possible.
+    Idle,
+    Running,
+    /// The last sync finished at this time.
+    Synced(i64),
+    /// The last sync failed, with a message for the reader.
+    Failed(String),
+}
+
+/// A search over the loaded rows.
+#[derive(Debug, Default)]
+pub struct Search {
+    /// What the user typed.
+    pub query: String,
+    /// Whether the query is still being typed.
+    pub editing: bool,
+}
+
 /// Work the interface needs from the outside world.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
-    /// Load the cached message for the row at this index.
-    OpenMessage(usize),
+    /// Load the cached message with this identifier.
+    OpenMessage(MessageId),
+    /// Read the open message again to show it in this format; raw messages
+    /// can be large, so they are not kept in memory.
+    Reformat(MessageId, BodyPreference),
+    /// Sync the account now.
+    Sync,
 }
 
 /// The whole interface state.
@@ -102,11 +182,17 @@ pub enum Request {
 #[allow(clippy::struct_excessive_bools, reason = "independent interface flags")]
 pub struct App {
     pub account: SafeText,
+    /// Every loaded row, newest first.
     pub rows: Vec<Row>,
+    /// Indexes into `rows` of the rows the list shows, in order.
+    pub shown: Vec<usize>,
+    /// The selected position in `shown`.
     pub selected: usize,
-    /// The first row drawn in the list, kept stable while moving.
+    /// The first position drawn in the list, kept stable while moving.
     pub list_offset: usize,
     pub screen: Screen,
+    pub search: Search,
+    pub sync: SyncState,
     pub help: bool,
     pub status: Option<String>,
     pub quit: bool,
@@ -120,12 +206,16 @@ pub struct App {
 
 impl App {
     pub fn new(account: SafeText, rows: Vec<Row>) -> Self {
+        let shown = (0..rows.len()).collect();
         Self {
             account,
             rows,
+            shown,
             selected: 0,
             list_offset: 0,
             screen: Screen::Inbox,
+            search: Search::default(),
+            sync: SyncState::Idle,
             help: false,
             status: None,
             quit: false,
@@ -138,6 +228,64 @@ impl App {
         }
     }
 
+    /// The row at `position` in the list.
+    pub fn shown_row(&self, position: usize) -> Option<&Row> {
+        self.shown
+            .get(position)
+            .and_then(|&index| self.rows.get(index))
+    }
+
+    fn position_of(&self, id: &MessageId) -> Option<usize> {
+        self.shown
+            .iter()
+            .position(|&index| self.rows.get(index).is_some_and(|row| &row.id == id))
+    }
+
+    /// Whether a search is narrowing the list.
+    pub fn filtered(&self) -> bool {
+        !self.search.query.is_empty()
+    }
+
+    /// Replaces the rows after a sync, keeping the selection and any open
+    /// message.
+    pub fn reload(&mut self, rows: Vec<Row>) {
+        let selected = self.shown_row(self.selected).map(|row| row.id.clone());
+        self.rows = rows;
+        self.refilter();
+        if let Some(position) = selected.and_then(|id| self.position_of(&id)) {
+            self.selected = position;
+        }
+    }
+
+    fn refilter(&mut self) {
+        let words: Vec<String> = self
+            .search
+            .query
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        self.shown = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.matches(&words))
+            .map(|(index, _)| index)
+            .collect();
+        self.selected = self.selected.min(self.shown.len().saturating_sub(1));
+    }
+
+    fn set_query(&mut self, query: String) {
+        let selected = self.shown_row(self.selected).map(|row| row.id.clone());
+        self.search.query = query;
+        self.selected = 0;
+        self.list_offset = 0;
+        self.refilter();
+        if let Some(position) = selected.and_then(|id| self.position_of(&id)) {
+            self.selected = position;
+        }
+    }
+
     /// Handles one key press and returns any work the caller must do.
     pub fn key(&mut self, key: KeyEvent) -> Option<Request> {
         self.status = None;
@@ -145,15 +293,22 @@ impl App {
             self.help = false;
             return None;
         }
-        let pending_g = std::mem::take(&mut self.pending_g);
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         if control && matches!(key.code, KeyCode::Char('c')) {
             self.quit = true;
             return None;
         }
+        if self.search.editing {
+            self.search_key(key);
+            return None;
+        }
+        let pending_g = std::mem::take(&mut self.pending_g);
         if key.code == KeyCode::Char('?') {
             self.help = true;
             return None;
+        }
+        if control && matches!(key.code, KeyCode::Char('r')) {
+            return Some(Request::Sync);
         }
         let half = (self.page / 2).max(1);
         let motion = match key.code {
@@ -175,14 +330,21 @@ impl App {
         match &mut self.screen {
             Screen::Inbox => {
                 if let Some(motion) = motion {
-                    self.selected = motion.apply(self.selected, self.rows.len());
+                    self.selected = motion.apply(self.selected, self.shown.len());
                     return None;
                 }
                 match key.code {
-                    KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right
-                        if !self.rows.is_empty() =>
-                    {
-                        Some(Request::OpenMessage(self.selected))
+                    KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self
+                        .shown_row(self.selected)
+                        .map(|row| Request::OpenMessage(row.id.clone())),
+                    KeyCode::Char('/') => {
+                        self.search.editing = true;
+                        self.set_query(String::new());
+                        None
+                    }
+                    KeyCode::Esc if self.filtered() => {
+                        self.set_query(String::new());
+                        None
                     }
                     KeyCode::Char('q') | KeyCode::Esc => {
                         self.quit = true;
@@ -204,50 +366,103 @@ impl App {
                         self.repaint = true;
                         None
                     }
-                    KeyCode::Char('n') if view.index + 1 < self.rows.len() => {
-                        self.selected = view.index + 1;
-                        Some(Request::OpenMessage(self.selected))
-                    }
-                    KeyCode::Char('p') if view.index > 0 => {
-                        self.selected = view.index - 1;
-                        Some(Request::OpenMessage(self.selected))
-                    }
-                    KeyCode::Char('H') => {
-                        self.toggle_format();
-                        None
-                    }
+                    KeyCode::Char('n') => self.step(1),
+                    KeyCode::Char('p') => self.step(-1),
+                    KeyCode::Char('H') => self.toggle_format(),
                     _ => None,
                 }
             }
         }
     }
 
-    /// Shows the message at `index` with its cached raw bytes, if any.
-    pub fn show_message(&mut self, index: usize, raw: Result<Option<Vec<u8>>, ()>) {
-        let (body, raw) = match raw {
-            Ok(Some(raw)) => (
-                Body::Rendered(Box::new(render_message(&raw, self.preference))),
-                Some(raw),
-            ),
-            Ok(None) => (Body::NotCached, None),
-            Err(()) => (Body::Failed, None),
+    /// Keys while a search query is being typed: the list narrows as it
+    /// changes.
+    fn search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                self.search.editing = false;
+                if self.filtered() {
+                    self.status = Some(match self.shown.len() {
+                        1 => "1 match; esc shows every message".to_owned(),
+                        count => format!("{count} matches; esc shows every message"),
+                    });
+                }
+            }
+            KeyCode::Esc => {
+                self.search.editing = false;
+                self.set_query(String::new());
+            }
+            KeyCode::Backspace => {
+                let mut query = std::mem::take(&mut self.search.query);
+                if query.pop().is_none() {
+                    self.search.editing = false;
+                }
+                self.set_query(query);
+            }
+            KeyCode::Down => self.selected = Motion::By(1).apply(self.selected, self.shown.len()),
+            KeyCode::Up => self.selected = Motion::By(-1).apply(self.selected, self.shown.len()),
+            KeyCode::Char(character)
+                if !character.is_control()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.search.query.len() + character.len_utf8()
+                        <= MailboxSearchQuery::MAX_LEN =>
+            {
+                let mut query = self.search.query.clone();
+                query.push(character);
+                self.set_query(query);
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens the next or previous message in the list.
+    fn step(&mut self, delta: isize) -> Option<Request> {
+        let Screen::Message(view) = &self.screen else {
+            return None;
         };
-        self.selected = index;
+        let current = self.position_of(&view.id).unwrap_or(self.selected);
+        let next = current.checked_add_signed(delta)?;
+        let request = Request::OpenMessage(self.shown_row(next)?.id.clone());
+        self.selected = next;
+        Some(request)
+    }
+
+    /// Shows the message `id` with its cached raw bytes, if any.
+    pub fn show_message(&mut self, id: MessageId, raw: Result<Option<Vec<u8>>, ()>) {
+        let body = match raw {
+            Ok(Some(raw)) => Body::Rendered(Box::new(render_message(&raw, self.preference))),
+            Ok(None) => Body::NotCached,
+            Err(()) => Body::Failed,
+        };
+        if let Some(position) = self.position_of(&id) {
+            self.selected = position;
+        }
         self.repaint = true;
         self.screen = Screen::Message(MessageView {
-            index,
+            id,
             body,
-            raw,
             preference: self.preference,
             scroll: 0,
             layout: None,
         });
     }
 
+    fn is_open(&self, id: &MessageId) -> bool {
+        self.open_id() == Some(id)
+    }
+
+    /// The open message, if any.
+    pub fn open_id(&self) -> Option<&MessageId> {
+        match &self.screen {
+            Screen::Message(view) => Some(&view.id),
+            Screen::Inbox => None,
+        }
+    }
+
     /// Marks the open message as downloading.
-    pub fn downloading(&mut self, index: usize) {
+    pub fn downloading(&mut self, id: &MessageId) {
         if let Screen::Message(view) = &mut self.screen
-            && view.index == index
+            && &view.id == id
         {
             view.body = Body::Downloading;
             view.layout = None;
@@ -257,13 +472,12 @@ impl App {
 
     /// Takes a finished download. It is shown only if that message is still
     /// open; it is cached either way.
-    pub fn downloaded(&mut self, index: usize, result: Result<Vec<u8>, String>) {
-        let open = matches!(&self.screen, Screen::Message(view) if view.index == index);
-        if !open {
+    pub fn downloaded(&mut self, id: MessageId, result: Result<Vec<u8>, String>) {
+        if !self.is_open(&id) {
             return;
         }
         match result {
-            Ok(raw) => self.show_message(index, Ok(Some(raw))),
+            Ok(raw) => self.show_message(id, Ok(Some(raw))),
             Err(error) => {
                 if let Screen::Message(view) = &mut self.screen {
                     view.body = Body::DownloadFailed(error);
@@ -274,27 +488,45 @@ impl App {
         }
     }
 
-    fn toggle_format(&mut self) {
-        let Screen::Message(view) = &mut self.screen else {
-            return;
+    /// Records the end of a sync.
+    pub fn synced(&mut self, result: Result<(), String>, now_millis: i64) {
+        self.sync = match result {
+            Ok(()) => SyncState::Synced(now_millis),
+            Err(error) => SyncState::Failed(error),
+        };
+    }
+
+    /// Asks to show the open message in its other format.
+    fn toggle_format(&mut self) -> Option<Request> {
+        let Screen::Message(view) = &self.screen else {
+            return None;
         };
         let Body::Rendered(rendered) = &view.body else {
-            return;
+            return None;
         };
         if !rendered.has_alternative {
             self.status = Some("This message has only one format.".to_owned());
-            return;
+            return None;
         }
-        let next = match rendered.format {
+        let other = match rendered.format {
             Some(BodyFormat::Html) => BodyPreference::Plain,
             _ => BodyPreference::Html,
         };
-        if let Some(raw) = &view.raw {
-            view.body = Body::Rendered(Box::new(render_message(raw, next)));
-            view.preference = next;
+        Some(Request::Reformat(view.id.clone(), other))
+    }
+
+    /// Shows the open message `id` again from `raw` in `preference`, which
+    /// then applies to the messages opened after it. Nothing changes, the
+    /// preference included, when `id` is no longer open.
+    pub fn reformat(&mut self, id: &MessageId, raw: &[u8], preference: BodyPreference) {
+        if let Screen::Message(view) = &mut self.screen
+            && &view.id == id
+        {
+            self.preference = preference;
+            view.body = Body::Rendered(Box::new(render_message(raw, preference)));
+            view.preference = preference;
             view.scroll = 0;
             view.layout = None;
-            self.preference = next;
             self.repaint = true;
         }
     }
@@ -326,35 +558,47 @@ fn signed(value: usize) -> isize {
 #[cfg(test)]
 mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tersa_application::mailbox::MessageId;
     use tersa_presentation::terminal::SafeText;
 
-    use super::{App, Body, Request, Row, Screen, sender_name};
+    use super::{App, Body, BodyPreference, Request, Row, Screen, SyncState, sender_name};
 
-    fn row(subject: &str) -> Row {
-        Row {
-            sender: SafeText::single_line("Sender"),
-            subject: SafeText::single_line(subject),
-            preview: SafeText::single_line("preview"),
-            received_at_millis: 0,
-            unread: true,
-        }
+    fn id(text: &str) -> MessageId {
+        MessageId::new(text).expect("id")
     }
 
     fn press(app: &mut App, code: KeyCode) -> Option<Request> {
         app.key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
+    fn typed(app: &mut App, text: &str) {
+        for character in text.chars() {
+            press(app, KeyCode::Char(character));
+        }
+    }
+
     fn app(rows: usize) -> App {
         App::new(
             SafeText::single_line("acct"),
-            (0..rows).map(|index| row(&format!("s{index}"))).collect(),
+            (0..rows)
+                .map(|index| {
+                    Row::sample(&format!("m{index}"), "Sender", &format!("s{index}"), true)
+                })
+                .collect(),
         )
+    }
+
+    fn open(app: &App) -> Option<&str> {
+        match &app.screen {
+            Screen::Message(view) => Some(view.id.as_str()),
+            Screen::Inbox => None,
+        }
     }
 
     #[test]
     fn previews_are_unescaped_then_sanitized() {
         let envelope = tersa_application::mailbox::MessageEnvelope::new(
-            tersa_application::mailbox::MessageId::new("m").expect("id"),
+            id("m"),
             tersa_application::mailbox::ThreadId::new("t").expect("thread"),
             tersa_application::mailbox::HeaderText::new("A <a@example.com>").expect("from"),
             tersa_application::mailbox::HeaderText::new("s").expect("subject"),
@@ -363,10 +607,9 @@ mod tests {
             tersa_application::mailbox::UnixTimestampMillis::new(0).expect("time"),
             false,
         );
-        assert_eq!(
-            Row::from_envelope(&envelope).preview.as_str(),
-            "I don't & [2J"
-        );
+        let row = Row::from_envelope(&envelope);
+        assert_eq!(row.preview.as_str(), "I don't & [2J");
+        assert_eq!(row.sender.as_str(), "A");
     }
 
     #[test]
@@ -412,16 +655,18 @@ mod tests {
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            Some(Request::OpenMessage(1))
+            Some(Request::OpenMessage(id("m1")))
         );
-        app.show_message(1, Ok(None));
+        app.show_message(id("m1"), Ok(None));
         assert!(
             matches!(&app.screen, Screen::Message(view) if matches!(view.body, Body::NotCached))
         );
         assert_eq!(
             press(&mut app, KeyCode::Char('p')),
-            Some(Request::OpenMessage(0))
+            Some(Request::OpenMessage(id("m0")))
         );
+        app.show_message(id("m0"), Ok(None));
+        assert_eq!(press(&mut app, KeyCode::Char('p')), None, "already first");
         press(&mut app, KeyCode::Char('q'));
         assert!(matches!(app.screen, Screen::Inbox));
         press(&mut app, KeyCode::Char('q'));
@@ -431,16 +676,16 @@ mod tests {
     #[test]
     fn downloads_land_only_on_the_message_still_open() {
         let mut app = app(2);
-        app.show_message(0, Ok(None));
-        app.downloading(0);
+        app.show_message(id("m0"), Ok(None));
+        app.downloading(&id("m0"));
         assert!(
             matches!(&app.screen, Screen::Message(view) if matches!(view.body, Body::Downloading))
         );
-        app.downloaded(1, Ok(b"Subject: other\r\n\r\nx".to_vec()));
+        app.downloaded(id("m1"), Ok(b"Subject: other\r\n\r\nx".to_vec()));
         assert!(
             matches!(&app.screen, Screen::Message(view) if matches!(view.body, Body::Downloading))
         );
-        app.downloaded(0, Ok(b"Subject: s\r\n\r\nfull body".to_vec()));
+        app.downloaded(id("m0"), Ok(b"Subject: s\r\n\r\nfull body".to_vec()));
         let Screen::Message(view) = &app.screen else {
             panic!("message screen");
         };
@@ -448,8 +693,8 @@ mod tests {
             panic!("rendered");
         };
         assert_eq!(rendered.body.as_str(), "full body");
-        app.show_message(1, Ok(None));
-        app.downloaded(1, Err("offline".to_owned()));
+        app.show_message(id("m1"), Ok(None));
+        app.downloaded(id("m1"), Err("offline".to_owned()));
         assert!(
             matches!(&app.screen, Screen::Message(view) if matches!(&view.body, Body::DownloadFailed(error) if error == "offline"))
         );
@@ -469,7 +714,7 @@ mod tests {
 Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n\r\n\
 <p>html body</p>\r\n--b--\r\n";
         let mut app = app(1);
-        app.show_message(0, Ok(Some(raw.to_vec())));
+        app.show_message(id("m0"), Ok(Some(raw.to_vec())));
         let body = |app: &App| {
             let Screen::Message(view) = &app.screen else {
                 panic!("message screen");
@@ -480,8 +725,27 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
             rendered.body.as_str().to_owned()
         };
         assert_eq!(body(&app), "html body", "HTML is the default");
-        press(&mut app, KeyCode::Char('H'));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('H')),
+            Some(Request::Reformat(id("m0"), BodyPreference::Plain))
+        );
+        assert_eq!(
+            app.preference,
+            BodyPreference::Html,
+            "nothing changes until the message is shown again"
+        );
+        app.reformat(&id("m0"), raw, BodyPreference::Plain);
         assert_eq!(body(&app), "plain body");
+        assert_eq!(app.preference, BodyPreference::Plain);
+        app.reformat(&id("other"), raw, BodyPreference::Html);
+        assert_eq!(body(&app), "plain body", "only the open message changes");
+        assert_eq!(app.preference, BodyPreference::Plain, "nor the preference");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('H')),
+            Some(Request::Reformat(id("m0"), BodyPreference::Html))
+        );
+        app.reformat(&id("m0"), raw, BodyPreference::Html);
+        assert_eq!(body(&app), "html body");
     }
 
     #[test]
@@ -493,5 +757,125 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
         assert!(!app.help);
         app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.quit);
+    }
+
+    fn mailbox() -> App {
+        App::new(
+            SafeText::single_line("acct"),
+            vec![
+                Row::sample("a", "Ann <ann@example.com>", "Lunch on Friday", true),
+                Row::sample("b", "Bob <bob@work.example>", "Quarterly report", false),
+                Row::sample("c", "Ann <ann@example.com>", "Report draft", false),
+            ],
+        )
+    }
+
+    fn shown_ids(app: &App) -> Vec<&str> {
+        (0..app.shown.len())
+            .filter_map(|position| app.shown_row(position))
+            .map(|row| row.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn search_narrows_the_list_as_the_query_is_typed() {
+        let mut app = mailbox();
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.search.editing);
+        typed(&mut app, "REPORT");
+        assert_eq!(shown_ids(&app), ["b", "c"], "case-insensitive");
+        typed(&mut app, " ann");
+        assert_eq!(shown_ids(&app), ["c"], "every word must match");
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.search.editing);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("1 match; esc shows every message")
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Request::OpenMessage(id("c")))
+        );
+        app.show_message(id("c"), Ok(None));
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(shown_ids(&app), ["a", "b", "c"], "esc clears the search");
+        assert_eq!(app.selected, 2, "the selection follows its message");
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn search_matches_addresses_and_ignores_control_characters() {
+        let mut app = mailbox();
+        press(&mut app, KeyCode::Char('/'));
+        typed(&mut app, "work.example");
+        assert_eq!(shown_ids(&app), ["b"]);
+        press(&mut app, KeyCode::Char('\u{1b}'));
+        assert_eq!(app.search.query, "work.example");
+        for _ in 0.."work.example".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        assert!(app.search.editing);
+        press(&mut app, KeyCode::Backspace);
+        assert!(!app.search.editing, "backspace on an empty query leaves");
+        assert_eq!(shown_ids(&app), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn search_queries_are_bounded() {
+        let mut app = mailbox();
+        press(&mut app, KeyCode::Char('/'));
+        typed(&mut app, &"x".repeat(300));
+        assert_eq!(app.search.query.len(), 256);
+        assert!(app.shown.is_empty());
+        assert_eq!(press(&mut app, KeyCode::Enter), None);
+        assert_eq!(press(&mut app, KeyCode::Enter), None, "nothing to open");
+    }
+
+    #[test]
+    fn next_and_previous_stay_within_search_results() {
+        let mut app = mailbox();
+        press(&mut app, KeyCode::Char('/'));
+        typed(&mut app, "ann");
+        press(&mut app, KeyCode::Enter);
+        app.show_message(id("a"), Ok(None));
+        assert_eq!(
+            press(&mut app, KeyCode::Char('n')),
+            Some(Request::OpenMessage(id("c")))
+        );
+        app.show_message(id("c"), Ok(None));
+        assert_eq!(press(&mut app, KeyCode::Char('n')), None);
+    }
+
+    #[test]
+    fn a_reload_keeps_the_selection_and_the_open_message() {
+        let mut app = mailbox();
+        press(&mut app, KeyCode::Char('j'));
+        app.show_message(id("b"), Ok(None));
+        let mut rows = vec![Row::sample("new", "Zed", "Fresh", true)];
+        rows.extend(mailbox().rows);
+        app.reload(rows);
+        assert_eq!(open(&app), Some("b"));
+        assert_eq!(app.selected, 2, "b moved down one place");
+        assert_eq!(
+            press(&mut app, KeyCode::Char('p')),
+            Some(Request::OpenMessage(id("a")))
+        );
+        app.reload(vec![Row::sample("new", "Zed", "Fresh", true)]);
+        assert_eq!(open(&app), Some("b"), "an open message outlives its row");
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn ctrl_r_asks_for_a_sync_and_results_are_recorded() {
+        let mut app = mailbox();
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Some(Request::Sync)
+        );
+        app.synced(Ok(()), 42);
+        assert_eq!(app.sync, SyncState::Synced(42));
+        app.synced(Err("offline".to_owned()), 43);
+        assert_eq!(app.sync, SyncState::Failed("offline".to_owned()));
     }
 }

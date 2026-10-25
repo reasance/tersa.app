@@ -11,7 +11,9 @@ use tersa_application::mailbox::{AccountId, MailboxReader, MessageId, StoreLimit
 use tersa_application::sync::SyncReport;
 use tersa_keys::RootKey;
 use tersa_presentation::terminal::SafeText;
-use tersa_sync_runtime::{Installation, InstallationLock, Revocation, Runtime, has_local_data};
+use tersa_sync_runtime::{
+    FlowError, Installation, InstallationLock, Revocation, Runtime, has_local_data,
+};
 use tersa_vault::{SlotKind, Vault, VaultError, VaultState};
 
 use crate::config::{Config, Paths};
@@ -361,7 +363,7 @@ pub fn inbox(context: &Context, raw: Option<&str>, limit: u16) -> Result<(), Str
     Ok(())
 }
 
-/// The most messages the interface loads; paging arrives with T2c.
+/// The most messages the interface loads; paging arrives with T2d.
 const TUI_MESSAGES: u16 = 500;
 
 /// Opens the full-screen interface on the first account's cached mail. The
@@ -376,79 +378,84 @@ pub fn tui(context: &Context) -> Result<(), String> {
         .into_iter()
         .next()
         .ok_or_else(|| NO_ACCOUNTS.to_owned())?;
+    // The first frame does not wait for the integrity scan; the start-up
+    // sync's first open runs it.
     let store = locked
         .installation
-        .open_store(&account)
+        .open_store_for_display(&account)
         .map_err(|error| error.to_string())?;
-    let executor = executor()?;
-    let limit = StoreLimit::new(TUI_MESSAGES).map_err(|_error| "invalid limit".to_owned())?;
-    let envelopes = executor
-        .block_on(store.list_envelopes(&account, limit))
-        .map_err(|_error| "could not read the local mailbox".to_owned())?;
-    let rows = envelopes
-        .iter()
-        .map(crate::tui::Row::from_envelope)
-        .collect();
     let source = StoreSource {
         store,
         account: account.clone(),
-        executor,
-        ids: envelopes
-            .iter()
-            .map(|envelope| envelope.message_id().clone())
-            .collect(),
+        executor: executor()?,
+        limit: StoreLimit::new(TUI_MESSAGES).map_err(|_error| "invalid limit".to_owned())?,
     };
-    // Downloads need the OAuth client; without it the interface still reads
-    // the cache.
-    let fetcher = runtime(context, Arc::clone(&locked.installation))
+    // Network work needs the OAuth client; without it the interface still
+    // reads the cache.
+    let remote = runtime(context, Arc::clone(&locked.installation))
         .ok()
-        .and_then(|runtime| {
-            Some(Box::new(StoreFetcher {
+        .map(|runtime| {
+            Box::new(Network {
                 runtime,
-                executor: self::executor().ok()?,
                 account: account.clone(),
-                ids: source.ids.clone(),
-            }) as Box<dyn crate::tui::Fetcher>)
+            }) as Box<dyn crate::tui::Remote>
         });
-    crate::tui::run(
-        SafeText::single_line(account.as_str()),
-        rows,
-        &source,
-        fetcher,
-    )
+    crate::tui::run(SafeText::single_line(account.as_str()), &source, remote)
 }
 
-/// Downloads full messages for the interface through the identity gate.
-struct StoreFetcher {
+/// Downloads and syncs for the interface, through the identity gate.
+struct Network {
     runtime: Runtime,
-    executor: tokio::runtime::Runtime,
     account: AccountId,
-    ids: Vec<MessageId>,
 }
 
-impl crate::tui::Fetcher for StoreFetcher {
-    fn fetch(&mut self, index: usize) -> Result<Vec<u8>, String> {
-        let id = self
-            .ids
-            .get(index)
-            .ok_or_else(|| "unknown message".to_owned())?;
-        self.executor
-            .block_on(self.runtime.fetch_message(&self.account, id))
-            .map_err(|error| error.to_string())
+impl crate::tui::Remote for Network {
+    fn fetch<'a>(&'a self, id: &'a MessageId) -> crate::tui::Pending<'a, Vec<u8>> {
+        Box::pin(async move {
+            self.runtime
+                .fetch_message(&self.account, id)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn sync(&self) -> crate::tui::Pending<'_, ()> {
+        Box::pin(async move {
+            self.runtime
+                .sync_account(&self.account)
+                .await
+                .map(|_report| ())
+                // The status line already says the sync failed.
+                .map_err(|error| match error {
+                    FlowError::Sync(error) => error.reason().to_owned(),
+                    other => other.to_string(),
+                })
+        })
     }
 }
 
-/// Reads cached messages for the interface from one account's store.
+/// Reads cached mail for the interface from one account's store.
 struct StoreSource<S> {
     store: S,
     account: AccountId,
     executor: tokio::runtime::Runtime,
-    ids: Vec<MessageId>,
+    limit: StoreLimit,
 }
 
 impl<S: MailboxReader> crate::tui::MailSource for StoreSource<S> {
-    fn message(&self, index: usize) -> Result<Option<Vec<u8>>, ()> {
-        let id = self.ids.get(index).ok_or(())?;
+    fn rows(&self) -> Result<Vec<crate::tui::Row>, ()> {
+        self.executor
+            .block_on(self.store.list_envelopes(&self.account, self.limit))
+            .map(|envelopes| {
+                envelopes
+                    .iter()
+                    .map(crate::tui::Row::from_envelope)
+                    .collect()
+            })
+            .map_err(|_error| ())
+    }
+
+    fn message(&self, id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
         self.executor
             .block_on(self.store.get_message(&self.account, id))
             .map(|message| message.map(|message| message.content().as_bytes().to_vec()))

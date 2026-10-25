@@ -39,8 +39,12 @@ pub fn truncate(text: &str, max: usize) -> String {
 }
 
 /// Wraps `text` to `columns` display columns at any character, for text
-/// without natural break points such as web addresses.
-pub fn wrap_chars(text: &str, columns: usize) -> Vec<String> {
+/// without natural break points such as web addresses. Stops after `limit`
+/// lines.
+pub fn wrap_chars(text: &str, columns: usize, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let columns = columns.max(1);
     let mut lines = Vec::new();
     let mut line = String::new();
@@ -50,30 +54,45 @@ pub fn wrap_chars(text: &str, columns: usize) -> Vec<String> {
         if used + added > columns && used > 0 {
             lines.push(std::mem::take(&mut line));
             used = 0;
+            if lines.len() >= limit {
+                return lines;
+            }
         }
         line.push(character);
         used += added;
     }
-    lines.push(line);
+    if lines.len() < limit {
+        lines.push(line);
+    }
     lines
 }
 
 /// Wraps `text` to `columns` display columns, breaking at spaces when it
 /// can and inside words when it must. Tabs expand to the next tab stop and
-/// leading indentation is kept.
-pub fn wrap(text: &str, columns: usize) -> Vec<String> {
+/// leading indentation is kept. Stops after `limit` lines, so a huge text
+/// costs no more than what is kept.
+pub fn wrap(text: &str, columns: usize, limit: usize) -> Vec<String> {
     let columns = columns.max(1);
     let mut lines = Vec::new();
     for source in text.split('\n') {
+        let room = limit.saturating_sub(lines.len());
+        if room == 0 {
+            break;
+        }
         let (prefix, continuation) = line_prefix(source);
         let prefix_width = width(prefix);
         if prefix.is_empty() || prefix_width * 2 > columns {
-            wrap_line(source, columns, &mut lines);
+            wrap_line(source, columns, room, &mut lines);
             continue;
         }
         // Quote marks and list bullets carry over to continuation lines.
         let mut parts = Vec::new();
-        wrap_line(&source[prefix.len()..], columns - prefix_width, &mut parts);
+        wrap_line(
+            &source[prefix.len()..],
+            columns - prefix_width,
+            room,
+            &mut parts,
+        );
         for (row, part) in parts.into_iter().enumerate() {
             let lead = if row == 0 {
                 prefix
@@ -101,12 +120,18 @@ fn line_prefix(line: &str) -> (&str, String) {
     (prefix, format!("{quotes}{}", " ".repeat(hanging)))
 }
 
-fn wrap_line(source: &str, columns: usize, lines: &mut Vec<String>) {
+/// Appends at most `room` wrapped lines of `source` to `lines`.
+fn wrap_line(source: &str, columns: usize, room: usize, lines: &mut Vec<String>) {
+    let limit = lines.len() + room;
     let mut line = String::new();
     let mut line_width = 0;
     // Byte offset in `line` just after the last space, and the width there.
     let mut last_space: Option<(usize, usize)> = None;
     for character in source.chars() {
+        if lines.len() >= limit {
+            lines.truncate(limit);
+            return;
+        }
         if character == '\t' {
             let spaces = TAB_STOP - line_width % TAB_STOP;
             for _ in 0..spaces {
@@ -131,6 +156,7 @@ fn wrap_line(source: &str, columns: usize, lines: &mut Vec<String>) {
         );
     }
     lines.push(line);
+    lines.truncate(limit);
 }
 
 fn push_char(
@@ -174,7 +200,29 @@ fn push_char(
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate, width, wrap, wrap_chars};
+    use super::{truncate, width};
+
+    fn wrap(text: &str, columns: usize) -> Vec<String> {
+        super::wrap(text, columns, usize::MAX)
+    }
+
+    fn wrap_chars(text: &str, columns: usize) -> Vec<String> {
+        super::wrap_chars(text, columns, usize::MAX)
+    }
+
+    #[test]
+    fn wrapping_stops_at_the_line_limit() {
+        let long = "word ".repeat(10_000);
+        assert_eq!(super::wrap(&long, 5, 3), ["word", "word", "word"]);
+        assert_eq!(super::wrap("a\nb\nc\nd", 10, 2), ["a", "b"]);
+        assert_eq!(super::wrap("> > one two three", 11, 1), ["> > one two"]);
+        assert!(super::wrap("text", 10, 0).is_empty());
+        assert_eq!(
+            super::wrap_chars(&"x".repeat(10_000), 2, 3),
+            ["xx", "xx", "xx"]
+        );
+        assert!(super::wrap_chars("x", 2, 0).is_empty());
+    }
 
     #[test]
     fn quotes_and_bullets_continue_on_wrapped_lines() {

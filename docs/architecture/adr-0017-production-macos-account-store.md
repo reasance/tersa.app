@@ -24,6 +24,10 @@ bound to one local account, and reject unknown schema ownership.
 access, and uses WAL, foreign keys, in-memory temporary storage, secure
 deletion, a bounded busy timeout, canonical schema validation, `SQLite` and `SQLCipher` integrity
 checks, and no-follow opening of the canonicalized database leaf.
+(Amended in T2c: the `integrity_check` and `cipher_integrity_check` scans read
+the whole database, so they run on the first open of each database in a
+process. Later opens and the interface's first read skip them; every other open
+check still runs, and SQLCipher authenticates each page it reads.)
 An existing file is first inspected through an immutable read-only SQLite URI,
 so rollback-journal recovery cannot modify it before ownership is established.
 An empty candidate with any SQLite sidecar is rejected rather than claimed.

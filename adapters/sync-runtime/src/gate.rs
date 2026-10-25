@@ -18,7 +18,9 @@ use tersa_application::mailbox::{
     AccountId, MailboxStore, MailboxStoreError, Message, MessageId, RemoteMailbox,
     RemoteMailboxError,
 };
-use tersa_application::sync::{SyncCoordinator, SyncFailure, SyncPolicy, SyncReport};
+use tersa_application::sync::{
+    SyncCoordinator, SyncFailure, SyncFailureSource, SyncPolicy, SyncReport,
+};
 
 /// Reports why a gated sync stopped before or during the bounded sync.
 #[derive(Debug)]
@@ -30,12 +32,43 @@ pub enum GatedSyncError {
     Sync(SyncFailure),
 }
 
+impl GatedSyncError {
+    /// Why the sync failed, without the "sync failed" framing, for a status
+    /// line that already says so.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Gate(_) => "the account identity could not be checked",
+            Self::Sync(failure) => sync_cause(*failure),
+        }
+    }
+}
+
 impl fmt::Display for GatedSyncError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Gate(_) => formatter.write_str("the account-identity gate blocked the sync"),
-            Self::Sync(_) => formatter.write_str("the bounded sync failed"),
+            Self::Sync(failure) => write!(formatter, "the sync failed: {}", sync_cause(*failure)),
         }
+    }
+}
+
+/// A content-free reason a reader can act on.
+fn sync_cause(failure: SyncFailure) -> &'static str {
+    match failure.category() {
+        SyncFailureSource::Remote(RemoteMailboxError::AuthorizationRequired) => {
+            "Gmail asks to sign in again"
+        }
+        SyncFailureSource::Remote(RemoteMailboxError::RateLimited) => {
+            "Gmail's rate limit was reached; it retries later"
+        }
+        SyncFailureSource::Remote(RemoteMailboxError::Transport) => "Gmail could not be reached",
+        SyncFailureSource::Remote(_) | SyncFailureSource::Protocol(_) => {
+            "Gmail's mailbox changed during the sync, or its reply was invalid"
+        }
+        SyncFailureSource::Store(_) => "the local cache could not be written",
+        SyncFailureSource::SingleFlight => "another sync is running",
+        SyncFailureSource::IdentityFenced => "the account identity changed",
     }
 }
 
@@ -45,8 +78,12 @@ impl std::error::Error for GatedSyncError {}
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum GatedFetchError {
-    /// The account-identity gate blocked the fetch; nothing was written.
+    /// The account-identity gate could not run; nothing was written.
     Gate(GateError),
+    /// The connected account is not the one the cache recorded, or none is
+    /// recorded yet; only a sync may record or clear an identity, so nothing
+    /// was written.
+    Unverified,
     /// Gmail did not return the message.
     Remote(RemoteMailboxError),
     /// Caching the fetched message failed.
@@ -57,6 +94,9 @@ impl fmt::Display for GatedFetchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Gate(_) => formatter.write_str("the account-identity gate blocked the download"),
+            Self::Unverified => {
+                formatter.write_str("the account is not verified for this cache yet; sync first")
+            }
             Self::Remote(error) => write!(formatter, "Gmail did not return the message ({error})"),
             Self::Store(_) => formatter.write_str("the downloaded message could not be cached"),
         }
@@ -203,19 +243,30 @@ where
         .map_err(GatedSyncError::Sync)
 }
 
-/// Downloads one complete message through the identity gate and caches it.
+/// Downloads one complete message after a read-only identity check, and
+/// caches it.
 ///
-/// The gate runs first, exactly as for [`gated_sync`], and its committed hash
-/// fences the cache write, so a message can never be stored under a
-/// different account. The message is cached only when its envelope row
-/// still exists; it is returned either way. The same external serialization
-/// rule as [`gated_sync`] applies.
+/// Unlike [`gated_sync`], this gate never records or clears an identity: it
+/// proceeds only when the connected account's hash already equals the
+/// recorded one, and otherwise returns [`GatedFetchError::Unverified`] before
+/// any download. The matched hash fences the cache write, which re-checks the
+/// recorded identity inside its transaction, so a message can never be stored
+/// under a different account. The message is cached only when its envelope
+/// row still exists; it is returned either way.
+///
+/// # Concurrency
+///
+/// Because its gate only reads and its single write is fenced, this function
+/// may run concurrently with other fetches and with one [`gated_sync`] cycle
+/// for the same account: if that cycle clears and re-records the identity,
+/// the fenced write aborts instead of caching under the new identity.
 ///
 /// # Errors
 ///
-/// Returns [`GatedFetchError::Gate`] when the gate blocks (no write occurred),
-/// [`GatedFetchError::Remote`] when Gmail fails, and
-/// [`GatedFetchError::Store`] when caching fails.
+/// Returns [`GatedFetchError::Gate`] when the identity cannot be read or
+/// hashed and [`GatedFetchError::Unverified`] when it does not match (no
+/// write occurred in either case), [`GatedFetchError::Remote`] when Gmail
+/// fails, and [`GatedFetchError::Store`] when caching fails.
 pub async fn gated_fetch<S, St, H>(
     account: &AccountId,
     session: S,
@@ -228,15 +279,24 @@ where
     St: MailboxStore + AccountIdentityStore,
     H: AccountIdentityHasher,
 {
-    let fence = run_identity_gate(account, &session, hasher, &store)
+    let normalized = normalize_subject(session.subject());
+    let fresh = hasher
+        .hash(account, &normalized)
+        .map_err(|error| GatedFetchError::Gate(GateError::Hasher(error)))?;
+    drop(normalized);
+    let stored = store
+        .load_identity(account)
         .await
-        .map_err(GatedFetchError::Gate)?;
+        .map_err(|error| GatedFetchError::Gate(GateError::Store(error)))?;
+    if decide(stored.as_ref(), &fresh) != IdentityDecision::Match {
+        return Err(GatedFetchError::Unverified);
+    }
     let message = session
         .fetch_message(account, message_id)
         .await
         .map_err(GatedFetchError::Remote)?;
     store
-        .cache_message_if_present(account, &message, &fence)
+        .cache_message_if_present(account, &message, &fresh)
         .await
         .map_err(GatedFetchError::Store)?;
     Ok(message)
@@ -785,8 +845,17 @@ mod tests {
         assert_eq!(*sync_fences.lock().unwrap(), vec![[9; 32]]);
     }
 
-    /// A session whose mailbox returns one fixed message.
-    struct FetchingProfile(AccountSubject);
+    /// A session whose mailbox returns one fixed message and counts
+    /// downloads.
+    struct FetchingProfile(AccountSubject, Arc<AtomicUsize>);
+
+    fn fetching(value: &str) -> (FetchingProfile, Arc<AtomicUsize>) {
+        let downloads = Arc::new(AtomicUsize::new(0));
+        (
+            FetchingProfile(subject(value), Arc::clone(&downloads)),
+            downloads,
+        )
+    }
 
     impl AccountProfile for FetchingProfile {
         fn subject(&self) -> &AccountSubject {
@@ -808,6 +877,7 @@ mod tests {
             _account: &'a AccountId,
             message_id: &'a MessageId,
         ) -> BoxFuture<'a, Result<Message, RemoteMailboxError>> {
+            self.1.fetch_add(1, Ordering::SeqCst);
             let envelope = MessageEnvelope::new(
                 message_id.clone(),
                 ThreadId::new("thread").unwrap(),
@@ -825,34 +895,59 @@ mod tests {
     }
 
     #[test]
-    fn a_blocked_gate_never_downloads_or_caches() {
+    fn a_failing_gate_never_downloads_or_caches() {
         let store = FakeStore::with_stored([5; 32]);
         let cache_fences = store.fence_probe();
+        let (profile, downloads) = fetching("user-sub");
         let error = drive(gated_fetch(
             &account(),
-            FetchingProfile(subject("user-sub")),
+            profile,
             &FakeHasher::failing(),
             store,
             &MessageId::new("m1").unwrap(),
         ))
         .unwrap_err();
         assert!(matches!(error, GatedFetchError::Gate(_)));
+        assert_eq!(downloads.load(Ordering::SeqCst), 0);
         assert!(cache_fences.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn a_passing_gate_downloads_and_caches_under_the_verified_fence() {
+    fn an_unverified_account_never_downloads_records_or_clears() {
+        for store in [FakeStore::default(), FakeStore::with_stored([1; 32])] {
+            let reconciles = store.identity_reconciles_probe();
+            let cache_fences = store.fence_probe();
+            let (profile, downloads) = fetching("other-sub");
+            let error = drive(gated_fetch(
+                &account(),
+                profile,
+                &FakeHasher::ok([9; 32]),
+                store,
+                &MessageId::new("m1").unwrap(),
+            ))
+            .unwrap_err();
+            assert!(matches!(error, GatedFetchError::Unverified));
+            assert_eq!(downloads.load(Ordering::SeqCst), 0);
+            assert!(reconciles.lock().unwrap().is_empty(), "no identity write");
+            assert!(cache_fences.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_matching_account_downloads_and_caches_under_its_fence() {
         let store = FakeStore::with_stored([5; 32]);
         let cache_fences = store.fence_probe();
+        let (profile, downloads) = fetching("user-sub");
         let message = drive(gated_fetch(
             &account(),
-            FetchingProfile(subject("user-sub")),
+            profile,
             &FakeHasher::ok([5; 32]),
             store,
             &MessageId::new("m1").unwrap(),
         ))
         .unwrap();
         assert_eq!(message.content().as_bytes(), b"Subject: s\r\n\r\nbody");
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
         assert_eq!(*cache_fences.lock().unwrap(), vec![[5; 32]]);
     }
 
@@ -862,7 +957,7 @@ mod tests {
             &account(),
             FakeProfile(subject("user-sub")),
             &FakeHasher::ok([5; 32]),
-            FakeStore::default(),
+            FakeStore::with_stored([5; 32]),
             &MessageId::new("m1").unwrap(),
         ))
         .unwrap_err();
@@ -870,5 +965,46 @@ mod tests {
             error,
             GatedFetchError::Remote(RemoteMailboxError::NotFound)
         ));
+    }
+
+    #[test]
+    fn an_unreadable_identity_blocks_the_download() {
+        let store = FakeStore {
+            load_error: true,
+            ..FakeStore::with_stored([5; 32])
+        };
+        let (profile, downloads) = fetching("user-sub");
+        let error = drive(gated_fetch(
+            &account(),
+            profile,
+            &FakeHasher::ok([5; 32]),
+            store,
+            &MessageId::new("m1").unwrap(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, GatedFetchError::Gate(GateError::Store(_))));
+        assert_eq!(downloads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn sync_errors_name_a_content_free_cause() {
+        use tersa_application::sync::{SyncFailure, SyncFailureSource, SyncProtocolError};
+
+        let message =
+            |source| GatedSyncError::Sync(SyncFailure::from_source_for_test(source)).to_string();
+        assert_eq!(
+            message(SyncFailureSource::Remote(RemoteMailboxError::Transport)),
+            "the sync failed: Gmail could not be reached"
+        );
+        assert_eq!(
+            message(SyncFailureSource::Protocol(
+                SyncProtocolError::ConflictingDuplicate
+            )),
+            "the sync failed: Gmail's mailbox changed during the sync, or its reply was invalid"
+        );
+        assert_eq!(
+            message(SyncFailureSource::IdentityFenced),
+            "the sync failed: the account identity changed"
+        );
     }
 }

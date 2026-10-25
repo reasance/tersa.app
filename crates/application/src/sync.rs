@@ -15,8 +15,8 @@ use crate::identity::IdentityHash;
 #[cfg(test)]
 use crate::mailbox::MailboxReader;
 use crate::mailbox::{
-    BoxFuture, MailboxStore, MailboxStoreError, PageSize, RemoteMailbox, RemoteMailboxError,
-    StoreLimit,
+    BoxFuture, MailboxStore, MailboxStoreError, MessageId, PageSize, RemoteMailbox,
+    RemoteMailboxError, StoreLimit,
 };
 
 /// The largest accepted number of remote pages in one recent snapshot.
@@ -359,7 +359,27 @@ where
             .await
             .map_err(|error| failure(store_failure_source(error), progress))?;
         let body_limit = usize::from(policy.full_body_limit.get());
-        for id in survivors.into_iter().take(body_limit) {
+        let newest: Vec<_> = survivors.into_iter().take(body_limit).collect();
+        self.cache_bodies(account, &newest, fence, &mut progress)
+            .await?;
+        Ok(SyncReport { progress })
+    }
+
+    /// Downloads and caches the bodies of `newest` that the store lacks.
+    async fn cache_bodies(
+        &self,
+        account: &AccountId,
+        newest: &[MessageId],
+        fence: &IdentityHash,
+        progress: &mut SyncProgress,
+    ) -> Result<(), SyncFailure> {
+        // Gmail messages never change, so a cached body is never fetched again.
+        let missing = self
+            .store
+            .uncached_message_ids(account, newest)
+            .await
+            .map_err(|error| failure(store_failure_source(error), *progress))?;
+        for id in missing {
             progress.body_requests += 1;
             match self.remote.fetch_message(account, &id).await {
                 Ok(message) => {
@@ -368,14 +388,14 @@ where
                             SyncFailureSource::Protocol(
                                 SyncProtocolError::MismatchedFetchedMessage,
                             ),
-                            progress,
+                            *progress,
                         ));
                     }
                     if self
                         .store
                         .cache_message_if_present(account, &message, fence)
                         .await
-                        .map_err(|error| failure(store_failure_source(error), progress))?
+                        .map_err(|error| failure(store_failure_source(error), *progress))?
                     {
                         progress.bodies_cached += 1;
                     } else {
@@ -383,10 +403,10 @@ where
                     }
                 }
                 Err(RemoteMailboxError::NotFound) => progress.bodies_skipped += 1,
-                Err(error) => return Err(failure(SyncFailureSource::Remote(error), progress)),
+                Err(error) => return Err(failure(SyncFailureSource::Remote(error), *progress)),
             }
         }
-        Ok(SyncReport { progress })
+        Ok(())
     }
 }
 
@@ -424,7 +444,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use tersa_domain::mailbox::{
-        HeaderText, Message, MessageEnvelope, MessageId, ThreadId, UnixTimestampMillis,
+        HeaderText, Message, MessageEnvelope, ThreadId, UnixTimestampMillis,
     };
 
     use super::*;
@@ -483,6 +503,8 @@ mod tests {
         cache_results: Mutex<Vec<Result<bool, MailboxStoreError>>>,
         cached_ids: Mutex<Vec<MessageId>>,
         put_calls: Mutex<u16>,
+        /// Messages whose body the store already holds.
+        bodies: Mutex<Vec<MessageId>>,
     }
     impl MailboxStore for TestStore {
         fn mark_message_read<'a>(
@@ -577,9 +599,10 @@ mod tests {
         fn get_message<'a>(
             &'a self,
             _: &'a AccountId,
-            _: &'a MessageId,
+            id: &'a MessageId,
         ) -> BoxFuture<'a, Result<Option<Message>, MailboxStoreError>> {
-            Box::pin(ready(Ok(None)))
+            let held = self.bodies.lock().unwrap().contains(id);
+            Box::pin(ready(Ok(held.then(|| message(id.as_str(), 1)))))
         }
     }
     fn account() -> AccountId {
@@ -901,6 +924,47 @@ mod tests {
 
         assert_eq!(error.category(), SyncFailureSource::IdentityFenced);
         assert_eq!(error.progress().body_requests, 1);
+    }
+
+    #[test]
+    fn bodies_already_cached_are_not_fetched_again() {
+        let remote = TestRemote::new(vec![Ok(Page::new(
+            vec![
+                envelope("new", 30),
+                envelope("held", 20),
+                envelope("older", 10),
+            ],
+            None,
+        ))])
+        .with_fetch_results(vec![Ok(message("new", 30))]);
+        let store = TestStore::default();
+        *store.bodies.lock().unwrap() = vec![MessageId::new("held").unwrap()];
+        *store.cache_results.lock().unwrap() = vec![Ok(true)];
+        let coordinator = SyncCoordinator::new(remote, store);
+        let two_bodies = SyncPolicy::new(
+            PageSize::new(3).unwrap(),
+            1,
+            StoreLimit::new(3).unwrap(),
+            StoreLimit::new(2).unwrap(),
+        )
+        .unwrap();
+
+        let report = run(coordinator.sync_recent(&account(), two_bodies, &fence())).unwrap();
+
+        // "held" is among the two newest but cached; "older" is past the limit.
+        assert_eq!(report.progress().body_requests, 1);
+        assert_eq!(report.progress().bodies_cached, 1);
+        assert_eq!(
+            coordinator
+                .remote
+                .fetched_ids
+                .lock()
+                .unwrap()
+                .iter()
+                .map(MessageId::as_str)
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
     }
 
     #[test]
