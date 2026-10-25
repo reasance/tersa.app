@@ -173,8 +173,9 @@ struct Worker {
 }
 
 /// The longest quitting waits for the network thread to stop: a last resort
-/// against a store call that never returns. The longest store call, the
-/// integrity scan of the first open, takes 62 ms on 10,000 envelopes.
+/// against a store call that never returns. The longest store call is the
+/// integrity scan of the first open: 62 ms in the performance harness, more
+/// with large cached bodies.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 
 impl Drop for Worker {
@@ -1077,16 +1078,23 @@ mod tests {
 
         fn sync(&self) -> Pending<'_, ()> {
             Box::pin(async move {
-                let _ = self.started.send(());
                 match self.stall {
                     Stall::StoreCall => {
+                        let _ = self.started.send(());
                         std::thread::sleep(Duration::from_millis(300));
                         *self.ended.lock().expect("lock") = Some(Instant::now());
                         Ok(())
                     }
-                    Stall::Network => std::future::pending().await,
+                    Stall::Network => {
+                        let _ = self.started.send(());
+                        std::future::pending().await
+                    }
                     Stall::BlockingPool => {
-                        let lookup = tokio::task::spawn_blocking(|| {
+                        // Reports from the pool thread, so the lookup is
+                        // running, not just queued, when the quit begins.
+                        let started = self.started.clone();
+                        let lookup = tokio::task::spawn_blocking(move || {
+                            let _ = started.send(());
                             std::thread::sleep(Duration::from_secs(10));
                         });
                         let _ = lookup.await;
