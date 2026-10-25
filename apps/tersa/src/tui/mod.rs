@@ -14,11 +14,11 @@ mod wrap;
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::DefaultTerminal;
@@ -149,23 +149,75 @@ struct Worker {
     jobs: tokio::sync::mpsc::UnboundedSender<Job>,
     done: Receiver<Done>,
     fetching: HashSet<MessageId>,
-    /// The open message, read by queued downloads before they start.
-    open: Arc<Mutex<Option<MessageId>>>,
+    /// The open message. Opening another one stops the download of the
+    /// previous one, queued or running, so at most one download runs and
+    /// one large message is held in memory at a time.
+    open: tokio::sync::watch::Sender<Option<MessageId>>,
     syncing: bool,
     /// When the last sync started, on both clocks: the monotonic clock stops
     /// while the machine sleeps, the wall clock does not.
     last_sync: Option<(Instant, SystemTime)>,
 }
 
-/// At most this many downloads run at once; more wait their turn.
-const PARALLEL_FETCHES: usize = 4;
+/// Downloads `id` unless another message is opened first: then it stops,
+/// whether it is still queued or already running. Going back to the list
+/// does not stop it, so the message is cached when the reader returns.
+async fn download(
+    remote: &dyn Remote,
+    mut open: tokio::sync::watch::Receiver<Option<MessageId>>,
+    id: MessageId,
+) -> Done {
+    let other_opened = async {
+        loop {
+            if open
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|open| open != &id)
+            {
+                break;
+            }
+            // A dropped sender means the interface is gone; stop too.
+            if open.changed().await.is_err() {
+                break;
+            }
+        }
+    };
+    // Checked first, so a download queued for a message the reader already
+    // left never starts.
+    match first(other_opened, remote.fetch(&id)).await {
+        First::Left(()) => Done::Skipped(id),
+        First::Right(result) => Done::Fetched(id, result),
+    }
+}
+
+/// Which of two futures finished first.
+enum First<A, B> {
+    Left(A),
+    Right(B),
+}
+
+/// Runs both futures and returns the first output, dropping the other. On a
+/// tie the left one wins.
+async fn first<A: Future, B: Future>(left: A, right: B) -> First<A::Output, B::Output> {
+    let mut left = pin!(left);
+    let mut right = pin!(right);
+    std::future::poll_fn(|context| {
+        if let Poll::Ready(output) = left.as_mut().poll(context) {
+            return Poll::Ready(First::Left(output));
+        }
+        if let Poll::Ready(output) = right.as_mut().poll(context) {
+            return Poll::Ready(First::Right(output));
+        }
+        Poll::Pending
+    })
+    .await
+}
 
 impl Worker {
     fn start(remote: Box<dyn Remote>) -> Self {
         let (jobs, mut incoming) = tokio::sync::mpsc::unbounded_channel::<Job>();
         let (outgoing, done) = mpsc::channel();
-        let open = Arc::new(Mutex::new(None::<MessageId>));
-        let wanted = Arc::clone(&open);
+        let (open, wanted) = tokio::sync::watch::channel(None::<MessageId>);
         std::thread::spawn(move || {
             let Ok(executor) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -176,39 +228,14 @@ impl Worker {
                 return;
             };
             let remote: Rc<dyn Remote> = Rc::from(remote);
-            let fetches = Rc::new(tokio::sync::Semaphore::new(PARALLEL_FETCHES));
-            // One more slot for the message being opened when older
-            // downloads fill the others.
-            let reserved = Rc::new(tokio::sync::Semaphore::new(1));
             tokio::task::LocalSet::new().block_on(&executor, async move {
                 while let Some(job) = incoming.recv().await {
                     let remote = Rc::clone(&remote);
-                    let fetches = Rc::clone(&fetches);
-                    let reserved = Rc::clone(&reserved);
                     let outgoing = outgoing.clone();
-                    let wanted = Arc::clone(&wanted);
+                    let wanted = wanted.clone();
                     tokio::task::spawn_local(async move {
                         let finished = match job {
-                            Job::Fetch(id) => {
-                                let _turn = match fetches.try_acquire() {
-                                    Ok(permit) => Ok(permit),
-                                    Err(_) => match reserved.try_acquire() {
-                                        Ok(permit) => Ok(permit),
-                                        Err(_) => fetches.acquire().await,
-                                    },
-                                };
-                                let still_open = wanted
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .as_ref()
-                                    == Some(&id);
-                                if still_open {
-                                    let result = remote.fetch(&id).await;
-                                    Done::Fetched(id, result)
-                                } else {
-                                    Done::Skipped(id)
-                                }
-                            }
+                            Job::Fetch(id) => download(&*remote, wanted, id).await,
                             Job::Sync => Done::Synced(remote.sync().await),
                         };
                         let _ = outgoing.send(finished);
@@ -226,12 +253,15 @@ impl Worker {
         }
     }
 
-    /// Records which message is open, so stale downloads are skipped.
+    /// Records which message is open, so downloads of others stop.
     fn set_open(&self, id: Option<&MessageId>) {
-        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
-        if open.as_ref() != id {
-            *open = id.cloned();
-        }
+        self.open.send_if_modified(|open| {
+            let changed = open.as_ref() != id;
+            if changed {
+                *open = id.cloned();
+            }
+            changed
+        });
     }
 
     /// Asks for message `id`; returns false when the thread is gone.
@@ -441,6 +471,7 @@ mod tests {
     use tersa_application::mailbox::MessageId;
     use tersa_presentation::terminal::SafeText;
 
+    use super::app::{Body, Screen};
     use super::{
         App, Done, MailSource, Pending, Remote, Row, SYNC_EVERY, SyncState, WORKER_GONE, Worker,
         finish_work,
@@ -514,7 +545,13 @@ mod tests {
             entries.recv_timeout(Duration::from_millis(100)).is_err(),
             "nothing ran twice"
         );
+        // The sync finished; the five-minute clock now decides.
+        worker.syncing = false;
         assert!(!worker.sync_due(), "a sync was just asked for");
+        worker.last_sync = worker
+            .last_sync
+            .map(|(monotonic, wall)| (monotonic - SYNC_EVERY, wall));
+        assert!(worker.sync_due(), "five minutes later another one is due");
     }
 
     #[test]
@@ -575,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn the_open_message_downloads_while_older_downloads_fill_every_slot() {
+    fn opening_another_message_stops_a_running_download() {
         let (log, entries) = mpsc::channel();
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let mut worker = Worker::start(Box::new(Gated {
@@ -587,16 +624,50 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("work starts")
         };
-        for slow in ["slow1", "slow2", "slow3", "slow4"] {
-            worker.set_open(Some(&id(slow)));
-            assert!(worker.fetch(&id(slow)));
-            assert_eq!(next(), format!("start {slow}"));
-        }
+        worker.set_open(Some(&id("slow")));
+        assert!(worker.fetch(&id("slow")));
+        assert_eq!(next(), "start slow");
         worker.set_open(Some(&id("now")));
         assert!(worker.fetch(&id("now")));
         assert_eq!(next(), "start now");
-        assert_eq!(next(), "fetch now", "it did not wait for the slow ones");
-        gate.add_permits(4);
+        assert_eq!(next(), "fetch now", "it did not wait for the slow one");
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            match worker.done.recv_timeout(Duration::from_secs(5)) {
+                Ok(Done::Skipped(id)) => results.push(format!("skipped {}", id.as_str())),
+                Ok(Done::Fetched(id, Ok(_))) => results.push(format!("fetched {}", id.as_str())),
+                _ => panic!("unexpected result"),
+            }
+        }
+        results.sort();
+        assert_eq!(results, ["fetched now", "skipped slow"]);
+        gate.add_permits(1);
+        assert!(
+            entries.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the stopped download never finished"
+        );
+    }
+
+    #[test]
+    fn going_back_to_the_list_keeps_a_download_running() {
+        let (log, entries) = mpsc::channel();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut worker = Worker::start(Box::new(Gated {
+            log,
+            gate: Arc::clone(&gate),
+        }));
+        worker.set_open(Some(&id("slow")));
+        assert!(worker.fetch(&id("slow")));
+        assert_eq!(
+            entries.recv_timeout(Duration::from_secs(5)).expect("start"),
+            "start slow"
+        );
+        worker.set_open(None);
+        gate.add_permits(1);
+        assert!(matches!(
+            worker.done.recv_timeout(Duration::from_secs(5)),
+            Ok(Done::Fetched(id, Ok(_))) if id.as_str() == "slow"
+        ));
     }
 
     struct Empty;
@@ -619,13 +690,20 @@ mod tests {
             jobs,
             done,
             fetching: HashSet::from([id("a")]),
-            open: Arc::new(Mutex::new(None)),
+            open: tokio::sync::watch::channel(Some(id("a"))).0,
             syncing: true,
             last_sync: Some((Instant::now(), SystemTime::now())),
         };
         let mut app = App::new(SafeText::single_line("me@example.com"), Vec::new());
+        app.show_message(id("a"), Ok(None));
+        app.downloading(&id("a"));
         assert!(finish_work(&mut worker, &mut app, &Empty, 0));
         assert!(matches!(&app.sync, SyncState::Failed(error) if error == WORKER_GONE));
+        assert!(
+            matches!(&app.screen, Screen::Message(view)
+                if matches!(&view.body, Body::DownloadFailed(error) if error == WORKER_GONE)),
+            "the open message says why it will not arrive"
+        );
         assert!(!worker.syncing && worker.fetching.is_empty());
         assert!(
             !finish_work(&mut worker, &mut app, &Empty, 0),
