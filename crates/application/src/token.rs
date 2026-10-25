@@ -71,27 +71,6 @@ impl TokenClientConfig {
         })
     }
 
-    /// Creates a configuration from an optional borrowed Desktop-client secret.
-    ///
-    /// The borrowed value is copied directly into zeroizing storage. This keeps
-    /// callers that only hold build-time configuration strings from depending on
-    /// the concrete secret-storage wrapper.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same validation errors as [`Self::new`].
-    pub fn new_with_optional_client_secret<T: Into<String>>(
-        client_id: T,
-        redirect_uri: Url,
-        client_secret: Option<&str>,
-    ) -> Result<Self, TokenError> {
-        Self::new(
-            client_id,
-            redirect_uri,
-            client_secret.map(|secret| Zeroizing::new(secret.to_owned())),
-        )
-    }
-
     /// Returns the public OAuth client identifier.
     #[must_use]
     pub fn client_id(&self) -> &str {
@@ -740,17 +719,6 @@ impl AccessToken {
     pub fn expires_at(&self) -> Duration {
         self.expires_at
     }
-
-    /// Returns whether a refresh is due before driving a fetch.
-    ///
-    /// Refresh is proactive: it is due as soon as the remaining lifetime has
-    /// fallen to `skew_margin`, so a fetch never starts with a token that can
-    /// expire mid-flight. The deadline is tracked from `expires_in`, never
-    /// inferred from a rejected request.
-    #[must_use]
-    pub fn needs_refresh<C: MonotonicClock>(&self, clock: &C, skew_margin: Duration) -> bool {
-        clock.now().saturating_add(skew_margin) >= self.expires_at
-    }
 }
 
 impl fmt::Debug for AccessToken {
@@ -1195,12 +1163,6 @@ mod tests {
     #[derive(Clone, Debug, Default)]
     struct TestClock(Arc<AtomicU64>);
 
-    impl TestClock {
-        fn advance(&self, seconds: u64) {
-            self.0.fetch_add(seconds, Ordering::Relaxed);
-        }
-    }
-
     impl MonotonicClock for TestClock {
         fn now(&self) -> Duration {
             Duration::from_secs(self.0.load(Ordering::Relaxed))
@@ -1393,30 +1355,6 @@ mod tests {
             .unwrap_err(),
             TokenError::InvalidConfiguration
         );
-        assert_eq!(
-            TokenClientConfig::new_with_optional_client_secret(
-                "public-test-client",
-                test_redirect(),
-                Some("   "),
-            )
-            .unwrap_err(),
-            TokenError::InvalidConfiguration
-        );
-    }
-
-    #[test]
-    fn borrowed_optional_client_secret_is_copied_into_redacted_storage() {
-        let config = TokenClientConfig::new_with_optional_client_secret(
-            "public-test-client",
-            test_redirect(),
-            Some("desktop-test-secret"),
-        )
-        .unwrap();
-        assert_eq!(
-            config.client_secret().map(|secret| secret.as_str()),
-            Some("desktop-test-secret")
-        );
-        assert!(!format!("{config:?}").contains("desktop-test-secret"));
     }
 
     fn claims(subject: &str, audiences: &[&str], issuer: &str, azp: Option<&str>) -> IdTokenClaims {
@@ -1940,32 +1878,6 @@ mod tests {
                 expected
             );
         }
-    }
-
-    #[test]
-    fn proactive_refresh_decision_respects_the_skew_margin() {
-        let clock = TestClock::default();
-        let transport = FakeTransport::success(None);
-        let grant = make_grant("exchange-code");
-        let config = make_config(None);
-        let success = now_ready(exchange_grant(&grant, &config, &transport, &clock)).unwrap();
-        let access_token = success.access_token();
-        let skew_margin = Duration::from_secs(300);
-
-        // Well outside the margin: 3_300 seconds remain.
-        assert!(!access_token.needs_refresh(&clock, skew_margin));
-        // Still outside: exactly the margin plus one second of slack.
-        clock.advance(3_000);
-        assert!(!access_token.needs_refresh(&clock, skew_margin));
-        // At the margin boundary the remaining lifetime equals the margin.
-        clock.advance(300);
-        assert!(access_token.needs_refresh(&clock, skew_margin));
-        // Inside the margin.
-        clock.advance(200);
-        assert!(access_token.needs_refresh(&clock, skew_margin));
-        // Past expiry.
-        clock.advance(200);
-        assert!(access_token.needs_refresh(&clock, skew_margin));
     }
 
     #[test]
