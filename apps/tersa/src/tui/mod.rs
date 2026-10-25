@@ -436,23 +436,20 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
                 let loaded = u16::try_from(app.rows.len())
                     .unwrap_or(u16::MAX)
                     .clamp(FIRST_PAGE, StoreLimit::MAX);
-                match read_page(source, None, loaded) {
-                    Ok((rows, more)) => {
-                        app.reload(rows, more);
-                        // Bring back a selection the reload pushed past the
-                        // rows read, before the next frame shows another row.
-                        while app.selection_pending() && app.more_rows {
-                            load_page(app, source);
-                        }
-                        app.synced(result, now);
+                if let Ok((rows, more)) = read_page(source, None, loaded) {
+                    app.reload(rows, more);
+                    // Bring back a selection the reload pushed past the rows
+                    // read, before the next frame shows another row.
+                    while app.selection_pending() && app.more_rows {
+                        load_page(app, source);
                     }
+                    app.synced(result, now);
+                } else {
                     // Paging on after rows read before the sync could list
                     // mail it removed.
-                    Err(()) => {
-                        app.rows_failed();
-                        let read = Err("could not read the local mailbox".to_owned());
-                        app.synced(result.and(read), now);
-                    }
+                    app.rows_failed();
+                    let read = Err("could not read the local mailbox".to_owned());
+                    app.synced(result.and(read), now);
                 }
             }
         }
