@@ -2345,6 +2345,10 @@ mod store {
         Ok(result)
     }
 
+    /// The envelopes after a cursor, in listing order. The `<=` bound lets the
+    /// `messages_list_order` index seek; the rest breaks ties.
+    const ENVELOPES_AFTER_SQL: &str = "SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, CASE WHEN typeof(received_at) = 'integer' THEN received_at END, CASE WHEN typeof(unread) = 'integer' THEN unread END FROM messages WHERE received_at <= ?1 AND (received_at < ?1 OR message_id > ?2) ORDER BY received_at DESC, message_id ASC LIMIT ?3";
+
     /// Lists up to `limit` envelopes after `after`, seeking through the
     /// `messages_list_order` index rather than skipping rows.
     fn list_envelopes_after(
@@ -2368,9 +2372,8 @@ mod store {
                 push_rows(&mut statement.query(params![limit]).map_err(store_error)?)?;
             }
             Some(cursor) => {
-                // The `<=` bound lets the index seek; the rest breaks ties.
                 let mut statement = connection
-                    .prepare("SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, CASE WHEN typeof(received_at) = 'integer' THEN received_at END, CASE WHEN typeof(unread) = 'integer' THEN unread END FROM messages WHERE received_at <= ?1 AND (received_at < ?1 OR message_id > ?2) ORDER BY received_at DESC, message_id ASC LIMIT ?3")
+                    .prepare(ENVELOPES_AFTER_SQL)
                     .map_err(store_error)?;
                 push_rows(
                     &mut statement
@@ -2656,6 +2659,22 @@ mod store {
             Box::pin(async move {
                 self.checked_account(account)?;
                 self.load_complete_message(message_id)
+            })
+        }
+
+        fn list_envelopes_after<'a>(
+            &'a self,
+            account: &'a AccountId,
+            after: Option<&'a EnvelopeCursor>,
+            limit: StoreLimit,
+        ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                let connection = self
+                    .connection
+                    .lock()
+                    .map_err(|_poison| MailboxStoreError::Storage)?;
+                list_envelopes_after(&connection, after, limit)
             })
         }
 
@@ -3663,7 +3682,27 @@ mod store {
 
         #[test]
         fn keyset_pages_list_every_envelope_once_in_order() {
-            let (_database, store) = open("pages");
+            fn paged(reader: &impl MailboxReader) -> Vec<String> {
+                let mut paged = Vec::new();
+                let mut cursor = None;
+                loop {
+                    let page = run(reader.list_envelopes_after(
+                        &account(),
+                        cursor.as_ref(),
+                        StoreLimit::new(4).unwrap(),
+                    ))
+                    .unwrap();
+                    let Some(last) = page.last() else { break };
+                    cursor = Some(EnvelopeCursor::after(last));
+                    paged.extend(
+                        page.iter()
+                            .map(|item| item.message_id().as_str().to_owned()),
+                    );
+                }
+                paged
+            }
+
+            let (database, store) = open("pages");
             let envelopes: Vec<_> = (0..23)
                 .map(|index| envelope(&format!("m{index:02}"), "thread", i64::from(index / 3)))
                 .collect();
@@ -3674,41 +3713,33 @@ mod store {
                     .iter()
                     .map(|item| item.message_id().as_str().to_owned())
                     .collect();
-            let mut paged = Vec::new();
-            let mut cursor = None;
-            loop {
-                let page = run(store.list_envelopes_after(
-                    &account(),
-                    cursor.as_ref(),
-                    StoreLimit::new(4).unwrap(),
-                ))
-                .unwrap();
-                let Some(last) = page.last() else { break };
-                cursor = Some(EnvelopeCursor::after(last));
-                paged.extend(
-                    page.iter()
-                        .map(|item| item.message_id().as_str().to_owned()),
-                );
-            }
             assert_eq!(
-                paged, expected,
+                paged(&store),
+                expected,
                 "ties on the received time are broken by identifier"
             );
-            assert_eq!(paged.len(), 23);
+            assert_eq!(expected.len(), 23);
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                paged(&reader),
+                expected,
+                "the read-only reader pages the same way"
+            );
 
-            let plan: Vec<String> = store
-                .connection
-                .lock()
+            let connection = store.connection.lock().unwrap();
+            let plan: Vec<String> = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {ENVELOPES_AFTER_SQL}"))
                 .unwrap()
-                .prepare("EXPLAIN QUERY PLAN SELECT message_id FROM messages WHERE received_at <= 5 AND (received_at < 5 OR message_id > 'm') ORDER BY received_at DESC, message_id ASC LIMIT 4")
-                .unwrap()
-                .query_map([], |row| row.get::<_, String>(3))
+                .query_map(params![5, "m", 4], |row| row.get::<_, String>(3))
                 .unwrap()
                 .map(Result::unwrap)
                 .collect();
+            assert_eq!(plan.len(), 1, "one step, no sort: {plan:?}");
             assert!(
-                plan.iter().any(|step| step.contains("messages_list_order")),
-                "{plan:?}"
+                plan[0]
+                    .starts_with("SEARCH messages USING INDEX messages_list_order (received_at<?)"),
+                "the listing query seeks the index: {plan:?}"
             );
         }
 

@@ -370,7 +370,8 @@ pub trait MailboxReader: Send + Sync {
     /// [`Self::list_envelopes`], or from the newest when `after` is `None`.
     /// Paging with the last envelope of each page lists every envelope once.
     ///
-    /// The default lists the whole cache and skips; stores should seek.
+    /// The default lists the newest [`StoreLimit::MAX`] envelopes and skips,
+    /// so it never pages past them; stores should seek.
     ///
     /// # Errors
     ///
