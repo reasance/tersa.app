@@ -5276,6 +5276,11 @@ mod store {
             let changed = envelope("m1", "t2", 20);
             run(store.upsert_envelopes(&account(), std::slice::from_ref(&changed))).unwrap();
             assert_eq!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap())).unwrap(),
+                vec![changed.clone()],
+                "the upsert replaces the envelope's fields"
+            );
+            assert_eq!(
                 run(store.message(&account(), changed.message_id()))
                     .unwrap()
                     .unwrap()
@@ -5928,6 +5933,21 @@ mod store {
                     .collect::<Vec<_>>(),
                 vec!["a", "b"]
             );
+            run(store.upsert_envelopes(&account(), &[envelope("early", "thread", 5)])).unwrap();
+            let threaded = run(store.thread_envelopes(
+                &account(),
+                values[0].thread_id(),
+                StoreLimit::new(2).unwrap(),
+            ))
+            .unwrap();
+            assert_eq!(
+                threaded
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                vec!["early", "a"],
+                "a thread lists oldest first and the limit drops the newest"
+            );
             store.fail_next_mutation();
             assert_eq!(
                 run(store
@@ -5948,7 +5968,7 @@ mod store {
                 run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
                     .unwrap()
                     .len(),
-                3
+                4
             );
         }
 
