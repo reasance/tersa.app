@@ -362,8 +362,8 @@ fn event_loop(
                     }
                 }
             }
-            Some(Request::Reformat(id)) => match source.message(&id) {
-                Ok(Some(raw)) => app.reformat(&id, &raw),
+            Some(Request::Reformat(id, preference)) => match source.message(&id) {
+                Ok(Some(raw)) => app.reformat(&id, &raw, preference),
                 _ => app.status = Some("The message could not be read again.".to_owned()),
             },
             Some(Request::Sync) => match &mut worker {

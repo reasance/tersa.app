@@ -169,9 +169,9 @@ pub struct Search {
 pub enum Request {
     /// Load the cached message with this identifier.
     OpenMessage(MessageId),
-    /// Read the open message again to show it in the other format; raw
-    /// messages can be large, so they are not kept in memory.
-    Reformat(MessageId),
+    /// Read the open message again to show it in this format; raw messages
+    /// can be large, so they are not kept in memory.
+    Reformat(MessageId, BodyPreference),
     /// Sync the account now.
     Sync,
 }
@@ -507,19 +507,21 @@ impl App {
             self.status = Some("This message has only one format.".to_owned());
             return None;
         }
-        self.preference = match rendered.format {
+        let other = match rendered.format {
             Some(BodyFormat::Html) => BodyPreference::Plain,
             _ => BodyPreference::Html,
         };
-        Some(Request::Reformat(view.id.clone()))
+        Some(Request::Reformat(view.id.clone(), other))
     }
 
-    /// Shows the open message `id` again from `raw` in the preferred format.
-    pub fn reformat(&mut self, id: &MessageId, raw: &[u8]) {
-        let preference = self.preference;
+    /// Shows the open message `id` again from `raw` in `preference`, which
+    /// then applies to the messages opened after it. Nothing changes, the
+    /// preference included, when `id` is no longer open.
+    pub fn reformat(&mut self, id: &MessageId, raw: &[u8], preference: BodyPreference) {
         if let Screen::Message(view) = &mut self.screen
             && &view.id == id
         {
+            self.preference = preference;
             view.body = Body::Rendered(Box::new(render_message(raw, preference)));
             view.preference = preference;
             view.scroll = 0;
@@ -558,7 +560,7 @@ mod tests {
     use tersa_application::mailbox::MessageId;
     use tersa_presentation::terminal::SafeText;
 
-    use super::{App, Body, Request, Row, Screen, SyncState, sender_name};
+    use super::{App, Body, BodyPreference, Request, Row, Screen, SyncState, sender_name};
 
     fn id(text: &str) -> MessageId {
         MessageId::new(text).expect("id")
@@ -715,17 +717,24 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
         assert_eq!(body(&app), "html body", "HTML is the default");
         assert_eq!(
             press(&mut app, KeyCode::Char('H')),
-            Some(Request::Reformat(id("m0")))
+            Some(Request::Reformat(id("m0"), BodyPreference::Plain))
         );
-        app.reformat(&id("m0"), raw);
+        assert_eq!(
+            app.preference,
+            BodyPreference::Html,
+            "nothing changes until the message is shown again"
+        );
+        app.reformat(&id("m0"), raw, BodyPreference::Plain);
         assert_eq!(body(&app), "plain body");
-        app.reformat(&id("other"), raw);
+        assert_eq!(app.preference, BodyPreference::Plain);
+        app.reformat(&id("other"), raw, BodyPreference::Html);
         assert_eq!(body(&app), "plain body", "only the open message changes");
+        assert_eq!(app.preference, BodyPreference::Plain, "nor the preference");
         assert_eq!(
             press(&mut app, KeyCode::Char('H')),
-            Some(Request::Reformat(id("m0")))
+            Some(Request::Reformat(id("m0"), BodyPreference::Html))
         );
-        app.reformat(&id("m0"), raw);
+        app.reformat(&id("m0"), raw, BodyPreference::Html);
         assert_eq!(body(&app), "html body");
     }
 
