@@ -35,16 +35,17 @@ impl Row {
 
 /// The display name from a `Name <address>` header, or the address.
 ///
-/// A display name that itself contains `@` could pose as another address, as
-/// in `"security@bank.example" <attacker@evil.example>`, so the real address
-/// is shown instead.
+/// A display name that itself contains `@`, or a character that looks like
+/// it, could pose as another address, as in `"security@bank.example"
+/// <attacker@evil.example>`, so the real address is shown instead.
 fn sender_name(from: &str) -> &str {
     let from = from.trim();
     match from.rsplit_once('<') {
         Some((name, address)) => {
             let name = name.trim().trim_matches('"').trim();
             let address = address.trim_end_matches('>').trim();
-            if name.is_empty() || name.contains('@') {
+            // `@`, the fullwidth `＠`, and the small `﹫`.
+            if name.is_empty() || name.contains(['@', '\u{ff20}', '\u{fe6b}']) {
                 address
             } else {
                 name
@@ -379,6 +380,15 @@ mod tests {
             "attacker@evil.example",
             "a name that looks like an address gives way to the address"
         );
+        for lookalike in ['\u{ff20}', '\u{fe6b}'] {
+            assert_eq!(
+                sender_name(&format!(
+                    "security{lookalike}bank.example <attacker@evil.example>"
+                )),
+                "attacker@evil.example",
+                "{lookalike:?}"
+            );
+        }
     }
 
     #[test]
