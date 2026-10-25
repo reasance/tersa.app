@@ -111,10 +111,8 @@ pub fn run(
     remote: Option<Box<dyn Remote>>,
 ) -> Result<(), String> {
     require_terminal()?;
-    let rows = source
-        .page(None, FIRST_PAGE)
+    let (rows, more) = read_page(source, None, FIRST_PAGE)
         .map_err(|()| "could not read the local mailbox".to_owned())?;
-    let more = rows.len() == usize::from(FIRST_PAGE);
     let mut app = App::new(account, rows);
     app.more_rows = more;
     let worker = remote.map(Worker::start);
@@ -437,15 +435,12 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
                     .unwrap_or(u16::MAX)
                     .clamp(FIRST_PAGE, StoreLimit::MAX);
                 let reloaded = result.and_then(|()| {
-                    source
-                        .page(None, loaded)
+                    read_page(source, None, loaded)
                         .map_err(|()| "could not read the local mailbox".to_owned())
                 });
                 match reloaded {
-                    Ok(rows) => {
-                        let more = rows.len() == usize::from(loaded);
-                        app.reload(rows);
-                        app.more_rows = more;
+                    Ok((rows, more)) => {
+                        app.reload(rows, more);
                         app.synced(Ok(()), now);
                     }
                     Err(error) => app.synced(Err(error), now),
@@ -459,14 +454,32 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
 /// Reads the page after the last loaded row; returns whether it changed the
 /// list.
 fn load_page(app: &mut App, source: &dyn MailSource) -> bool {
-    if let Ok(rows) = source.page(app.rows.last(), PAGE) {
-        app.more_rows = rows.len() == usize::from(PAGE);
-        app.append(rows);
-    } else {
-        app.more_rows = false;
-        app.status = Some("Older messages could not be read from the local cache.".to_owned());
+    match read_page(source, app.rows.last(), PAGE) {
+        Ok((rows, more)) => {
+            app.more_rows = more;
+            app.append(rows);
+        }
+        // The top bar says so; a status line would vanish at the next key.
+        Err(()) => app.older_rows_failed(),
     }
     true
+}
+
+/// Reads up to `limit` rows after `after`, and whether older rows follow. It
+/// asks for one row more than it keeps, so a page that ends the cache is not
+/// taken for an unfinished one.
+fn read_page(
+    source: &dyn MailSource,
+    after: Option<&Row>,
+    limit: u16,
+) -> Result<(Vec<Row>, bool), ()> {
+    // A read is capped; at the cap a full page counts as unfinished.
+    let probe = limit.saturating_add(1).min(StoreLimit::MAX);
+    let mut rows = source.page(after, probe)?;
+    let kept = usize::from(limit);
+    let more = rows.len() > kept || (probe == limit && rows.len() == kept);
+    rows.truncate(kept);
+    Ok((rows, more))
 }
 
 /// Fails the sync and downloads a stopped worker still owed; returns whether
@@ -512,7 +525,7 @@ mod tests {
 
     use super::{
         App, Done, FIRST_PAGE, MailSource, Pending, Remote, Row, SYNC_EVERY, SyncState,
-        WORKER_GONE, Worker, finish_work, load_page,
+        WORKER_GONE, Worker, finish_work, load_page, read_page,
     };
 
     /// Records the order work finishes in; syncs wait for the test.
@@ -791,6 +804,10 @@ mod tests {
             app.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("50+ matches; esc shows every message")
+        );
         while app.more_rows {
             assert!(load_page(&mut app, &source));
         }
@@ -800,6 +817,73 @@ mod tests {
         let expected: Vec<String> = (0..1_234).map(|index| format!("m{index:05}")).collect();
         assert_eq!(ids, expected, "every row once, in order");
         assert_eq!(app.shown.len(), 617, "the search covers every page");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("617 matches; esc shows every message"),
+            "the count follows the pages"
+        );
+    }
+
+    #[test]
+    fn a_page_that_ends_the_cache_is_not_taken_for_an_unfinished_one() {
+        let source = Pages::new(100);
+        let (rows, more) = read_page(&source, None, FIRST_PAGE).expect("page");
+        assert_eq!(rows.len(), 100);
+        assert!(!more, "exactly one first page");
+
+        let source = Pages::new(600);
+        let (rows, more) = read_page(&source, None, FIRST_PAGE).expect("page");
+        let mut app = App::new(SafeText::single_line("acct"), rows);
+        app.more_rows = more;
+        while app.more_rows {
+            load_page(&mut app, &source);
+        }
+        assert_eq!(app.rows.len(), 600);
+        assert_eq!(source.reads.get(), 2, "no empty read after a full page");
+    }
+
+    #[test]
+    fn a_failed_older_page_outlasts_the_next_key() {
+        struct OlderFail(Pages);
+        impl MailSource for OlderFail {
+            fn page(&self, after: Option<&Row>, limit: u16) -> Result<Vec<Row>, ()> {
+                if after.is_some() {
+                    return Err(());
+                }
+                self.0.page(after, limit)
+            }
+
+            fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
+                Ok(None)
+            }
+        }
+        let source = OlderFail(Pages::new(1_234));
+        let (rows, more) = read_page(&source, None, FIRST_PAGE).expect("page");
+        let mut app = App::new(SafeText::single_line("acct"), rows);
+        app.more_rows = more;
+        load_page(&mut app, &source);
+        app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(!app.more_rows, "loading stops");
+        assert!(app.older_unreadable, "a key press does not clear it");
+    }
+
+    fn finished_sync(app: &mut App, source: &dyn MailSource) {
+        let (jobs, _) = tokio::sync::mpsc::unbounded_channel();
+        let (done_sender, done) = mpsc::channel();
+        let mut worker = Worker {
+            jobs,
+            done,
+            fetching: HashSet::new(),
+            open: tokio::sync::watch::channel(None).0,
+            syncing: true,
+            last_sync: Some((Instant::now(), SystemTime::now())),
+        };
+        done_sender.send(Done::Synced(Ok(()))).expect("send");
+        assert!(finish_work(&mut worker, app, source, 0));
+    }
+
+    fn selected_id(app: &App) -> Option<&str> {
+        app.shown_row(app.selected).map(|row| row.id.as_str())
     }
 
     #[test]
@@ -813,24 +897,32 @@ mod tests {
         for _ in 0..300 {
             app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         }
-        let (jobs, _) = tokio::sync::mpsc::unbounded_channel();
-        let (done_sender, done) = mpsc::channel();
-        let mut worker = Worker {
-            jobs,
-            done,
-            fetching: HashSet::new(),
-            open: tokio::sync::watch::channel(None).0,
-            syncing: true,
-            last_sync: Some((Instant::now(), SystemTime::now())),
-        };
-        done_sender.send(Done::Synced(Ok(()))).expect("send");
-        assert!(finish_work(&mut worker, &mut app, &source, 0));
+        finished_sync(&mut app, &source);
         assert_eq!(app.rows.len(), 600);
         assert!(app.more_rows);
-        assert_eq!(
-            app.shown_row(app.selected).map(|row| row.id.as_str()),
-            Some("m00300")
+        assert_eq!(selected_id(&app), Some("m00300"));
+    }
+
+    #[test]
+    fn a_selection_pushed_past_the_reload_comes_back_with_its_page() {
+        let mut source = Pages::new(1_234);
+        let mut app = App::new(
+            SafeText::single_line("acct"),
+            source.page(None, 600).expect("page"),
         );
+        app.more_rows = true;
+        for _ in 0..599 {
+            app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        assert_eq!(selected_id(&app), Some("m00599"));
+        // The sync stored one newer message, so 600 rows end one row earlier.
+        source
+            .rows
+            .insert(0, Row::sample("new", "Zed", "Fresh", true));
+        finished_sync(&mut app, &source);
+        assert_eq!(app.rows.len(), 600);
+        load_page(&mut app, &source);
+        assert_eq!(selected_id(&app), Some("m00599"));
     }
 
     #[test]

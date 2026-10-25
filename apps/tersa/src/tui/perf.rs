@@ -12,8 +12,16 @@
 //! cargo test --release -p tersa perf -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! The first frame here is measured in process, from opening the store to the
-//! first draw; process start and the keyring read come on top of it.
+//! What they measure, and what they leave out:
+//!
+//! - The first frame is the fastest of five runs in process, from opening the
+//!   store to a draw into ratatui's test backend. Process start, the keyring
+//!   read and writing to a real terminal come on top of it.
+//! - The idle resident size is that of this test binary in a fresh process
+//!   that does what the interface does. The test binary links the test
+//!   harness as well, so the product binary is no larger.
+//! - The budget on the stripped release binary is not checked here: it is
+//!   the size of `target/release/tersa`, which the release profile strips.
 
 #![expect(clippy::unwrap_used, reason = "a benchmark fixture that must build")]
 
@@ -30,7 +38,7 @@ use tersa_presentation::terminal::SafeText;
 use tersa_store_sqlcipher::{DatabaseKey, IntegrityScan, SqlCipherMailboxStore};
 
 use super::app::App;
-use super::{FIRST_PAGE, MailSource, PAGE, load_page, view};
+use super::{FIRST_PAGE, PAGE, load_page, read_page, view};
 use crate::commands::StoreSource;
 
 /// ADR 0031 budgets.
@@ -191,9 +199,9 @@ fn perf_full_cache_budgets() {
     let warm = source(store);
     let (first_frame, mut app) = best(5, || {
         let fresh = source(open(&fixture.path, IntegrityScan::Skip));
-        let rows = fresh.page(None, FIRST_PAGE).unwrap();
+        let (rows, more) = read_page(&fresh, None, FIRST_PAGE).unwrap();
         let mut app = App::new(SafeText::single_line("acct_perf"), rows);
-        app.more_rows = true;
+        app.more_rows = more;
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
             .draw(|frame| view::draw(frame, &mut app, 1_761_000_000_000))
@@ -219,7 +227,7 @@ fn perf_full_cache_budgets() {
     report(&format!("slowest page of {PAGE}"), slowest_page, None);
 
     let loaded = u16::try_from(MESSAGES).unwrap();
-    let (reload, rows) = best(3, || warm.page(None, loaded).unwrap());
+    let (reload, (rows, _more)) = best(3, || read_page(&warm, None, loaded).unwrap());
     assert_eq!(rows.len(), MESSAGES);
     report("reload all rows after a sync", reload, None);
 
@@ -276,12 +284,13 @@ const CHILD_DATABASE: &str = "TERSA_PERF_DATABASE";
 #[ignore = "performance: started by perf_full_cache_budgets"]
 fn perf_idle_rss_child() {
     let Some(path) = std::env::var_os(CHILD_DATABASE) else {
+        println!("perf_idle_rss_child measures only when perf_full_cache_budgets starts it");
         return;
     };
     let source = source(open(std::path::Path::new(&path), IntegrityScan::Skip));
-    let rows = source.page(None, FIRST_PAGE).unwrap();
+    let (rows, more) = read_page(&source, None, FIRST_PAGE).unwrap();
     let mut app = App::new(SafeText::single_line("acct_perf"), rows);
-    app.more_rows = true;
+    app.more_rows = more;
     while app.more_rows {
         load_page(&mut app, &source);
     }

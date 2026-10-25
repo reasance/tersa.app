@@ -204,6 +204,15 @@ pub struct App {
     pub repaint: bool,
     /// Whether older rows may still be in the cache, not yet loaded.
     pub more_rows: bool,
+    /// Set when older rows could not be read; the top bar says so until the
+    /// next reload.
+    pub older_unreadable: bool,
+    /// The row selected before a reload pushed it past the reloaded rows; it
+    /// is selected again when its page arrives, unless a key comes first.
+    pending_selection: Option<MessageId>,
+    /// Whether the status line counts the matches of a finished search, so
+    /// pages that arrive later update it.
+    counting_matches: bool,
 }
 
 impl App {
@@ -228,6 +237,9 @@ impl App {
             preference: BodyPreference::Html,
             repaint: false,
             more_rows: false,
+            older_unreadable: false,
+            pending_selection: None,
+            counting_matches: false,
         }
     }
 
@@ -249,8 +261,6 @@ impl App {
         !self.search.query.is_empty()
     }
 
-    /// Replaces the rows after a sync, keeping the selection and any open
-    /// message.
     /// Adds older rows after the loaded ones, keeping the selection.
     pub fn append(&mut self, rows: Vec<Row>) {
         let words = self.search_words();
@@ -259,15 +269,54 @@ impl App {
         let rows = &self.rows;
         self.shown
             .extend((start..rows.len()).filter(|&index| rows[index].matches(&words)));
+        if let Some(position) = self
+            .pending_selection
+            .as_ref()
+            .and_then(|id| self.position_of(id))
+        {
+            self.selected = position;
+            self.pending_selection = None;
+        }
+        self.count_matches();
     }
 
-    pub fn reload(&mut self, rows: Vec<Row>) {
+    /// Replaces the rows after a sync, keeping the selection and any open
+    /// message; `more` says whether older rows follow.
+    pub fn reload(&mut self, rows: Vec<Row>, more: bool) {
         let selected = self.shown_row(self.selected).map(|row| row.id.clone());
         self.rows = rows;
+        self.more_rows = more;
+        self.older_unreadable = false;
+        self.pending_selection = None;
         self.refilter();
-        if let Some(position) = selected.and_then(|id| self.position_of(&id)) {
-            self.selected = position;
+        if let Some(id) = selected {
+            match self.position_of(&id) {
+                Some(position) => self.selected = position,
+                // Newer mail pushed it into a page not read again yet.
+                None if more => self.pending_selection = Some(id),
+                None => {}
+            }
         }
+        self.count_matches();
+    }
+
+    /// Stops loading older rows after a failed read.
+    pub fn older_rows_failed(&mut self) {
+        self.more_rows = false;
+        self.older_unreadable = true;
+        self.count_matches();
+    }
+
+    /// Updates the match count of a finished search on the status line.
+    fn count_matches(&mut self) {
+        if !self.counting_matches {
+            return;
+        }
+        let more = if self.more_rows { "+" } else { "" };
+        self.status = Some(match self.shown.len() {
+            1 if more.is_empty() => "1 match; esc shows every message".to_owned(),
+            count => format!("{count}{more} matches; esc shows every message"),
+        });
     }
 
     fn search_words(&self) -> Vec<String> {
@@ -305,6 +354,8 @@ impl App {
     /// Handles one key press and returns any work the caller must do.
     pub fn key(&mut self, key: KeyEvent) -> Option<Request> {
         self.status = None;
+        self.counting_matches = false;
+        self.pending_selection = None;
         if self.help {
             self.help = false;
             return None;
@@ -397,12 +448,8 @@ impl App {
         match key.code {
             KeyCode::Enter => {
                 self.search.editing = false;
-                if self.filtered() {
-                    self.status = Some(match self.shown.len() {
-                        1 => "1 match; esc shows every message".to_owned(),
-                        count => format!("{count} matches; esc shows every message"),
-                    });
-                }
+                self.counting_matches = self.filtered();
+                self.count_matches();
             }
             KeyCode::Esc => {
                 self.search.editing = false;
@@ -870,14 +917,14 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
         app.show_message(id("b"), Ok(None));
         let mut rows = vec![Row::sample("new", "Zed", "Fresh", true)];
         rows.extend(mailbox().rows);
-        app.reload(rows);
+        app.reload(rows, false);
         assert_eq!(open(&app), Some("b"));
         assert_eq!(app.selected, 2, "b moved down one place");
         assert_eq!(
             press(&mut app, KeyCode::Char('p')),
             Some(Request::OpenMessage(id("a")))
         );
-        app.reload(vec![Row::sample("new", "Zed", "Fresh", true)]);
+        app.reload(vec![Row::sample("new", "Zed", "Fresh", true)], false);
         assert_eq!(open(&app), Some("b"), "an open message outlives its row");
         assert_eq!(app.selected, 0);
     }
