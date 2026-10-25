@@ -378,9 +378,11 @@ pub fn tui(context: &Context) -> Result<(), String> {
         .into_iter()
         .next()
         .ok_or_else(|| NO_ACCOUNTS.to_owned())?;
+    // The first frame does not wait for the integrity scan; the start-up
+    // sync's first open runs it.
     let store = locked
         .installation
-        .open_store(&account)
+        .open_store_for_display(&account)
         .map_err(|error| error.to_string())?;
     let source = StoreSource {
         store,

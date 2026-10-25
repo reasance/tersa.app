@@ -91,6 +91,18 @@ mod store {
         }
     }
 
+    /// Whether opening a database reads all of it to check every page.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum IntegrityScan {
+        /// Run `PRAGMA integrity_check` and `PRAGMA cipher_integrity_check`,
+        /// which read the whole database, so their cost grows with the cache.
+        Full,
+        /// Skip both scans, for a database this process already scanned.
+        /// Every other check still runs, and `SQLCipher` still authenticates
+        /// each page when it is read, so a damaged page fails the read.
+        Skip,
+    }
+
     /// Stores one account's mailbox in one `SQLCipher` database file.
     pub struct SqlCipherMailboxStore {
         account: AccountId,
@@ -268,7 +280,24 @@ mod store {
             path: P,
             key: DatabaseKey,
         ) -> Result<Self, MailboxStoreError> {
-            Self::open_inner_impl(account, path.as_ref(), key, &mut |_point, _path| Ok(()))
+            Self::open_with_scan(account, path, key, IntegrityScan::Full)
+        }
+
+        /// Opens like [`Self::open`], running the whole-database integrity
+        /// scans only when `scan` is [`IntegrityScan::Full`].
+        ///
+        /// # Errors
+        ///
+        /// The same as [`Self::open`].
+        pub fn open_with_scan<P: AsRef<Path>>(
+            account: AccountId,
+            path: P,
+            key: DatabaseKey,
+            scan: IntegrityScan,
+        ) -> Result<Self, MailboxStoreError> {
+            Self::open_inner_impl(account, path.as_ref(), key, scan, &mut |_point, _path| {
+                Ok(())
+            })
         }
 
         /// Opens the database for `account` at `path` ONLY if its file already
@@ -308,12 +337,18 @@ mod store {
             after_preflight: impl FnOnce(&Path),
         ) -> Result<Self, MailboxStoreError> {
             let mut after_preflight = Some(after_preflight);
-            Self::open_inner_impl(account, path, key, &mut |point, canonical_path| {
-                if point == WriterHook::AfterSnapshot {
-                    after_preflight.take().expect("hook runs once")(canonical_path);
-                }
-                Ok(())
-            })
+            Self::open_inner_impl(
+                account,
+                path,
+                key,
+                IntegrityScan::Full,
+                &mut |point, canonical_path| {
+                    if point == WriterHook::AfterSnapshot {
+                        after_preflight.take().expect("hook runs once")(canonical_path);
+                    }
+                    Ok(())
+                },
+            )
         }
 
         #[cfg(test)]
@@ -326,18 +361,24 @@ mod store {
         ) -> Result<Self, MailboxStoreError> {
             let mut after_preflight = Some(after_preflight);
             let mut after_open = Some(after_open);
-            Self::open_inner_impl(account, path, key, &mut |point, canonical_path| {
-                match point {
-                    WriterHook::AfterSnapshot => {
-                        after_preflight.take().expect("hook runs once")(canonical_path);
+            Self::open_inner_impl(
+                account,
+                path,
+                key,
+                IntegrityScan::Full,
+                &mut |point, canonical_path| {
+                    match point {
+                        WriterHook::AfterSnapshot => {
+                            after_preflight.take().expect("hook runs once")(canonical_path);
+                        }
+                        WriterHook::AfterOpen => {
+                            after_open.take().expect("hook runs once")(canonical_path);
+                        }
+                        _ => {}
                     }
-                    WriterHook::AfterOpen => {
-                        after_open.take().expect("hook runs once")(canonical_path);
-                    }
-                    _ => {}
-                }
-                Ok(())
-            })
+                    Ok(())
+                },
+            )
         }
 
         #[cfg(test)]
@@ -347,13 +388,14 @@ mod store {
             key: DatabaseKey,
             hook: &mut dyn FnMut(WriterHook, &Path) -> Result<(), OpenFailure>,
         ) -> Result<Self, MailboxStoreError> {
-            Self::open_inner_impl(account, path, key, hook)
+            Self::open_inner_impl(account, path, key, IntegrityScan::Full, hook)
         }
 
         fn open_inner_impl(
             account: AccountId,
             path: &Path,
             mut key: DatabaseKey,
+            scan: IntegrityScan,
             hook: &mut dyn FnMut(WriterHook, &Path) -> Result<(), OpenFailure>,
         ) -> Result<Self, MailboxStoreError> {
             let canonical_path = canonical_database_path(path).map_err(|kind| match kind {
@@ -365,13 +407,14 @@ mod store {
                 OpenFailure::Storage => MailboxStoreError::Storage,
             })?;
             let existing_preflight = if leaf.snapshot.main.is_some() {
-                let preflight = match preflight_existing(&canonical_path, &account, &key.0, &leaf) {
-                    Ok(preflight) => preflight,
-                    Err(kind) => {
-                        key.0.zeroize();
-                        return Err(mailbox_open_error(kind));
-                    }
-                };
+                let preflight =
+                    match preflight_existing(&canonical_path, &account, &key.0, &leaf, scan) {
+                        Ok(preflight) => preflight,
+                        Err(kind) => {
+                            key.0.zeroize();
+                            return Err(mailbox_open_error(kind));
+                        }
+                    };
                 if let Err(kind) = leaf.require_snapshot_unchanged() {
                     key.0.zeroize();
                     return Err(mailbox_open_error(kind));
@@ -441,7 +484,7 @@ mod store {
                     hook(WriterHook::AfterFreshMigration, &canonical_path)?;
                 }
                 set_and_verify_persistent_wal(&connection)?;
-                validate_health(&connection)?;
+                validate_health(&connection, scan)?;
                 if let Some(preflight) = existing_preflight {
                     leaf.require_existing_writer_state(preflight)?;
                 }
@@ -2054,7 +2097,8 @@ mod store {
                 copied_wal,
                 copied_shm,
             )?;
-            let fresh = validate_recovery_read_only(&connection, account, key)?;
+            let fresh =
+                validate_recovery_read_only(&connection, account, key, IntegrityScan::Full)?;
             verify_recovery_stage(
                 leaf,
                 &directory,
@@ -2199,6 +2243,7 @@ mod store {
         account: &AccountId,
         key: &[u8; 32],
         leaf: &LeafGuard,
+        scan: IntegrityScan,
     ) -> Result<ExistingPreflight, OpenFailure> {
         let snapshot = leaf.snapshot;
         if snapshot.journal.is_some() || (snapshot.wal.is_none() && snapshot.shm.is_some()) {
@@ -2240,7 +2285,7 @@ mod store {
         let wal_connection = open_read_only_connection(path)?;
         disable_and_verify_checkpoint_on_close(&wal_connection)?;
         opened_file_has_moved(&wal_connection)?;
-        let fresh = validate_recovery_read_only(&wal_connection, account, key)?;
+        let fresh = validate_recovery_read_only(&wal_connection, account, key, scan)?;
         Ok(if fresh {
             ExistingPreflight::FreshWal
         } else {
@@ -2758,7 +2803,7 @@ mod store {
         account: &AccountId,
         key: &[u8; 32],
     ) -> Result<(), OpenFailure> {
-        if validate_recovery_read_only(connection, account, key)? {
+        if validate_recovery_read_only(connection, account, key, IntegrityScan::Full)? {
             return Err(OpenFailure::Corrupted);
         }
         Ok(())
@@ -2768,6 +2813,7 @@ mod store {
         connection: &Connection,
         account: &AccountId,
         key: &[u8; 32],
+        scan: IntegrityScan,
     ) -> Result<bool, OpenFailure> {
         apply_key(connection, key).map_err(classify_key)?;
         connection
@@ -2790,7 +2836,7 @@ mod store {
         connection.execute_batch("BEGIN;").map_err(classify_open)?;
         let validation = (|| {
             let fresh = validate_identity(connection, account)?;
-            validate_health(connection)?;
+            validate_health(connection, scan)?;
             Ok(fresh)
         })();
         if validation.is_ok() {
@@ -2881,7 +2927,7 @@ mod store {
             .map_err(classify_open)
     }
 
-    fn validate_health(connection: &Connection) -> Result<(), OpenFailure> {
+    fn validate_health(connection: &Connection, scan: IntegrityScan) -> Result<(), OpenFailure> {
         let foreign_keys: i64 = connection
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .map_err(classify_open)?;
@@ -2894,17 +2940,22 @@ mod store {
         let journal: String = connection
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .map_err(classify_open)?;
-        let integrity: String = connection
-            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-            .map_err(classify_open)?;
         let foreign_key_failure = connection
             .prepare("PRAGMA foreign_key_check")
             .and_then(|mut statement| statement.query([])?.next().map(|row| row.is_some()))
             .map_err(classify_open)?;
-        let cipher_failure = connection
-            .prepare("PRAGMA cipher_integrity_check")
-            .and_then(|mut statement| statement.query([])?.next().map(|row| row.is_some()))
-            .map_err(classify_open)?;
+        let (integrity, cipher_failure) = match scan {
+            IntegrityScan::Full => (
+                connection
+                    .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .map_err(classify_open)?,
+                connection
+                    .prepare("PRAGMA cipher_integrity_check")
+                    .and_then(|mut statement| statement.query([])?.next().map(|row| row.is_some()))
+                    .map_err(classify_open)?,
+            ),
+            IntegrityScan::Skip => ("ok".to_owned(), false),
+        };
         if foreign_keys != 1
             || temp_store != 2
             || secure_delete != 1
@@ -3538,6 +3589,50 @@ mod store {
         }
 
         #[test]
+        fn a_skipped_scan_still_fails_reads_of_a_damaged_page() {
+            let database = TestDatabase::new("scan");
+            {
+                let store =
+                    SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+                let big = envelope("big", "thread", 10);
+                run(store.upsert_envelopes(&account(), std::slice::from_ref(&big))).unwrap();
+                let body = Message::new(big, MessageContent::new(vec![b'x'; 256 * 1024]).unwrap());
+                run(store.put_message(&account(), &body)).unwrap();
+                store
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .unwrap();
+            }
+            // The body's overflow pages now fill most of the main file.
+            // Damage one in the middle.
+            let mut bytes = fs::read(database.path()).unwrap();
+            assert!(bytes.len() > 256 * 1024, "the body is in the main file");
+            let at = bytes.len() / 2;
+            bytes[at] ^= 0xff;
+            fs::write(database.path(), &bytes).unwrap();
+
+            assert_corrupted(SqlCipherMailboxStore::open_with_scan(
+                account(),
+                database.path(),
+                key(7),
+                IntegrityScan::Full,
+            ));
+            let store = SqlCipherMailboxStore::open_with_scan(
+                account(),
+                database.path(),
+                key(7),
+                IntegrityScan::Skip,
+            )
+            .unwrap();
+            assert!(
+                run(store.get_message(&account(), &MessageId::new("big").unwrap())).is_err(),
+                "SQLCipher authenticates the page when the body is read"
+            );
+        }
+
+        #[test]
         fn fresh_create_converges_reopen_is_noop_and_wrong_key_is_rejected() {
             assert_eq!(
                 key_result(rusqlite::ffi::SQLITE_NOMEM).map_err(classify_key),
@@ -3823,7 +3918,13 @@ mod store {
             let canonical_path = canonical_database_path(database.path()).unwrap();
             let main_only = LeafGuard::open(&canonical_path).unwrap();
             assert_eq!(
-                preflight_existing(&canonical_path, &account(), &key(7).0, &main_only),
+                preflight_existing(
+                    &canonical_path,
+                    &account(),
+                    &key(7).0,
+                    &main_only,
+                    IntegrityScan::Full
+                ),
                 Ok(ExistingPreflight::MainWithoutSidecars)
             );
 
@@ -3834,7 +3935,13 @@ mod store {
             let wal_identity_before = file_identity(&wal_path(&database)).unwrap();
             let missing_shm = LeafGuard::open(&canonical_path).unwrap();
             assert_eq!(
-                preflight_existing(&canonical_path, &account(), &key(7).0, &missing_shm),
+                preflight_existing(
+                    &canonical_path,
+                    &account(),
+                    &key(7).0,
+                    &missing_shm,
+                    IntegrityScan::Full
+                ),
                 Ok(ExistingPreflight::WalWithoutShm)
             );
             assert_eq!(fs::read(database.path()).unwrap(), main_before);
@@ -3946,7 +4053,13 @@ mod store {
             let canonical_path = canonical_database_path(database.path()).unwrap();
             let leaf = LeafGuard::open(&canonical_path).unwrap();
             assert_eq!(
-                preflight_existing(&canonical_path, &account(), &key(7).0, &leaf),
+                preflight_existing(
+                    &canonical_path,
+                    &account(),
+                    &key(7).0,
+                    &leaf,
+                    IntegrityScan::Full
+                ),
                 Ok(ExistingPreflight::WalWithoutShm)
             );
             assert!(!shm_path(&database).exists());
@@ -4002,7 +4115,13 @@ mod store {
                         ExistingPreflight::FreshWal
                     };
                     assert_eq!(
-                        preflight_existing(&canonical_path, &account(), &key(7).0, &leaf),
+                        preflight_existing(
+                            &canonical_path,
+                            &account(),
+                            &key(7).0,
+                            &leaf,
+                            IntegrityScan::Full
+                        ),
                         Ok(expected)
                     );
                     let mut cleanup_observed = false;
@@ -6771,5 +6890,6 @@ mod store {
 pub mod registry;
 
 pub use store::{
-    DatabaseKey, ReadOnlyMailboxOpenFailure, SqlCipherMailboxReader, SqlCipherMailboxStore,
+    DatabaseKey, IntegrityScan, ReadOnlyMailboxOpenFailure, SqlCipherMailboxReader,
+    SqlCipherMailboxStore,
 };
