@@ -15,8 +15,8 @@ use crate::identity::IdentityHash;
 #[cfg(test)]
 use crate::mailbox::MailboxReader;
 use crate::mailbox::{
-    BoxFuture, MailboxStore, MailboxStoreError, PageSize, RemoteMailbox, RemoteMailboxError,
-    StoreLimit,
+    BoxFuture, MailboxStore, MailboxStoreError, MessageId, PageSize, RemoteMailbox,
+    RemoteMailboxError, StoreLimit,
 };
 
 /// The largest accepted number of remote pages in one recent snapshot.
@@ -360,12 +360,25 @@ where
             .map_err(|error| failure(store_failure_source(error), progress))?;
         let body_limit = usize::from(policy.full_body_limit.get());
         let newest: Vec<_> = survivors.into_iter().take(body_limit).collect();
+        self.cache_bodies(account, &newest, fence, &mut progress)
+            .await?;
+        Ok(SyncReport { progress })
+    }
+
+    /// Downloads and caches the bodies of `newest` that the store lacks.
+    async fn cache_bodies(
+        &self,
+        account: &AccountId,
+        newest: &[MessageId],
+        fence: &IdentityHash,
+        progress: &mut SyncProgress,
+    ) -> Result<(), SyncFailure> {
         // Gmail messages never change, so a cached body is never fetched again.
         let missing = self
             .store
-            .uncached_message_ids(account, &newest)
+            .uncached_message_ids(account, newest)
             .await
-            .map_err(|error| failure(store_failure_source(error), progress))?;
+            .map_err(|error| failure(store_failure_source(error), *progress))?;
         for id in missing {
             progress.body_requests += 1;
             match self.remote.fetch_message(account, &id).await {
@@ -375,14 +388,14 @@ where
                             SyncFailureSource::Protocol(
                                 SyncProtocolError::MismatchedFetchedMessage,
                             ),
-                            progress,
+                            *progress,
                         ));
                     }
                     if self
                         .store
                         .cache_message_if_present(account, &message, fence)
                         .await
-                        .map_err(|error| failure(store_failure_source(error), progress))?
+                        .map_err(|error| failure(store_failure_source(error), *progress))?
                     {
                         progress.bodies_cached += 1;
                     } else {
@@ -390,10 +403,10 @@ where
                     }
                 }
                 Err(RemoteMailboxError::NotFound) => progress.bodies_skipped += 1,
-                Err(error) => return Err(failure(SyncFailureSource::Remote(error), progress)),
+                Err(error) => return Err(failure(SyncFailureSource::Remote(error), *progress)),
             }
         }
-        Ok(SyncReport { progress })
+        Ok(())
     }
 }
 
@@ -431,7 +444,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use tersa_domain::mailbox::{
-        HeaderText, Message, MessageEnvelope, MessageId, ThreadId, UnixTimestampMillis,
+        HeaderText, Message, MessageEnvelope, ThreadId, UnixTimestampMillis,
     };
 
     use super::*;
