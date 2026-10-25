@@ -31,6 +31,10 @@ pub const MAX_PLAIN_OUTPUT: usize = html::MAX_TEXT_OUTPUT;
 /// shown. `mail-parser` builds every part before returning, with no limit of
 /// its own, so a 64 MiB message of tiny parts would allocate millions.
 pub const MAX_MIME_PARTS: usize = 5_000;
+/// The longest MIME boundary accepted; RFC 2046 allows 70 characters.
+/// `mail-parser` compares the whole boundary at every `--` it meets, so a
+/// boundary of megabytes of dashes over a body of dashes takes minutes.
+pub const MAX_BOUNDARY_LEN: usize = 100;
 /// How deep `mail-parser` 0.11.9 parses encoded messages attached to messages.
 const NESTED_DEPTH: usize = 3;
 /// The most bytes of a message given to `mail-parser`. Whatever the counting
@@ -42,7 +46,8 @@ const CUT: &str = "[… the rest of this message is over 4 MiB and is not shown,
                    including any attachments there]";
 const TRUNCATED: &str = "[… message truncated]";
 const UNREADABLE: &str = "This message could not be read.";
-const TOO_MANY_PARTS: &str = "This message has too many parts to show.";
+const TOO_COMPLEX: &str =
+    "This message is too complex to show: it has too many parts or an over-long boundary.";
 
 /// Which body the reader would rather see.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -137,7 +142,7 @@ pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage
             from: addresses(headers.as_ref().and_then(mail_parser::Message::from)),
             to: addresses(headers.as_ref().and_then(mail_parser::Message::to)),
             cc: addresses(headers.as_ref().and_then(mail_parser::Message::cc)),
-            body: SafeText::multi_line(TOO_MANY_PARTS),
+            body: SafeText::multi_line(TOO_COMPLEX),
             format: None,
             has_alternative: false,
             links: Vec::new(),
@@ -233,7 +238,8 @@ pub fn render_message(raw: &[u8], preference: BodyPreference) -> RenderedMessage
 /// boundary search (a boundary counts anywhere in a line), the same
 /// transfer-encoding decoders, and the same nesting into attached messages,
 /// up to [`NESTED_DEPTH`] for encoded ones. `mail-parser` is pinned to that
-/// version, and a test checks the count against real parses.
+/// version, and a test checks the count against real parses. A boundary
+/// longer than [`MAX_BOUNDARY_LEN`] counts as past `limit`.
 fn count_parts(raw: &[u8], depth: usize, limit: usize) -> usize {
     let parser = MessageParser::default();
     let mut stream = MessageStream::new(raw);
@@ -263,6 +269,10 @@ fn count_parts(raw: &[u8], depth: usize, limit: usize) -> usize {
         if multipart
             && let Some(boundary) = content_type.and_then(|kind| kind.attribute("boundary"))
         {
+            if boundary.len() > MAX_BOUNDARY_LEN {
+                // Counts as too many parts, before any search can start.
+                return limit.saturating_add(1);
+            }
             if stream.seek_next_part(boundary.as_bytes()) {
                 let digest = content_type.and_then(ContentType::subtype) == Some("digest");
                 stack.push((std::mem::take(&mut state), false));
@@ -301,7 +311,8 @@ fn count_parts(raw: &[u8], depth: usize, limit: usize) -> usize {
             }
         }
         if message && depth > 0 {
-            count += count_parts(&bytes, depth - 1, limit.saturating_sub(count));
+            count =
+                count.saturating_add(count_parts(&bytes, depth - 1, limit.saturating_sub(count)));
         }
         if state.boundary.is_some() {
             loop {
@@ -495,8 +506,8 @@ mod tests {
     use mail_parser::{MessageParser, PartType};
 
     use super::{
-        BodyFormat, BodyPreference, CUT, MAX_MIME_PARTS, MAX_PARSED_LEN, MAX_PLAIN_OUTPUT,
-        NESTED_DEPTH, TOO_MANY_PARTS, TRUNCATED, count_parts, render_message,
+        BodyFormat, BodyPreference, CUT, MAX_BOUNDARY_LEN, MAX_MIME_PARTS, MAX_PARSED_LEN,
+        MAX_PLAIN_OUTPUT, NESTED_DEPTH, TOO_COMPLEX, TRUNCATED, count_parts, render_message,
     };
 
     /// Every part `mail-parser` built, nested messages included.
@@ -844,7 +855,7 @@ Content-Transfer-Encoding: base64\r\n\r\n/9j/4AAQ\r\n\
 
         let flood = render_message(many_parts(MAX_MIME_PARTS).as_bytes(), BodyPreference::Plain);
         assert_eq!(flood.subject.as_str(), "many");
-        assert_eq!(flood.body.as_str(), TOO_MANY_PARTS);
+        assert_eq!(flood.body.as_str(), TOO_COMPLEX);
         assert_eq!(flood.format, None);
     }
 
@@ -862,7 +873,7 @@ Content-Transfer-Encoding: base64\r\n\r\n/9j/4AAQ\r\n\
                 base64_lines(inner.as_bytes())
             );
             let rendered = render_message(raw.as_bytes(), BodyPreference::Plain);
-            assert_eq!(rendered.body.as_str(), TOO_MANY_PARTS, "{content_type:?}");
+            assert_eq!(rendered.body.as_str(), TOO_COMPLEX, "{content_type:?}");
             assert_eq!(rendered.subject.as_str(), "outer");
         }
 
@@ -946,10 +957,33 @@ Content-Transfer-Encoding: base64\r\n\r\n/9j/4AAQ\r\n\
                 render_message(raw.as_bytes(), BodyPreference::Plain)
                     .body
                     .as_str(),
-                TOO_MANY_PARTS,
+                TOO_COMPLEX,
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn an_over_long_boundary_is_never_searched() {
+        // The parser's search is quadratic in such a boundary over dashes.
+        let raw = |length: usize| {
+            let mut raw = format!(
+                "Subject: s\r\nContent-Type: multipart/mixed; boundary=\"{}x\"\r\n\r\n",
+                "-".repeat(length - 1)
+            );
+            raw.push_str(&"-".repeat(1_000_000));
+            raw
+        };
+        let long = raw(MAX_BOUNDARY_LEN + 1);
+        assert_eq!(
+            count_parts(long.as_bytes(), NESTED_DEPTH, MAX_MIME_PARTS),
+            MAX_MIME_PARTS + 1
+        );
+        let rendered = render_message(long.as_bytes(), BodyPreference::Plain);
+        assert_eq!(rendered.body.as_str(), TOO_COMPLEX);
+        assert_eq!(rendered.subject.as_str(), "s");
+        let longest = raw(MAX_BOUNDARY_LEN);
+        assert!(count_parts(longest.as_bytes(), NESTED_DEPTH, MAX_MIME_PARTS) <= MAX_MIME_PARTS);
     }
 
     #[test]
