@@ -2308,8 +2308,6 @@ name = "tersa-presentation"
 version = "0.0.0"
 dependencies = [
  "mail-parser",
- "tersa-application",
- "tersa-domain",
  "unicode-segmentation",
  "unicode-width",
 ]

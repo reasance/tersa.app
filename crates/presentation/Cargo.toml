@@ -1,6 +1,6 @@
 [package]
 name = "tersa-presentation"
-description = "UI-neutral presentation models for tersa.app"
+description = "Message rendering and terminal-safe text for tersa"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,8 +11,6 @@ publish = false
 
 [dependencies]
 mail-parser.workspace = true
-tersa-application = { path = "../application", version = "=0.0.0" }
-tersa-domain = { path = "../domain", version = "=0.0.0" }
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
