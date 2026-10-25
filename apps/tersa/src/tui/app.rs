@@ -207,12 +207,20 @@ pub struct App {
     /// Set when rows could not be read, older ones or the list again after a
     /// sync; the top bar says so until the next reload.
     pub rows_unreadable: bool,
-    /// The row selected before a reload pushed it past the reloaded rows; it
-    /// is selected again when its page arrives, unless a key comes first.
-    pending_selection: Option<MessageId>,
+    /// The row selected before a reload pushed it past the reloaded rows,
+    /// with its received time; it is selected again when its page arrives,
+    /// unless a key comes first.
+    pending_selection: Option<(MessageId, i64)>,
     /// Whether the status line counts the matches of a finished search, so
     /// pages that arrive later update it.
     counting_matches: bool,
+}
+
+/// Whether `row` comes after the message `id` received at `received_at` in
+/// the listing order: received time descending, then identifier ascending.
+fn listed_after(row: &Row, id: &MessageId, received_at: i64) -> bool {
+    row.received_at_millis < received_at
+        || (row.received_at_millis == received_at && row.id.as_str() > id.as_str())
 }
 
 impl App {
@@ -269,13 +277,18 @@ impl App {
         let rows = &self.rows;
         self.shown
             .extend((start..rows.len()).filter(|&index| rows[index].matches(&words)));
-        if let Some(position) = self
-            .pending_selection
-            .as_ref()
-            .and_then(|id| self.position_of(id))
-        {
-            self.selected = position;
-            self.pending_selection = None;
+        if let Some((id, received_at)) = self.pending_selection.clone() {
+            if let Some(position) = self.position_of(&id) {
+                self.selected = position;
+                self.pending_selection = None;
+            } else if self
+                .rows
+                .last()
+                .is_some_and(|last| listed_after(last, &id, received_at))
+            {
+                // The listing has passed where it would be: the sync removed it.
+                self.pending_selection = None;
+            }
         }
         self.count_matches();
     }
@@ -283,17 +296,19 @@ impl App {
     /// Replaces the rows after a sync, keeping the selection and any open
     /// message; `more` says whether older rows follow.
     pub fn reload(&mut self, rows: Vec<Row>, more: bool) {
-        let selected = self.shown_row(self.selected).map(|row| row.id.clone());
+        let selected = self
+            .shown_row(self.selected)
+            .map(|row| (row.id.clone(), row.received_at_millis));
         self.rows = rows;
         self.more_rows = more;
         self.rows_unreadable = false;
         self.pending_selection = None;
         self.refilter();
-        if let Some(id) = selected {
+        if let Some((id, received_at)) = selected {
             match self.position_of(&id) {
                 Some(position) => self.selected = position,
                 // Newer mail pushed it into a page not read again yet.
-                None if more => self.pending_selection = Some(id),
+                None if more => self.pending_selection = Some((id, received_at)),
                 None => {}
             }
         }

@@ -15,9 +15,11 @@
 //!
 //! What they measure, and what they leave out:
 //!
-//! - The first frame is the fastest of five runs in process, from opening the
+//! - The first frame is timed five times in process, from opening the
 //!   store to a draw into ratatui's test backend. Process start, the keyring
-//!   read and writing to a real terminal come on top of it.
+//!   read and writing to a real terminal come on top of it. The budgets
+//!   are checked against the slowest run, the first frame's and the
+//!   top-50 query's alike.
 //! - The idle resident size is that of this test binary in a fresh process
 //!   that does what the interface does. The test binary links the test
 //!   harness as well, so the product binary is no larger.
@@ -152,24 +154,31 @@ fn rss_mib() -> f64 {
     kib / 1024.0
 }
 
-/// The best of `runs` timings of `work`, which is what a warm process sees.
-fn best<T>(runs: usize, mut work: impl FnMut() -> T) -> (Duration, T) {
+/// The fastest and the slowest of `runs` timings of `work`, and the value
+/// of the last run. Budgets are checked against the slowest.
+fn timed<T>(runs: usize, mut work: impl FnMut() -> T) -> (Duration, Duration, T) {
     let mut fastest = Duration::MAX;
+    let mut slowest = Duration::ZERO;
     let mut last = None;
     for _ in 0..runs {
         let start = Instant::now();
         let value = work();
-        fastest = fastest.min(start.elapsed());
+        let elapsed = start.elapsed();
+        fastest = fastest.min(elapsed);
+        slowest = slowest.max(elapsed);
         last = Some(value);
     }
-    (fastest, last.unwrap())
+    (fastest, slowest, last.unwrap())
 }
 
-fn report(name: &str, measured: Duration, budget: Option<Duration>) {
-    match budget {
-        Some(budget) => println!("{name}: {measured:.2?} (budget {budget:?})"),
-        None => println!("{name}: {measured:.2?}"),
-    }
+fn report(name: &str, measured: Duration) {
+    println!("{name}: {measured:.2?}");
+}
+
+/// Prints the fastest and slowest runs and checks the slowest.
+fn report_budget(name: &str, fastest: Duration, slowest: Duration, budget: Duration) {
+    println!("{name}: {fastest:.2?} fastest, {slowest:.2?} slowest (budget {budget:?})");
+    check(slowest, budget, name);
 }
 
 /// Budgets hold only for optimized builds; a debug run just prints.
@@ -184,21 +193,20 @@ fn check(measured: Duration, budget: Duration, name: &str) {
 fn perf_full_cache_budgets() {
     let fixture = Fixture::build();
 
-    let (full_open, _) = best(3, || open(&fixture.path, IntegrityScan::Full));
-    let (open_time, store) = best(5, || open(&fixture.path, IntegrityScan::Skip));
-    report("open with the integrity scan", full_open, None);
-    report("open without it", open_time, None);
+    let (full_open, _, _) = timed(3, || open(&fixture.path, IntegrityScan::Full));
+    let (open_time, _, store) = timed(5, || open(&fixture.path, IntegrityScan::Skip));
+    report("open with the integrity scan", full_open);
+    report("open without it", open_time);
 
     let limit = StoreLimit::new(50).unwrap();
-    let (top_50, rows) = best(20, || {
+    let (top_50, top_50_slowest, rows) = timed(20, || {
         block_on(store.list_envelopes_after(&account(), None, limit)).unwrap()
     });
     assert_eq!(rows.len(), 50);
-    report("top-50 query", top_50, Some(TOP_50));
-    check(top_50, TOP_50, "top-50 query");
+    report_budget("top-50 query", top_50, top_50_slowest, TOP_50);
 
     let warm = source(store);
-    let (first_frame, mut app) = best(5, || {
+    let (first_frame, first_frame_slowest, mut app) = timed(5, || {
         let fresh = source(open(&fixture.path, IntegrityScan::Skip));
         let (rows, more) = read_page(&fresh, None, FIRST_PAGE).unwrap();
         let mut app = App::new(SafeText::single_line("acct_perf"), rows);
@@ -209,12 +217,12 @@ fn perf_full_cache_budgets() {
             .unwrap();
         app
     });
-    report(
+    report_budget(
         "first frame (open, first page, draw)",
         first_frame,
-        Some(FIRST_FRAME),
+        first_frame_slowest,
+        FIRST_FRAME,
     );
-    check(first_frame, FIRST_FRAME, "first frame");
 
     let mut slowest_page = Duration::ZERO;
     let loading = Instant::now();
@@ -224,15 +232,15 @@ fn perf_full_cache_budgets() {
         slowest_page = slowest_page.max(start.elapsed());
     }
     assert_eq!(app.rows.len(), MESSAGES);
-    report("load the other 9,900 rows", loading.elapsed(), None);
-    report(&format!("slowest page of {PAGE}"), slowest_page, None);
+    report("load the other 9,900 rows", loading.elapsed());
+    report(&format!("slowest page of {PAGE}"), slowest_page);
 
     let loaded = u16::try_from(MESSAGES).unwrap();
-    let (reload, (rows, _more)) = best(3, || read_page(&warm, None, loaded).unwrap());
+    let (reload, _, (rows, _more)) = timed(3, || read_page(&warm, None, loaded).unwrap());
     assert_eq!(rows.len(), MESSAGES);
-    report("reload all rows after a sync", reload, None);
+    report("reload all rows after a sync", reload);
 
-    let (search, ()) = best(5, || {
+    let (search, _, ()) = timed(5, || {
         app.key(ratatui::crossterm::event::KeyEvent::new(
             ratatui::crossterm::event::KeyCode::Char('/'),
             ratatui::crossterm::event::KeyModifiers::NONE,
@@ -248,7 +256,7 @@ fn perf_full_cache_budgets() {
             ratatui::crossterm::event::KeyModifiers::NONE,
         ));
     });
-    report("type a 9-character search over 10,000 rows", search, None);
+    report("type a 9-character search over 10,000 rows", search);
 
     drop(rows);
 

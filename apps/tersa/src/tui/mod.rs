@@ -932,6 +932,34 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_the_sync_removed_stops_the_catch_up() {
+        let mut source = Pages::new(1_234);
+        let mut app = App::new(
+            SafeText::single_line("acct"),
+            source.page(None, 600).expect("page"),
+        );
+        app.more_rows = true;
+        for _ in 0..599 {
+            app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        let newer: Vec<Row> = (0..600)
+            .map(|index| Row::sample(&format!("new{index}"), "Zed", "Fresh", true))
+            .collect();
+        source.rows.retain(|row| row.id.as_str() != "m00599");
+        source.rows.splice(0..0, newer);
+        finished_sync(&mut app, &source, Ok(()));
+        assert!(!app.selection_pending(), "the listing passed where it was");
+        // The 600 rows read again are all newer mail; the next page ends just
+        // before where it was and the one after passes it.
+        assert_eq!(
+            app.rows.len(),
+            600 + 500 + 500,
+            "the catch-up stops there, short of the 1,833 cached"
+        );
+        assert!(app.more_rows, "the rest loads in the background");
+    }
+
+    #[test]
     fn a_failed_sync_still_reads_the_list_again() {
         let mut source = Pages::new(50);
         let mut app = App::new(
