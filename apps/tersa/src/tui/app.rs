@@ -6,10 +6,12 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tersa_application::mailbox::{MessageEnvelope, MessageId};
-use tersa_application::mailbox_search::MailboxSearchQuery;
 use tersa_presentation::html::decode_entities;
 use tersa_presentation::message::{BodyFormat, BodyPreference, RenderedMessage, render_message};
 use tersa_presentation::terminal::SafeText;
+
+/// The longest search query, in bytes.
+const MAX_QUERY_LEN: usize = 256;
 
 /// One inbox row, already sanitized.
 #[derive(Clone, Debug)]
@@ -492,8 +494,7 @@ impl App {
             KeyCode::Char(character)
                 if !character.is_control()
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.search.query.len() + character.len_utf8()
-                        <= MailboxSearchQuery::MAX_LEN =>
+                    && self.search.query.len() + character.len_utf8() <= MAX_QUERY_LEN =>
             {
                 let mut query = self.search.query.clone();
                 query.push(character);
