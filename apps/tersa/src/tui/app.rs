@@ -300,6 +300,11 @@ impl App {
         self.count_matches();
     }
 
+    /// Whether a reload left the selected row to come back with a later page.
+    pub fn selection_pending(&self) -> bool {
+        self.pending_selection.is_some()
+    }
+
     /// Stops loading older rows after a failed read.
     pub fn older_rows_failed(&mut self) {
         self.more_rows = false;
@@ -312,7 +317,12 @@ impl App {
         if !self.counting_matches {
             return;
         }
-        let more = if self.more_rows { "+" } else { "" };
+        // Rows not searched yet, or never readable, may hold more matches.
+        let more = if self.more_rows || self.older_unreadable {
+            "+"
+        } else {
+            ""
+        };
         self.status = Some(match self.shown.len() {
             1 if more.is_empty() => "1 match; esc shows every message".to_owned(),
             count => format!("{count}{more} matches; esc shows every message"),

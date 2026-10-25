@@ -434,14 +434,21 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
                 let loaded = u16::try_from(app.rows.len())
                     .unwrap_or(u16::MAX)
                     .clamp(FIRST_PAGE, StoreLimit::MAX);
-                let reloaded = result.and_then(|()| {
-                    read_page(source, None, loaded)
-                        .map_err(|()| "could not read the local mailbox".to_owned())
-                });
-                match reloaded {
-                    Ok((rows, more)) => {
+                match result.map(|()| read_page(source, None, loaded)) {
+                    Ok(Ok((rows, more))) => {
                         app.reload(rows, more);
+                        // Bring back a selection the reload pushed one page
+                        // on before the next frame shows another row.
+                        if app.selection_pending() {
+                            load_page(app, source);
+                        }
                         app.synced(Ok(()), now);
+                    }
+                    // The sync may have changed the rows already loaded, so
+                    // paging on after them could list mail it removed.
+                    Ok(Err(())) => {
+                        app.older_rows_failed();
+                        app.synced(Err("could not read the local mailbox".to_owned()), now);
                     }
                     Err(error) => app.synced(Err(error), now),
                 }
@@ -861,10 +868,49 @@ mod tests {
         let (rows, more) = read_page(&source, None, FIRST_PAGE).expect("page");
         let mut app = App::new(SafeText::single_line("acct"), rows);
         app.more_rows = more;
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "odd".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         load_page(&mut app, &source);
-        app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert!(!app.more_rows, "loading stops");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("50+ matches; esc shows every message"),
+            "older mail was never searched"
+        );
+        app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert!(app.older_unreadable, "a key press does not clear it");
+    }
+
+    #[test]
+    fn a_failed_reload_after_a_sync_stops_paging() {
+        struct FailAfterSync(Pages, std::cell::Cell<bool>);
+        impl MailSource for FailAfterSync {
+            fn page(&self, after: Option<&Row>, limit: u16) -> Result<Vec<Row>, ()> {
+                if self.1.get() {
+                    return Err(());
+                }
+                self.0.page(after, limit)
+            }
+
+            fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
+                Ok(None)
+            }
+        }
+        let source = FailAfterSync(Pages::new(1_234), std::cell::Cell::new(false));
+        let (rows, more) = read_page(&source, None, FIRST_PAGE).expect("page");
+        let mut app = App::new(SafeText::single_line("acct"), rows);
+        app.more_rows = more;
+        source.1.set(true);
+        finished_sync(&mut app, &source);
+        assert!(
+            !app.more_rows,
+            "rows loaded before the sync are no cursor for after it"
+        );
+        assert!(app.older_unreadable);
+        assert!(matches!(app.sync, SyncState::Failed(_)));
     }
 
     fn finished_sync(app: &mut App, source: &dyn MailSource) {
@@ -920,9 +966,11 @@ mod tests {
             .rows
             .insert(0, Row::sample("new", "Zed", "Fresh", true));
         finished_sync(&mut app, &source);
-        assert_eq!(app.rows.len(), 600);
-        load_page(&mut app, &source);
-        assert_eq!(selected_id(&app), Some("m00599"));
+        assert_eq!(
+            selected_id(&app),
+            Some("m00599"),
+            "back before the next frame"
+        );
     }
 
     #[test]

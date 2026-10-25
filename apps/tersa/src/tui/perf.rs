@@ -3,7 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The ADR 0031 performance budgets, measured on a full cache: an encrypted
-//! store holding 10,000 envelopes (the most a cache keeps) and 25 bodies.
+//! store holding 10,000 envelopes (the most a cache can keep; the default
+//! sync policy keeps 100) and 25 bodies.
 //!
 //! These tests are ignored by default and kept out of CI, which is for
 //! correctness. Run them on a release build:
