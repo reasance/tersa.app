@@ -61,10 +61,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, now_millis: i64) {
 }
 
 fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
+    // "+" while older rows are still loading.
+    let more = if app.more_rows { "+" } else { "" };
     let count = match (app.filtered(), app.rows.len()) {
-        (true, total) => format!("{} of {total} messages", app.shown.len()),
-        (false, 1) => "1 message".to_owned(),
-        (false, count) => format!("{count} messages"),
+        (true, total) => format!("{} of {total}{more} messages", app.shown.len()),
+        (false, 1) if more.is_empty() => "1 message".to_owned(),
+        (false, count) => format!("{count}{more} messages"),
+    };
+    let count = if app.rows_unreadable {
+        format!("{count} (some could not be read)")
+    } else {
+        count
     };
     let sync = match &app.sync {
         SyncState::Idle => String::new(),
@@ -504,6 +511,19 @@ mod tests {
         );
         let lines = screen(&mut app, 60, 5);
         assert!(lines[0].starts_with(" tersa  acct_1234  ·  2 messages"));
+        app.more_rows = true;
+        assert!(
+            screen(&mut app, 60, 5)[0].starts_with(" tersa  acct_1234  ·  2+ messages"),
+            "older rows are still loading"
+        );
+        app.more_rows = false;
+        app.rows_unreadable = true;
+        assert!(
+            screen(&mut app, 60, 5)[0]
+                .starts_with(" tersa  acct_1234  ·  2 messages (some could not be read)"),
+            "older rows could not be read"
+        );
+        app.rows_unreadable = false;
         assert!(lines[1].starts_with("● "));
         assert!(lines[1].contains("Ann"));
         assert!(lines[1].contains("Hello there · the preview"));

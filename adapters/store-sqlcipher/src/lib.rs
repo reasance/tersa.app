@@ -32,7 +32,8 @@ mod store {
         AccountLifecycleMetadata, AccountLifecycleStore, DisconnectRecoveryState,
     };
     use tersa_application::mailbox::{
-        AccountPurgeStore, BoxFuture, MailboxReader, MailboxStore, MailboxStoreError, StoreLimit,
+        AccountPurgeStore, BoxFuture, EnvelopeCursor, MailboxReader, MailboxStore,
+        MailboxStoreError, StoreLimit,
     };
     use tersa_domain::mailbox::{
         AccountId, HeaderText, Message, MessageContent, MessageEnvelope, MessageId, ThreadId,
@@ -2344,6 +2345,50 @@ mod store {
         Ok(result)
     }
 
+    /// The envelopes after a cursor, in listing order. The `<=` bound lets the
+    /// `messages_list_order` index seek; the rest breaks ties.
+    const ENVELOPES_AFTER_SQL: &str = "SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, CASE WHEN typeof(received_at) = 'integer' THEN received_at END, CASE WHEN typeof(unread) = 'integer' THEN unread END FROM messages WHERE received_at <= ?1 AND (received_at < ?1 OR message_id > ?2) ORDER BY received_at DESC, message_id ASC LIMIT ?3";
+
+    /// Lists up to `limit` envelopes after `after`, seeking through the
+    /// `messages_list_order` index rather than skipping rows.
+    fn list_envelopes_after(
+        connection: &Connection,
+        after: Option<&EnvelopeCursor>,
+        limit: StoreLimit,
+    ) -> Result<Vec<MessageEnvelope>, MailboxStoreError> {
+        let mut result = Vec::new();
+        let limit = i64::from(limit.get());
+        let mut push_rows = |rows: &mut rusqlite::Rows<'_>| -> Result<(), MailboxStoreError> {
+            while let Some(row) = rows.next().map_err(store_error)? {
+                result.push(envelope_from_row(row)?);
+            }
+            Ok(())
+        };
+        match after {
+            None => {
+                let mut statement = connection
+                    .prepare("SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) <= 256 THEN message_id END, CASE WHEN typeof(thread_id) = 'text' AND length(CAST(thread_id AS BLOB)) <= 256 THEN thread_id END, CASE WHEN typeof(sender) = 'text' AND length(CAST(sender AS BLOB)) <= 1024 THEN sender END, CASE WHEN typeof(subject) = 'text' AND length(CAST(subject AS BLOB)) <= 1024 THEN subject END, CASE WHEN typeof(preview) = 'text' AND length(CAST(preview AS BLOB)) <= 1024 THEN preview END, CASE WHEN typeof(received_at) = 'integer' THEN received_at END, CASE WHEN typeof(unread) = 'integer' THEN unread END FROM messages ORDER BY received_at DESC, message_id ASC LIMIT ?1")
+                    .map_err(store_error)?;
+                push_rows(&mut statement.query(params![limit]).map_err(store_error)?)?;
+            }
+            Some(cursor) => {
+                let mut statement = connection
+                    .prepare(ENVELOPES_AFTER_SQL)
+                    .map_err(store_error)?;
+                push_rows(
+                    &mut statement
+                        .query(params![
+                            cursor.received_at().as_millis(),
+                            cursor.message_id().as_str(),
+                            limit
+                        ])
+                        .map_err(store_error)?,
+                )?;
+            }
+        }
+        Ok(result)
+    }
+
     impl MailboxStore for SqlCipherMailboxStore {
         fn mark_message_read<'a>(
             &'a self,
@@ -2550,6 +2595,17 @@ mod store {
                 self.with_connection(|connection| uncached_ids(connection, message_ids))
             })
         }
+        fn list_envelopes_after<'a>(
+            &'a self,
+            account: &'a AccountId,
+            after: Option<&'a EnvelopeCursor>,
+            limit: StoreLimit,
+        ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                self.with_connection(|connection| list_envelopes_after(connection, after, limit))
+            })
+        }
         fn thread_envelopes<'a>(
             &'a self,
             account: &'a AccountId,
@@ -2603,6 +2659,22 @@ mod store {
             Box::pin(async move {
                 self.checked_account(account)?;
                 self.load_complete_message(message_id)
+            })
+        }
+
+        fn list_envelopes_after<'a>(
+            &'a self,
+            account: &'a AccountId,
+            after: Option<&'a EnvelopeCursor>,
+            limit: StoreLimit,
+        ) -> BoxFuture<'a, Result<Vec<MessageEnvelope>, MailboxStoreError>> {
+            Box::pin(async move {
+                self.checked_account(account)?;
+                let connection = self
+                    .connection
+                    .lock()
+                    .map_err(|_poison| MailboxStoreError::Storage)?;
+                list_envelopes_after(&connection, after, limit)
             })
         }
 
@@ -2969,10 +3041,6 @@ mod store {
         Ok(())
     }
 
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "rusqlite Result::map_err supplies owned errors"
-    )]
     fn classify_open(error: rusqlite::Error) -> OpenFailure {
         match error {
             rusqlite::Error::SqliteFailure(sqlite, _)
@@ -2989,7 +3057,10 @@ mod store {
             | rusqlite::Error::InvalidQuery
             | rusqlite::Error::QueryReturnedNoRows
             | rusqlite::Error::Utf8Error(..) => OpenFailure::Corrupted,
-            _ => OpenFailure::Storage,
+            other => {
+                report_storage_failure(&other);
+                OpenFailure::Storage
+            }
         }
     }
 
@@ -3152,10 +3223,6 @@ mod store {
         let bytes = token.as_bytes();
         (1..=4096).contains(&bytes.len()) && bytes.iter().all(|byte| (0x21..=0x7e).contains(byte))
     }
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "rusqlite Result::map_err supplies owned errors"
-    )]
     fn store_error(error: rusqlite::Error) -> MailboxStoreError {
         match error {
             rusqlite::Error::SqliteFailure(sqlite, _)
@@ -3166,9 +3233,34 @@ mod store {
             {
                 MailboxStoreError::Corrupted
             }
-            _ => MailboxStoreError::Storage,
+            other => {
+                report_storage_failure(&other);
+                MailboxStoreError::Storage
+            }
         }
     }
+
+    /// In tests, prints why `SQLite` failed, with its extended result code, so
+    /// an intermittent `Storage` failure shows its cause; the test harness
+    /// shows the output of failing tests only. Release builds print nothing,
+    /// because messages can name paths and mailbox content never belongs in
+    /// logs.
+    #[cfg(test)]
+    fn report_storage_failure(error: &rusqlite::Error) {
+        if let rusqlite::Error::SqliteFailure(sqlite, message) = error {
+            eprintln!(
+                "SQLite storage failure: extended code {} ({:?}): {}",
+                sqlite.extended_code,
+                sqlite.code,
+                message.as_deref().unwrap_or("no message")
+            );
+        } else {
+            eprintln!("SQLite storage failure: {error}");
+        }
+    }
+
+    #[cfg(not(test))]
+    const fn report_storage_failure(_error: &rusqlite::Error) {}
     fn corrupted(_error: rusqlite::Error) -> MailboxStoreError {
         MailboxStoreError::Corrupted
     }
@@ -3586,6 +3678,93 @@ mod store {
         )]
         fn assert_corrupted(result: Result<SqlCipherMailboxStore, MailboxStoreError>) {
             assert!(matches!(result, Err(MailboxStoreError::Corrupted)));
+        }
+
+        #[test]
+        fn the_read_only_reader_pages_past_the_newest_store_limit() {
+            let (database, store) = open("reader-pages");
+            let total = usize::from(StoreLimit::MAX) + 1;
+            let envelopes: Vec<_> = (0..total)
+                .map(|index| {
+                    envelope(
+                        &format!("m{index:05}"),
+                        "thread",
+                        i64::try_from(total - index).unwrap(),
+                    )
+                })
+                .collect();
+            run(store.upsert_envelopes(&account(), &envelopes)).unwrap();
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            let cursor = EnvelopeCursor::after(&envelopes[total - 2]);
+            let page = run(reader.list_envelopes_after(
+                &account(),
+                Some(&cursor),
+                StoreLimit::new(10).unwrap(),
+            ))
+            .unwrap();
+            let ids: Vec<&str> = page.iter().map(|item| item.message_id().as_str()).collect();
+            assert_eq!(
+                ids,
+                ["m10000"],
+                "the oldest, past the newest StoreLimit::MAX"
+            );
+        }
+
+        #[test]
+        fn keyset_pages_list_every_envelope_once_in_order() {
+            fn paged(reader: &impl MailboxReader) -> Vec<String> {
+                let mut paged = Vec::new();
+                let mut cursor = None;
+                loop {
+                    let page = run(reader.list_envelopes_after(
+                        &account(),
+                        cursor.as_ref(),
+                        StoreLimit::new(4).unwrap(),
+                    ))
+                    .unwrap();
+                    let Some(last) = page.last() else { break };
+                    cursor = Some(EnvelopeCursor::after(last));
+                    paged.extend(
+                        page.iter()
+                            .map(|item| item.message_id().as_str().to_owned()),
+                    );
+                }
+                paged
+            }
+
+            let (_database, store) = open("pages");
+            let envelopes: Vec<_> = (0..23)
+                .map(|index| envelope(&format!("m{index:02}"), "thread", i64::from(index / 3)))
+                .collect();
+            run(store.upsert_envelopes(&account(), &envelopes)).unwrap();
+            let expected: Vec<_> =
+                run(store.list_envelopes(&account(), StoreLimit::new(100).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|item| item.message_id().as_str().to_owned())
+                    .collect();
+            assert_eq!(
+                paged(&store),
+                expected,
+                "ties on the received time are broken by identifier"
+            );
+            assert_eq!(expected.len(), 23);
+
+            let connection = store.connection.lock().unwrap();
+            let plan: Vec<String> = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {ENVELOPES_AFTER_SQL}"))
+                .unwrap()
+                .query_map(params![5, "m", 4], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(plan.len(), 1, "one step, no sort: {plan:?}");
+            assert!(
+                plan[0]
+                    .starts_with("SEARCH messages USING INDEX messages_list_order (received_at<?)"),
+                "the listing query seeks the index: {plan:?}"
+            );
         }
 
         #[test]
