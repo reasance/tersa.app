@@ -3681,6 +3681,37 @@ mod store {
         }
 
         #[test]
+        fn the_read_only_reader_pages_past_the_newest_store_limit() {
+            let (database, store) = open("reader-pages");
+            let total = usize::from(StoreLimit::MAX) + 1;
+            let envelopes: Vec<_> = (0..total)
+                .map(|index| {
+                    envelope(
+                        &format!("m{index:05}"),
+                        "thread",
+                        i64::try_from(total - index).unwrap(),
+                    )
+                })
+                .collect();
+            run(store.upsert_envelopes(&account(), &envelopes)).unwrap();
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            let cursor = EnvelopeCursor::after(&envelopes[total - 2]);
+            let page = run(reader.list_envelopes_after(
+                &account(),
+                Some(&cursor),
+                StoreLimit::new(10).unwrap(),
+            ))
+            .unwrap();
+            let ids: Vec<&str> = page.iter().map(|item| item.message_id().as_str()).collect();
+            assert_eq!(
+                ids,
+                ["m10000"],
+                "the oldest, past the newest StoreLimit::MAX"
+            );
+        }
+
+        #[test]
         fn keyset_pages_list_every_envelope_once_in_order() {
             fn paged(reader: &impl MailboxReader) -> Vec<String> {
                 let mut paged = Vec::new();
@@ -3702,7 +3733,7 @@ mod store {
                 paged
             }
 
-            let (database, store) = open("pages");
+            let (_database, store) = open("pages");
             let envelopes: Vec<_> = (0..23)
                 .map(|index| envelope(&format!("m{index:02}"), "thread", i64::from(index / 3)))
                 .collect();
@@ -3719,13 +3750,6 @@ mod store {
                 "ties on the received time are broken by identifier"
             );
             assert_eq!(expected.len(), 23);
-            let reader =
-                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
-            assert_eq!(
-                paged(&reader),
-                expected,
-                "the read-only reader pages the same way"
-            );
 
             let connection = store.connection.lock().unwrap();
             let plan: Vec<String> = connection
