@@ -16,6 +16,7 @@ mod wrap;
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
+use std::os::fd::AsFd;
 use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +26,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::io::Errno;
 use tersa_application::mailbox::{MessageId, StoreLimit};
 use tersa_presentation::terminal::SafeText;
 
@@ -86,13 +89,14 @@ static PANICKED: AtomicBool = AtomicBool::new(false);
 
 /// Checks that standard input and output are a terminal. Callers run it
 /// before unlocking anything, so `tersa > out.txt` fails without asking for a
-/// passphrase.
+/// passphrase. Standard input is checked the way crossterm checks it, so
+/// crossterm reads the input [`wait_for_input`] watches.
 ///
 /// # Errors
 ///
 /// Returns a message when either is not a terminal.
 pub fn require_terminal() -> Result<(), String> {
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    if rustix::termios::isatty(std::io::stdin()) && std::io::stdout().is_terminal() {
         Ok(())
     } else {
         Err("the interface needs a terminal; `tersa inbox` prints plain output".to_owned())
@@ -121,6 +125,7 @@ pub fn run(
         Ok(terminal) => terminal,
         Err(error) => {
             // Raw mode may be on even though the alternate screen failed.
+            silence_closed_stderr();
             ratatui::restore();
             return Err(terminal_error(error));
         }
@@ -131,6 +136,7 @@ pub fn run(
         restore_terminal(info);
     }));
     let result = event_loop(&mut terminal, &mut app, source, &mut worker);
+    silence_closed_stderr();
     ratatui::restore();
     // Stops the network thread once the terminal is back to normal.
     drop(worker);
@@ -383,8 +389,11 @@ fn event_loop(
         }
         // While pages remain, only look for a key that is already waiting.
         let wait = if app.more_rows { Duration::ZERO } else { TICK };
-        if !event::poll(wait).map_err(terminal_error)? {
-            continue;
+        match wait_for_input(wait).map_err(terminal_error)? {
+            Input::Waiting => {}
+            Input::None => continue,
+            // Nobody is left to read the screen: quit as `q` would.
+            Input::Closed => return Ok(()),
         }
         let key = match event::read().map_err(terminal_error)? {
             Event::Key(key) if key.kind == KeyEventKind::Press => key,
@@ -538,6 +547,70 @@ fn fail_pending(worker: &mut Worker, app: &mut App, now: i64) -> bool {
     changed
 }
 
+/// What the terminal has for the event loop.
+enum Input {
+    /// A key or a resize is waiting.
+    Waiting,
+    /// Nothing arrived in time.
+    None,
+    /// The terminal is gone.
+    Closed,
+}
+
+/// Waits up to `wait` for a key or a resize.
+///
+/// crossterm reads a terminal that has gone away again and again, at full
+/// speed, when no hangup signal ends the process (crossterm-rs/crossterm#793),
+/// so the wait happens here and crossterm runs only while standard input,
+/// which it reads because [`require_terminal`] passed, is still open.
+fn wait_for_input(wait: Duration) -> std::io::Result<Input> {
+    // The first pass returns events crossterm parsed from an earlier read.
+    for timeout in [Duration::ZERO, wait] {
+        if !terminal_open(std::io::stdin(), timeout)? {
+            return Ok(Input::Closed);
+        }
+        if event::poll(Duration::ZERO)? {
+            return Ok(Input::Waiting);
+        }
+    }
+    Ok(Input::None)
+}
+
+/// Waits up to `timeout` for `input` to become readable; returns false when
+/// the terminal behind it has gone away.
+fn terminal_open(input: impl AsFd, timeout: Duration) -> std::io::Result<bool> {
+    let mut fds = [PollFd::new(&input, PollFlags::IN)];
+    let mut timeout = Timespec::try_from(timeout).map_err(std::io::Error::other)?;
+    loop {
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
+            Ok(_) => break,
+            // A signal, such as a resize, which crossterm reports once a
+            // second look shows the terminal still open.
+            Err(Errno::INTR) => timeout = Timespec::default(),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let revents = fds[0].revents();
+    if revents.contains(PollFlags::HUP) {
+        return Ok(false);
+    }
+    if revents.intersects(PollFlags::ERR | PollFlags::NVAL) {
+        return Err(std::io::Error::other("the terminal cannot be polled"));
+    }
+    Ok(true)
+}
+
+/// Sends standard error nowhere once it is a terminal that has gone away.
+/// ratatui reports there that it could not restore the terminal, and a failed
+/// `eprintln!` would abort before the network thread stops.
+fn silence_closed_stderr() {
+    if let Ok(false) = terminal_open(std::io::stderr(), Duration::ZERO)
+        && let Ok(null) = std::fs::File::options().write(true).open("/dev/null")
+    {
+        let _ = rustix::stdio::dup2_stderr(&null);
+    }
+}
+
 #[allow(clippy::needless_pass_by_value, reason = "used as a map_err adapter")]
 fn terminal_error(error: std::io::Error) -> String {
     format!("the terminal failed: {error}")
@@ -566,7 +639,7 @@ mod tests {
 
     use super::{
         App, Done, FIRST_PAGE, MailSource, Pending, Remote, Row, SYNC_EVERY, SyncState,
-        WORKER_GONE, Worker, finish_work, load_page, read_page,
+        WORKER_GONE, Worker, finish_work, load_page, read_page, terminal_open,
     };
 
     /// Records the order work finishes in; syncs wait for the test.
@@ -1161,6 +1234,39 @@ mod tests {
     fn quitting_leaves_a_blocking_lookup_behind() {
         let took = quit_time(Stall::BlockingPool);
         assert!(took < Duration::from_secs(5), "took {took:?}");
+    }
+
+    /// A pseudo-terminal: the side tersa reads, and the side the terminal
+    /// emulator holds.
+    fn pty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        use rustix::fs::{Mode, OFlags};
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+
+        let emulator = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("openpt");
+        grantpt(&emulator).expect("grantpt");
+        unlockpt(&emulator).expect("unlockpt");
+        let name = ptsname(&emulator, Vec::new()).expect("ptsname");
+        let input = rustix::fs::open(
+            name.as_c_str(),
+            OFlags::RDWR | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+        .expect("open the terminal");
+        (input, emulator)
+    }
+
+    #[test]
+    fn a_closed_terminal_is_seen_at_once() {
+        let (input, emulator) = pty();
+        // An idle terminal is waited for, not reported at once.
+        let start = Instant::now();
+        assert!(terminal_open(&input, Duration::from_millis(50)).expect("poll"));
+        assert!(start.elapsed() >= Duration::from_millis(40));
+
+        drop(emulator);
+        let start = Instant::now();
+        assert!(!terminal_open(&input, Duration::from_secs(10)).expect("poll"));
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
