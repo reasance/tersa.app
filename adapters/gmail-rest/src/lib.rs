@@ -24,7 +24,7 @@ use std::time::Duration;
 use base64::Engine;
 use serde::Deserialize;
 use tersa_application::mailbox::{
-    BoxFuture, Page, PageSize, PageToken, RemoteMailbox, RemoteMailboxError,
+    AccountEmail, BoxFuture, Page, PageSize, PageToken, RemoteMailbox, RemoteMailboxError,
 };
 use tersa_application::oauth::GMAIL_READONLY_SCOPE;
 use tersa_application::token::{
@@ -95,6 +95,19 @@ impl GmailMailbox {
             account,
             transport: Box::new(transport),
         }
+    }
+
+    /// The Gmail address of the authenticated user behind the access token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RemoteMailboxError::Transport`] for transport failures and
+    /// [`RemoteMailboxError::InvalidResponse`] for a missing or invalid
+    /// profile address.
+    pub async fn email_address(&self) -> Result<AccountEmail, RemoteMailboxError> {
+        let profile: GmailProfile = self.request_json(profile_request()?, JSON_LIMIT).await?;
+        AccountEmail::new(profile.email_address)
+            .map_err(|_error| RemoteMailboxError::InvalidResponse)
     }
 
     fn checked_account(&self, account: &AccountId) -> Result<(), RemoteMailboxError> {
@@ -432,6 +445,15 @@ fn message_request(id: &MessageId, format: MessageFormat) -> Result<Request, Rem
     )
 }
 
+fn profile_request() -> Result<Request, RemoteMailboxError> {
+    let query = [("fields", "emailAddress".to_owned())];
+    Request::new(
+        Url::parse(BASE_URL).map_err(|_error| RemoteMailboxError::InvalidResponse)?,
+        &["profile"],
+        &query,
+    )
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GmailList {
@@ -482,6 +504,12 @@ struct Payload {
 struct Header {
     name: String,
     value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GmailProfile {
+    email_address: String,
 }
 
 fn envelope_from(
@@ -1413,6 +1441,42 @@ mod tests {
         ));
         assert_eq!(result, Err(RemoteMailboxError::InvalidResponse));
         assert_eq!(transport.requests().len(), 1);
+    }
+
+    #[test]
+    fn reads_the_account_email_with_an_exact_profile_request() {
+        let transport =
+            FakeTransport::new(vec![json(200, r#"{"emailAddress":"me@example.invalid"}"#)]);
+        let mailbox = GmailMailbox::with_transport(account(ACCOUNT), transport.clone());
+        let address =
+            ready(Box::pin(mailbox.email_address())).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(address.as_str(), "me@example.invalid");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, JSON_LIMIT);
+        assert_eq!(
+            requests[0].0,
+            "https://gmail.googleapis.com/gmail/v1/users/me/profile?fields=emailAddress"
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_profile_address_as_an_invalid_response() {
+        let transport = FakeTransport::new(vec![json(
+            200,
+            r#"{"emailAddress":"has space@example.invalid"}"#,
+        )]);
+        let mailbox = GmailMailbox::with_transport(account(ACCOUNT), transport);
+        let result = ready(Box::pin(mailbox.email_address()));
+        assert_eq!(result, Err(RemoteMailboxError::InvalidResponse));
+    }
+
+    #[test]
+    fn rejects_a_missing_profile_address_as_an_invalid_response() {
+        let transport = FakeTransport::new(vec![json(200, r"{}")]);
+        let mailbox = GmailMailbox::with_transport(account(ACCOUNT), transport);
+        let result = ready(Box::pin(mailbox.email_address()));
+        assert_eq!(result, Err(RemoteMailboxError::InvalidResponse));
     }
 
     #[test]

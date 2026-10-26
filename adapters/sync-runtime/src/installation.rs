@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 use tersa_application::identity::{AccountIdentityHasher, HasherError, IdentityHash};
-use tersa_application::mailbox::{AccountId, MailboxStoreError};
+use tersa_application::mailbox::{AccountEmail, AccountId, MailboxStoreError};
 use tersa_keys::{
     AccountKeyPurpose, InstallationKeyPurpose, KeyError, RootKey, account_identity_hash,
     derive_account_key, derive_installation_key, registry_dedup_tag,
@@ -268,6 +268,24 @@ impl Installation {
         self.open_store_with(account, IntegrityScan::Skip)
     }
 
+    /// The account's stored Gmail address, read through the display open so
+    /// showing it never waits for an integrity scan. An account that has not
+    /// completed a sync yet has no stored address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::UnknownAccount`] for an unregistered
+    /// account, or a store error.
+    pub fn account_email(
+        &self,
+        account: &AccountId,
+    ) -> Result<Option<AccountEmail>, InstallationError> {
+        let store = self.open_store_for_display(account)?;
+        store
+            .load_email_address(account)
+            .map_err(InstallationError::Store)
+    }
+
     /// Deletes an account's local data, then its registry entry.
     ///
     /// Data goes first so a failed deletion leaves the account registered and
@@ -497,6 +515,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use tersa_application::mailbox::{AccountEmail, AccountId};
     use tersa_keys::RootKey;
     use tersa_store_sqlcipher::registry::MAX_ACCOUNTS;
     use tersa_token_broker_core::{RefreshTokenStore, RefreshTokenStoreError, ValidatedSubject};
@@ -576,6 +595,35 @@ mod tests {
         tokens.delete(&subject("sub-1")).expect("delete");
         assert_eq!(tokens.load(&subject("sub-1")).expect("load"), None);
         tokens.delete(&subject("unknown")).expect("idempotent");
+    }
+
+    #[test]
+    fn account_email_reads_the_stored_address_and_rejects_unknown_accounts() {
+        let dir = TempDir::new("account-email");
+        let installation = Arc::new(Installation::open(&dir.0, root()).expect("open"));
+        InstallationTokens(Arc::clone(&installation))
+            .store(&subject("sub-1"), &Zeroizing::new("token".to_owned()))
+            .expect("store");
+        let account = installation
+            .account_for_subject("sub-1")
+            .expect("find")
+            .expect("registered");
+        assert_eq!(installation.account_email(&account).expect("read"), None);
+        let email = AccountEmail::new("user@example.invalid").expect("address");
+        installation
+            .open_store(&account)
+            .expect("store")
+            .store_email_address(&account, &email)
+            .expect("store the address");
+        assert_eq!(
+            installation.account_email(&account).expect("read"),
+            Some(email.clone())
+        );
+        let unknown = AccountId::new("acct_00000000000000000000000000000000").expect("id");
+        assert!(matches!(
+            installation.account_email(&unknown),
+            Err(InstallationError::UnknownAccount)
+        ));
     }
 
     #[test]

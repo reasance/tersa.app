@@ -32,7 +32,7 @@ mod store {
         AccountLifecycleMetadata, AccountLifecycleStore, DisconnectRecoveryState,
     };
     use tersa_application::mailbox::{
-        AccountPurgeStore, BoxFuture, EnvelopeCursor, MailboxReader, MailboxStore,
+        AccountEmail, AccountPurgeStore, BoxFuture, EnvelopeCursor, MailboxReader, MailboxStore,
         MailboxStoreError, StoreLimit,
     };
     use tersa_domain::mailbox::{
@@ -43,15 +43,15 @@ mod store {
 
     // Fixed ownership marker for this product account-store schema.
     const APPLICATION_ID: i64 = 0x5453_4D31;
-    // The schema is fresh-create only: `MIGRATION` runs on an empty file and the
-    // open path rejects any store whose objects differ from `canonical_schema`.
-    // Phase 1 is pre-release with no shipped stores, so adding the
-    // `account_identity` table and the `account_binding.broker_subject`
-    // column intentionally keeps `VERSION` at 1 rather than introducing a v2
-    // upgrade path — a store created before these changes opens as
-    // `Corrupted` and is re-bootstrapped fresh. Once a store ships, a schema
-    // change must bump `VERSION` and add an upgrade migration instead.
-    const VERSION: i64 = 1;
+    // The schema carries a shipped-store upgrade path: `MIGRATION` creates a
+    // fresh store on the current version, and a store found on the previous
+    // version upgrades in one transaction on the next writable open. A store
+    // whose version or objects match neither the current nor the previous
+    // schema opens as `Corrupted` and is never rewritten here.
+    const VERSION: i64 = 2;
+    // The previous shipped schema version, accepted read-only and upgraded on
+    // the next writable open.
+    const SCHEMA_VERSION_1: i64 = 1;
     // Derivation version of the stored account-identity hash. A row written by a
     // different algorithm reads as incompatible (fail closed), never a first
     // connect. Bumped 1 -> 2 in 3d-3a when the gate switched from hashing the
@@ -67,6 +67,7 @@ mod store {
     // Bounds lock waits without introducing retries or background work.
     const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
     const MIGRATION: &str = include_str!("../migrations/0001_account_mailbox.sql");
+    const MIGRATION_V2_ACCOUNT_EMAIL: &str = include_str!("../migrations/0002_account_email.sql");
     const RECOVERY_STAGE_LIMIT: usize = 8;
 
     /// Owns a redacted, zeroizing `SQLCipher` database key.
@@ -637,6 +638,98 @@ mod store {
                             return Err(MailboxStoreError::Corrupted);
                         }
                         Ok(Some(Zeroizing::new(subject)))
+                    }
+                    _ => Err(MailboxStoreError::Corrupted),
+                }
+            })
+        }
+
+        /// Stores the account's Gmail address in the binding row for display.
+        ///
+        /// The address is protected only by the database encryption and is
+        /// never logged. It is validated by construction, so this method
+        /// does not re-check its shape; the column CHECK bounds reject a
+        /// foreign write that bypasses this type.
+        ///
+        /// # Errors
+        ///
+        /// Returns storage for an account mismatch or backend failure and
+        /// corruption for a missing or mismatched binding row.
+        pub fn store_email_address(
+            &self,
+            account: &AccountId,
+            email: &AccountEmail,
+        ) -> Result<(), MailboxStoreError> {
+            self.checked_account(account)?;
+            self.with_connection(|connection| {
+                let changed = connection
+                    .execute(
+                        "UPDATE account_binding SET email_address = ?1 WHERE singleton = 1 AND account_id = ?2",
+                        params![email.as_str(), account.as_str()],
+                    )
+                    .map_err(store_error)?;
+                (changed == 1)
+                    .then_some(())
+                    .ok_or(MailboxStoreError::Corrupted)
+            })
+        }
+
+        /// Loads the account's Gmail address from the binding row.
+        ///
+        /// The address lives only in this account's database and is never
+        /// logged. A store still on the previous schema has no address
+        /// column, so the load returns `None` instead of failing. A SQL NULL
+        /// address also returns `None`; a missing or mismatched binding row,
+        /// a non-text address, or text violating the stored shape is
+        /// corruption, never `None`.
+        ///
+        /// # Errors
+        ///
+        /// Returns storage for an account mismatch or backend failure and
+        /// corruption for a missing or mismatched binding row or an invalid
+        /// persisted address.
+        pub fn load_email_address(
+            &self,
+            account: &AccountId,
+        ) -> Result<Option<AccountEmail>, MailboxStoreError> {
+            self.checked_account(account)?;
+            self.with_connection(|connection| {
+                let version: i64 = connection
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .map_err(store_error)?;
+                if version == SCHEMA_VERSION_1 {
+                    return Ok(None);
+                }
+                if version != VERSION {
+                    return Err(MailboxStoreError::Corrupted);
+                }
+                let row = connection.query_row(
+                    "SELECT typeof(email_address), CASE WHEN typeof(email_address) = 'text' THEN email_address END, CASE WHEN typeof(account_id) = 'text' THEN account_id END FROM account_binding WHERE singleton = 1",
+                    [],
+                    |row| {
+                        let address_type: String = row.get(0)?;
+                        let address: Option<String> = row.get(1)?;
+                        let binding: Option<String> = row.get(2)?;
+                        Ok((address_type, address, binding))
+                    },
+                );
+                let (address_type, address, binding) = match row {
+                    Ok(values) => values,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        return Err(MailboxStoreError::Corrupted);
+                    }
+                    Err(error) => return Err(store_error(error)),
+                };
+                if binding.as_deref() != Some(account.as_str()) {
+                    return Err(MailboxStoreError::Corrupted);
+                }
+                match address_type.as_str() {
+                    "null" => Ok(None),
+                    "text" => {
+                        let address = address.ok_or(MailboxStoreError::Corrupted)?;
+                        AccountEmail::new(address)
+                            .map(Some)
+                            .map_err(|_error| MailboxStoreError::Corrupted)
                     }
                     _ => Err(MailboxStoreError::Corrupted),
                 }
@@ -2839,6 +2932,7 @@ mod store {
             .map_err(classify_open)?;
         let fresh = validate_identity(connection, account)?;
         configure_owned_storage(connection)?;
+        upgrade_schema_v1(connection)?;
         Ok(fresh)
     }
 
@@ -2848,6 +2942,9 @@ mod store {
             .map_err(|_error| OpenFailure::Storage)?;
         transaction
             .execute_batch(MIGRATION)
+            .map_err(classify_open)?;
+        transaction
+            .execute_batch(MIGRATION_V2_ACCOUNT_EMAIL)
             .map_err(classify_open)?;
         transaction
             .execute(
@@ -2868,6 +2965,43 @@ mod store {
         connection
             .execute_batch("BEGIN IMMEDIATE; PRAGMA user_version = 0; COMMIT;")
             .map_err(classify_open)
+    }
+
+    // Upgrades a shipped version-1 store to the current schema: it adds the
+    // account email column and bumps the stored version in one
+    // `BEGIN IMMEDIATE` transaction, so a crash can never leave a
+    // half-upgraded store behind. A store already on the current version is
+    // left alone; the caller validated the old schema before this runs and
+    // the current one after.
+    fn upgrade_schema_v1(connection: &Connection) -> Result<(), OpenFailure> {
+        let user_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(classify_open)?;
+        if user_version != SCHEMA_VERSION_1 {
+            return Ok(());
+        }
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(classify_open)?;
+        let outcome = (|| {
+            connection
+                .execute_batch(MIGRATION_V2_ACCOUNT_EMAIL)
+                .map_err(classify_open)?;
+            connection
+                .pragma_update(None, "user_version", VERSION)
+                .map_err(classify_open)?;
+            let schema = schema(connection).map_err(classify_open)?;
+            (schema == canonical_schema())
+                .then_some(())
+                .ok_or(OpenFailure::Corrupted)
+        })();
+        match outcome {
+            Ok(()) => connection.execute_batch("COMMIT").map_err(classify_open),
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     fn configure_read_only(
@@ -2971,10 +3105,16 @@ mod store {
         if fresh {
             return Ok(true);
         }
-        if application_id != APPLICATION_ID
-            || user_version != VERSION
-            || schema != canonical_schema()
-        {
+        // A shipped store is either the current version or the previous one,
+        // each with exactly its own canonical objects. A newer version, a
+        // foreign application id, or a mismatched object set fails closed and
+        // is never rewritten here.
+        let expected = match user_version {
+            VERSION => canonical_schema(),
+            SCHEMA_VERSION_1 => canonical_schema_v1(),
+            _ => return Err(OpenFailure::Corrupted),
+        };
+        if application_id != APPLICATION_ID || schema != expected {
             return Err(OpenFailure::Corrupted);
         }
         let owner: String = connection
@@ -3159,6 +3299,19 @@ mod store {
         Ok(objects)
     }
     fn canonical_schema() -> Vec<(String, String, String)> {
+        canonical_objects(normalize(
+            "CREATE TABLE account_binding ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), account_id TEXT NOT NULL, broker_subject TEXT NULL CHECK (broker_subject IS NULL OR (length(CAST(broker_subject AS BLOB)) BETWEEN 1 AND 255)), refresh_token TEXT NULL CHECK (refresh_token IS NULL OR (length(CAST(refresh_token AS BLOB)) BETWEEN 1 AND 4096)) , email_address TEXT NULL CHECK (email_address IS NULL OR (length(CAST(email_address AS BLOB)) BETWEEN 3 AND 320)))",
+        ))
+    }
+    // The previously shipped version-1 binding row, without the account email
+    // column. A version-1 store must match exactly this object set so a
+    // writable open can upgrade it and a read-only open can read it.
+    fn canonical_schema_v1() -> Vec<(String, String, String)> {
+        canonical_objects(normalize(
+            "CREATE TABLE account_binding ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), account_id TEXT NOT NULL, broker_subject TEXT NULL CHECK (broker_subject IS NULL OR (length(CAST(broker_subject AS BLOB)) BETWEEN 1 AND 255)), refresh_token TEXT NULL CHECK (refresh_token IS NULL OR (length(CAST(refresh_token AS BLOB)) BETWEEN 1 AND 4096)) )",
+        ))
+    }
+    fn canonical_objects(account_binding: String) -> Vec<(String, String, String)> {
         vec![
             (
                 "index".into(),
@@ -3174,13 +3327,7 @@ mod store {
                     "CREATE INDEX messages_thread_order ON messages (thread_id ASC, received_at ASC, message_id ASC)",
                 ),
             ),
-            (
-                "table".into(),
-                "account_binding".into(),
-                normalize(
-                    "CREATE TABLE account_binding ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), account_id TEXT NOT NULL, broker_subject TEXT NULL CHECK (broker_subject IS NULL OR (length(CAST(broker_subject AS BLOB)) BETWEEN 1 AND 255)), refresh_token TEXT NULL CHECK (refresh_token IS NULL OR (length(CAST(refresh_token AS BLOB)) BETWEEN 1 AND 4096)) )",
-                ),
-            ),
+            ("table".into(), "account_binding".into(), account_binding),
             (
                 "table".into(),
                 "account_identity".into(),
@@ -6075,6 +6222,175 @@ mod store {
                     .map(|subject| subject.to_string()),
                 Some("google-subject-123".to_string())
             );
+        }
+
+        // Builds a shipped version-1 store: the 0001 migration, the binding
+        // row, the ownership marker, and `user_version` 1, in WAL mode as
+        // every shipped open leaves it.
+        fn version_1_store(name: &str) -> TestDatabase {
+            let database = TestDatabase::new(name);
+            let connection = raw_connection(&database);
+            apply_key(&connection, &key(7).0).unwrap();
+            connection.execute_batch(MIGRATION).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO account_binding (singleton, account_id) VALUES (1, ?1)",
+                    rusqlite::params![account().as_str()],
+                )
+                .unwrap();
+            connection
+                .pragma_update(None, "application_id", APPLICATION_ID)
+                .unwrap();
+            connection
+                .pragma_update(None, "user_version", SCHEMA_VERSION_1)
+                .unwrap();
+            connection
+                .execute_batch("PRAGMA journal_mode = WAL;")
+                .unwrap();
+            drop(connection);
+            database
+        }
+
+        #[test]
+        fn a_version_one_store_upgrades_on_a_writable_open() {
+            let database = version_1_store("version-one-upgrade");
+            {
+                let connection = raw_existing_connection(&database);
+                apply_key(&connection, &key(7).0).unwrap();
+                connection
+                    .execute(
+                        "UPDATE account_binding SET broker_subject = ?1, refresh_token = ?2 WHERE singleton = 1",
+                        rusqlite::params!["google-subject-123", "refresh-token-xyz"],
+                    )
+                    .unwrap();
+            }
+            let store = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            let (application_id, user_version, objects) = schema_state(&store);
+            assert_eq!((application_id, user_version), (APPLICATION_ID, VERSION));
+            assert_eq!(objects, canonical_schema());
+            assert_eq!(
+                store
+                    .load_broker_subject(&account())
+                    .unwrap()
+                    .map(|subject| subject.to_string()),
+                Some("google-subject-123".to_string())
+            );
+            assert_eq!(
+                store
+                    .load_refresh_token(&account())
+                    .unwrap()
+                    .map(|token| token.to_string()),
+                Some("refresh-token-xyz".to_string())
+            );
+            assert!(store.load_email_address(&account()).unwrap().is_none());
+            let email = AccountEmail::new("user@example.invalid").unwrap();
+            store.store_email_address(&account(), &email).unwrap();
+            run(store.upsert_envelopes(&account(), &[envelope("m1", "t1", 10)])).unwrap();
+            drop(store);
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                reopened.load_email_address(&account()).unwrap().as_ref(),
+                Some(&email)
+            );
+            assert_eq!(
+                run(reopened.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                ["m1"]
+            );
+        }
+
+        #[test]
+        fn a_version_one_store_opens_read_only_and_stays_version_one() {
+            let database = version_1_store("version-one-read-only");
+            let anchor = raw_existing_connection(&database);
+            apply_key(&anchor, &key(7).0).unwrap();
+            anchor
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL; CREATE TABLE wal_touch (value); DROP TABLE wal_touch;",
+                )
+                .unwrap();
+            fs::set_permissions(wal_path(&database), fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(shm_path(&database), fs::Permissions::from_mode(0o600)).unwrap();
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            drop(reader);
+            drop(anchor);
+            let connection = raw_existing_connection(&database);
+            apply_key(&connection, &key(7).0).unwrap();
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION_1);
+        }
+
+        #[test]
+        fn account_email_round_trips_survives_reopen_and_purge() {
+            let (database, store) = open("account-email-round-trip");
+            let email = AccountEmail::new("user@example.invalid").unwrap();
+            store.store_email_address(&account(), &email).unwrap();
+            assert_eq!(
+                store.load_email_address(&account()).unwrap().as_ref(),
+                Some(&email)
+            );
+            drop(store);
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                reopened.load_email_address(&account()).unwrap().as_ref(),
+                Some(&email)
+            );
+            run(reopened.purge_account(&account())).unwrap();
+            assert_eq!(
+                reopened.load_email_address(&account()).unwrap().as_ref(),
+                Some(&email)
+            );
+            assert!(reopened.load_broker_subject(&account()).unwrap().is_none());
+        }
+
+        #[test]
+        fn account_email_rejects_out_of_bound_direct_storage() {
+            let (_database, store) = open("account-email-check");
+            {
+                let connection = store.connection.lock().unwrap();
+                let invalid = "a".repeat(AccountEmail::MAX_LEN + 1);
+                assert!(matches!(
+                    connection.execute(
+                        "UPDATE account_binding SET email_address = ?1 WHERE singleton = 1",
+                        rusqlite::params![invalid],
+                    ),
+                    Err(rusqlite::Error::SqliteFailure(_, _))
+                ));
+            }
+            assert!(store.load_email_address(&account()).unwrap().is_none());
+        }
+
+        #[test]
+        fn account_email_rejects_invalid_text_storage() {
+            let (_database, store) = open("account-email-corrupt");
+            {
+                let connection = store.connection.lock().unwrap();
+                connection
+                    .execute(
+                        "UPDATE account_binding SET email_address = ?1 WHERE singleton = 1",
+                        rusqlite::params!["not-an-address"],
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                store.load_email_address(&account()),
+                Err(MailboxStoreError::Corrupted)
+            );
+        }
+
+        #[test]
+        fn fresh_stores_create_the_version_two_schema_with_no_email() {
+            let (_database, store) = open("fresh-version-two");
+            let (application_id, user_version, objects) = schema_state(&store);
+            assert_eq!((application_id, user_version), (APPLICATION_ID, VERSION));
+            assert_eq!(objects, canonical_schema());
+            assert!(store.load_email_address(&account()).unwrap().is_none());
         }
 
         #[test]
