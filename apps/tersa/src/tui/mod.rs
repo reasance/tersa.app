@@ -115,7 +115,7 @@ pub fn run(
         .map_err(|()| "could not read the local mailbox".to_owned())?;
     let mut app = App::new(account, rows);
     app.more_rows = more;
-    let worker = remote.map(Worker::start);
+    let mut worker = remote.map(Worker::start);
     // Installs a panic hook that restores the terminal before reporting.
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
@@ -130,8 +130,10 @@ pub fn run(
         PANICKED.store(true, Ordering::SeqCst);
         restore_terminal(info);
     }));
-    let result = event_loop(&mut terminal, &mut app, source, worker);
+    let result = event_loop(&mut terminal, &mut app, source, &mut worker);
     ratatui::restore();
+    // Stops the network thread once the terminal is back to normal.
+    drop(worker);
     result
 }
 
@@ -152,8 +154,8 @@ enum Done {
 
 /// The network thread's channels. Each job runs as its own task on one
 /// single-threaded runtime, so a download never waits for a sync. Dropping
-/// this ends the thread and cancels unfinished jobs; the process does not
-/// wait for it.
+/// this ends the thread, cancels unfinished jobs, and waits for the thread
+/// to stop.
 struct Worker {
     jobs: tokio::sync::mpsc::UnboundedSender<Job>,
     done: Receiver<Done>,
@@ -166,6 +168,27 @@ struct Worker {
     /// When the last sync started, on both clocks: the monotonic clock stops
     /// while the machine sleeps, the wall clock does not.
     last_sync: Option<(Instant, SystemTime)>,
+    /// Disconnects when the network thread has stopped.
+    stopped: Receiver<()>,
+}
+
+/// The longest quitting waits for the network thread to stop: a last resort
+/// against a store call that never returns. The longest store call is the
+/// integrity scan of the first open: 62 ms in the performance harness, more
+/// with large cached bodies.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
+
+impl Drop for Worker {
+    /// Stops the network thread and waits for it, so the process does not run
+    /// its exit handlers while that thread is still inside the store or the
+    /// TLS library. A pending network wait is cancelled at once and blocking
+    /// lookups such as DNS are left behind; a store call already running
+    /// finishes first. Past [`SHUTDOWN_WAIT`] the process exits regardless.
+    fn drop(&mut self) {
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        drop(std::mem::replace(&mut self.jobs, closed));
+        let _ = self.stopped.recv_timeout(SHUTDOWN_WAIT);
+    }
 }
 
 /// Downloads `id` unless another message is opened first: then it stops,
@@ -224,10 +247,16 @@ async fn first<A: Future, B: Future>(left: A, right: B) -> First<A::Output, B::O
 
 impl Worker {
     fn start(remote: Box<dyn Remote>) -> Self {
-        let (jobs, mut incoming) = tokio::sync::mpsc::unbounded_channel::<Job>();
+        let (jobs, incoming) = tokio::sync::mpsc::unbounded_channel::<Job>();
         let (outgoing, done) = mpsc::channel();
         let (open, wanted) = tokio::sync::watch::channel(None::<MessageId>);
+        let (alive, stopped) = mpsc::channel::<()>();
         std::thread::spawn(move || {
+            // Dropped last, once the runtime, its tasks and the remote (with
+            // its store connections) are gone, on every path out. Captures
+            // are dropped after locals, so they are moved into locals first.
+            let _alive = alive;
+            let (remote, mut incoming, outgoing, wanted) = (remote, incoming, outgoing, wanted);
             let Ok(executor) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -237,7 +266,8 @@ impl Worker {
                 return;
             };
             let remote: Rc<dyn Remote> = Rc::from(remote);
-            tokio::task::LocalSet::new().block_on(&executor, async move {
+            let tasks = tokio::task::LocalSet::new();
+            tasks.block_on(&executor, async move {
                 while let Some(job) = incoming.recv().await {
                     let remote = Rc::clone(&remote);
                     let outgoing = outgoing.clone();
@@ -251,6 +281,10 @@ impl Worker {
                     });
                 }
             });
+            // Drops the jobs still pending, then stops without waiting for
+            // blocking lookups such as DNS, which hold no store state.
+            drop(tasks);
+            executor.shutdown_background();
         });
         Self {
             jobs,
@@ -259,6 +293,7 @@ impl Worker {
             open,
             syncing: false,
             last_sync: None,
+            stopped,
         }
     }
 
@@ -311,7 +346,7 @@ fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     source: &dyn MailSource,
-    mut worker: Option<Worker>,
+    worker: &mut Option<Worker>,
 ) -> Result<(), String> {
     let mut dirty = true;
     let mut drawn = Instant::now();
@@ -320,7 +355,7 @@ fn event_loop(
             return Err("tersa stopped after an internal error".to_owned());
         }
         let now = now_millis();
-        if let Some(worker) = &mut worker {
+        if let Some(worker) = worker.as_mut() {
             dirty |= finish_work(worker, app, source, now);
             if worker.sync_due() {
                 start_sync(worker, app, now);
@@ -365,7 +400,7 @@ fn event_loop(
                 let raw = source.message(&id);
                 let missing = matches!(raw, Ok(None));
                 app.show_message(id.clone(), raw);
-                if let Some(worker) = &mut worker
+                if let Some(worker) = worker.as_mut()
                     && missing
                 {
                     worker.set_open(Some(&id));
@@ -380,7 +415,7 @@ fn event_loop(
                 Ok(Some(raw)) => app.reformat(&id, &raw, preference),
                 _ => app.status = Some("The message could not be read again.".to_owned()),
             },
-            Some(Request::Sync) => match &mut worker {
+            Some(Request::Sync) => match worker.as_mut() {
                 Some(worker) => start_sync(worker, app, now),
                 None => {
                     app.status = Some(
@@ -922,6 +957,7 @@ mod tests {
             open: tokio::sync::watch::channel(None).0,
             syncing: true,
             last_sync: Some((Instant::now(), SystemTime::now())),
+            stopped: mpsc::channel().1,
         };
         done_sender.send(Done::Synced(result)).expect("send");
         assert!(finish_work(&mut worker, app, source, 0));
@@ -1019,6 +1055,114 @@ mod tests {
         );
     }
 
+    /// How a stalled sync holds the network thread.
+    #[derive(Clone, Copy)]
+    enum Stall {
+        /// Blocks the thread, like a store call.
+        StoreCall,
+        /// Waits forever, like a network request.
+        Network,
+        /// Waits on tokio's blocking pool, like a DNS lookup.
+        BlockingPool,
+    }
+
+    /// A sync that reports its start, then stalls; a store call records
+    /// when it ends.
+    struct Stalled {
+        started: Sender<()>,
+        stall: Stall,
+        ended: Arc<Mutex<Option<Instant>>>,
+    }
+
+    impl Remote for Stalled {
+        fn fetch<'a>(&'a self, _id: &'a MessageId) -> Pending<'a, Vec<u8>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn sync(&self) -> Pending<'_, ()> {
+            Box::pin(async move {
+                match self.stall {
+                    Stall::StoreCall => {
+                        let _ = self.started.send(());
+                        std::thread::sleep(Duration::from_secs(1));
+                        *self.ended.lock().expect("lock") = Some(Instant::now());
+                        Ok(())
+                    }
+                    Stall::Network => {
+                        let _ = self.started.send(());
+                        std::future::pending().await
+                    }
+                    Stall::BlockingPool => {
+                        // Reports from the pool thread, so the lookup is
+                        // running, not just queued, when the quit begins.
+                        let started = self.started.clone();
+                        let lookup = tokio::task::spawn_blocking(move || {
+                            let _ = started.send(());
+                            std::thread::sleep(Duration::from_secs(10));
+                        });
+                        let _ = lookup.await;
+                        Ok(())
+                    }
+                }
+            })
+        }
+    }
+
+    fn stalled_sync(stall: Stall) -> (Worker, Arc<Mutex<Option<Instant>>>) {
+        let (started, start) = mpsc::channel();
+        let ended = Arc::new(Mutex::new(None));
+        let mut worker = Worker::start(Box::new(Stalled {
+            started,
+            stall,
+            ended: Arc::clone(&ended),
+        }));
+        assert!(worker.sync());
+        start
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the sync starts");
+        (worker, ended)
+    }
+
+    /// How long quitting takes while the sync stalls this way.
+    fn quit_time(stall: Stall) -> Duration {
+        let (worker, _) = stalled_sync(stall);
+        let quitting = Instant::now();
+        drop(worker);
+        quitting.elapsed()
+    }
+
+    #[test]
+    fn quitting_waits_for_a_store_call_the_network_thread_is_in() {
+        // A run counts only if the store call was still running when the
+        // quit began; on a stalled machine it may already have ended.
+        for _ in 0..5 {
+            let (worker, ended) = stalled_sync(Stall::StoreCall);
+            let quitting = Instant::now();
+            drop(worker);
+            let returned = Instant::now();
+            // Not ended yet, or ended after the quit returned: it did not wait.
+            let ended = (*ended.lock().expect("lock"))
+                .filter(|&ended| ended <= returned)
+                .expect("the quit returned before the store call ended");
+            if ended > quitting {
+                return;
+            }
+        }
+        panic!("the store call always ended before the quit began");
+    }
+
+    #[test]
+    fn quitting_cancels_a_network_wait_at_once() {
+        let took = quit_time(Stall::Network);
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+    }
+
+    #[test]
+    fn quitting_leaves_a_blocking_lookup_behind() {
+        let took = quit_time(Stall::BlockingPool);
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+    }
+
     #[test]
     fn a_stopped_worker_fails_the_work_it_owed() {
         let (jobs, _) = tokio::sync::mpsc::unbounded_channel();
@@ -1030,6 +1174,7 @@ mod tests {
             open: tokio::sync::watch::channel(Some(id("a"))).0,
             syncing: true,
             last_sync: Some((Instant::now(), SystemTime::now())),
+            stopped: mpsc::channel().1,
         };
         let mut app = App::new(SafeText::single_line("me@example.com"), Vec::new());
         app.show_message(id("a"), Ok(None));
