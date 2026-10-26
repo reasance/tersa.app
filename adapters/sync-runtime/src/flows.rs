@@ -23,7 +23,7 @@ use crate::installation::{
     Installation, InstallationError, InstallationHasher, InstallationTokens,
 };
 use crate::loopback::{Loopback, LoopbackError};
-use crate::session::{GmailSession, GmailSessionError, SharedSession};
+use crate::session::{GmailSession, GmailSessionError, SessionEmailAddress, SharedSession};
 use crate::session_cache::{Origin, SessionCache, SystemCacheClock};
 
 /// How long the browser sign-in may take.
@@ -382,15 +382,27 @@ impl Runtime {
             .ok_or(FlowError::UnknownAccount)
     }
 
-    async fn sync_with_session<S: AccountProfile + RemoteMailbox>(
+    async fn sync_with_session<S: AccountProfile + RemoteMailbox + SessionEmailAddress>(
         &self,
         account: &AccountId,
         session: S,
     ) -> Result<SyncReport, FlowError> {
         let store = self.installation.open_store(account)?;
-        gated_sync(account, session, &self.hasher, store, default_sync_policy())
+        // The address is fetched with this session's own token, but it is
+        // stored only after the identity gate has proven that this session
+        // owns the account. A failed fetch or store never fails the sync;
+        // the address simply stays as it was.
+        let email = session.email_address().await.ok();
+        let report = gated_sync(account, session, &self.hasher, store, default_sync_policy())
             .await
-            .map_err(FlowError::Sync)
+            .map_err(FlowError::Sync);
+        if report.is_ok()
+            && let Some(email) = email
+            && let Ok(store) = self.installation.open_store(account)
+        {
+            let _ = store.store_email_address(account, &email);
+        }
+        report
     }
 }
 

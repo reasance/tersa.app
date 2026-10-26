@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use tersa_application::identity::AccountProfile;
 use tersa_application::mailbox::{
-    AccountId, BoxFuture, Message, MessageEnvelope, MessageId, Page, PageSize, PageToken,
-    RemoteMailbox, RemoteMailboxError,
+    AccountEmail, AccountId, BoxFuture, Message, MessageEnvelope, MessageId, Page, PageSize,
+    PageToken, RemoteMailbox, RemoteMailboxError,
 };
 use tersa_application::token::{AccountSubject, BrokerSubjectError};
 use tersa_gmail_rest::GmailMailbox;
@@ -145,6 +145,31 @@ impl RemoteMailbox for SharedSession {
         message_id: &'a MessageId,
     ) -> BoxFuture<'a, Result<Message, RemoteMailboxError>> {
         self.0.fetch_message(account, message_id)
+    }
+}
+
+/// The account's Gmail address, fetched with the session's own access token.
+/// A crate-local surface: the application's [`RemoteMailbox`] port stays
+/// unchanged and other mailbox adapters stay free to skip it.
+pub trait SessionEmailAddress {
+    /// Fetches the Gmail address of the authenticated user behind the token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RemoteMailboxError`] for a transport failure and for a
+    /// missing or invalid profile address.
+    fn email_address(&self) -> BoxFuture<'_, Result<AccountEmail, RemoteMailboxError>>;
+}
+
+impl SessionEmailAddress for GmailSession {
+    fn email_address(&self) -> BoxFuture<'_, Result<AccountEmail, RemoteMailboxError>> {
+        Box::pin(self.mailbox.email_address())
+    }
+}
+
+impl SessionEmailAddress for SharedSession {
+    fn email_address(&self) -> BoxFuture<'_, Result<AccountEmail, RemoteMailboxError>> {
+        self.0.email_address()
     }
 }
 

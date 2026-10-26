@@ -26,6 +26,7 @@ pub use tersa_domain::mailbox::{
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const MAX_PAGE_TOKEN_LEN: usize = 4_096;
+const MAX_ACCOUNT_EMAIL_LEN: usize = 320;
 
 /// Reports rejected application contract values without exposing their content.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +42,13 @@ pub enum MailboxContractError {
     InvalidPageSize { value: u16 },
     /// A requested local result limit was outside 1 through 10,000.
     InvalidStoreLimit { value: u16 },
+    /// An account email was too short to hold a local part, `@`, and domain.
+    AccountEmailTooShort,
+    /// An account email was too long.
+    AccountEmailTooLong { len: usize },
+    /// An account email lacked `@` or contained whitespace or a control
+    /// character.
+    InvalidAccountEmail,
 }
 
 impl fmt::Display for MailboxContractError {
@@ -51,6 +59,9 @@ impl fmt::Display for MailboxContractError {
             Self::InvalidPageToken => "the page token contains an invalid character",
             Self::InvalidPageSize { .. } => "the page size must be between 1 and 500",
             Self::InvalidStoreLimit { .. } => "the store limit must be between 1 and 10000",
+            Self::AccountEmailTooShort => "the account email is too short",
+            Self::AccountEmailTooLong { .. } => "the account email exceeds its maximum length",
+            Self::InvalidAccountEmail => "the account email is not a valid address",
         };
         formatter.write_str(message)
     }
@@ -94,6 +105,56 @@ impl PageToken {
 impl fmt::Debug for PageToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PageToken([REDACTED])")
+    }
+}
+
+/// Holds the Gmail address of one account for display and resolution.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AccountEmail(String);
+
+impl AccountEmail {
+    /// The conservative provider-neutral address cap in bytes.
+    pub const MAX_LEN: usize = MAX_ACCOUNT_EMAIL_LEN;
+    /// The shortest address that can hold a local part, `@`, and a domain.
+    pub const MIN_LEN: usize = 3;
+    /// Creates an address with `@`, without whitespace or control characters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MailboxContractError`] if the address is shorter than
+    /// [`Self::MIN_LEN`], larger than [`Self::MAX_LEN`], missing `@`, or
+    /// contains whitespace or an ASCII or C1 control character.
+    pub fn new<T: Into<String>>(value: T) -> Result<Self, MailboxContractError> {
+        let value = value.into();
+        if value.len() < Self::MIN_LEN {
+            return Err(MailboxContractError::AccountEmailTooShort);
+        }
+        if value.len() > Self::MAX_LEN {
+            return Err(MailboxContractError::AccountEmailTooLong { len: value.len() });
+        }
+        // `char::is_control` rejects exactly the ASCII controls and the C1
+        // range, so this one test covers both.
+        if value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(MailboxContractError::InvalidAccountEmail);
+        }
+        if !value.contains('@') {
+            return Err(MailboxContractError::InvalidAccountEmail);
+        }
+        Ok(Self(value))
+    }
+    /// Returns the validated address text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AccountEmail {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AccountEmail([REDACTED])")
     }
 }
 
@@ -729,6 +790,48 @@ mod tests {
         assert!(!debug.contains("item-sentinel"));
         assert!(!debug.contains("token-sentinel"));
         assert_eq!(page.into_parts().0.len(), 1);
+    }
+
+    #[test]
+    fn account_email_contracts_enforce_bounds_and_redact_the_address() {
+        assert_eq!(
+            AccountEmail::new("ab"),
+            Err(MailboxContractError::AccountEmailTooShort)
+        );
+        assert_eq!(AccountEmail::new("a@b").unwrap().as_str(), "a@b");
+        let longest = format!("a@{}", "b".repeat(AccountEmail::MAX_LEN - 2));
+        assert_eq!(longest.len(), AccountEmail::MAX_LEN);
+        assert!(AccountEmail::new(longest.clone()).is_ok());
+        let mut over = longest.clone();
+        over.push('b');
+        assert!(matches!(
+            AccountEmail::new(over),
+            Err(MailboxContractError::AccountEmailTooLong { len: 321 })
+        ));
+        assert_eq!(
+            AccountEmail::new("missing-at-sign"),
+            Err(MailboxContractError::InvalidAccountEmail)
+        );
+        for rejected in [
+            "a b@c",
+            "a\tb@c",
+            "a\nb@c",
+            "a\u{1}b@c",
+            "a\u{7f}b@c",
+            "a\u{9f}b@c",
+        ] {
+            assert_eq!(
+                AccountEmail::new(rejected),
+                Err(MailboxContractError::InvalidAccountEmail)
+            );
+        }
+        let address = AccountEmail::new("address-sentinel@example.invalid").unwrap();
+        assert!(!format!("{address:?}").contains("address-sentinel"));
+        assert_eq!(
+            address,
+            AccountEmail::new("address-sentinel@example.invalid").unwrap()
+        );
+        assert_eq!(address.as_str(), "address-sentinel@example.invalid");
     }
 
     struct Noop;

@@ -13,6 +13,7 @@ use tersa_application::mailbox::{
 use tersa_application::sync::SyncReport;
 use tersa_keys::RootKey;
 use tersa_presentation::terminal::SafeText;
+use tersa_store_sqlcipher::SqlCipherMailboxStore;
 use tersa_sync_runtime::{
     FlowError, Installation, InstallationLock, Revocation, Runtime, has_local_data,
 };
@@ -199,11 +200,36 @@ fn executor() -> Result<tokio::runtime::Runtime, String> {
 
 fn resolve_account(installation: &Installation, raw: &str) -> Result<AccountId, String> {
     let accounts = installation.accounts().map_err(|error| error.to_string())?;
-    let mut matches = accounts
-        .into_iter()
+    // An id, or a prefix of one, resolves without opening any store. Only an
+    // `@` argument pays for the per-account stored-address reads, and a read
+    // that fails is reported rather than silently becoming "no account
+    // matches".
+    let mut id_matches = accounts
+        .iter()
         .filter(|account| account.as_str() == raw || account.as_str().starts_with(raw));
-    match (matches.next(), matches.next()) {
-        (Some(account), None) => Ok(account),
+    match (id_matches.next(), id_matches.next()) {
+        (Some(account), None) => return Ok(account.clone()),
+        (Some(_), Some(_)) => return Err(format!("`{raw}` matches more than one account")),
+        (None, _) => {}
+    }
+    if !raw.contains('@') {
+        return Err(format!(
+            "no account matches `{raw}`; see `tersa account list`"
+        ));
+    }
+    let raw_lowercase = raw.to_ascii_lowercase();
+    let mut address_matches = Vec::new();
+    for account in &accounts {
+        match installation.account_email(account) {
+            Ok(Some(email)) if email.as_str().eq_ignore_ascii_case(&raw_lowercase) => {
+                address_matches.push(account.clone());
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    match (address_matches.first(), address_matches.get(1)) {
+        (Some(account), None) => Ok(account.clone()),
         (Some(_), Some(_)) => Err(format!("`{raw}` matches more than one account")),
         (None, _) => Err(format!(
             "no account matches `{raw}`; see `tersa account list`"
@@ -275,7 +301,16 @@ pub fn account_list(context: &Context) -> Result<(), String> {
         println!("No accounts yet. Run `tersa account add`.");
     }
     for account in accounts {
-        println!("{}", account.as_str());
+        match locked
+            .installation
+            .account_email(&account)
+            .ok()
+            .flatten()
+            .map(|email| SafeText::single_line(email.as_str()))
+        {
+            Some(email) => println!("{}  {}", email.as_str(), account.as_str()),
+            None => println!("{}", account.as_str()),
+        }
     }
     Ok(())
 }
@@ -383,6 +418,16 @@ pub fn tui(context: &Context) -> Result<(), String> {
         .installation
         .open_store_for_display(&account)
         .map_err(|error| error.to_string())?;
+    // One small row before the first frame: the label prefers the account's
+    // stored Gmail address and falls back to the opaque id.
+    let label = store
+        .load_email_address(&account)
+        .ok()
+        .flatten()
+        .map_or_else(
+            || SafeText::single_line(account.as_str()),
+            |email| SafeText::single_line(email.as_str()),
+        );
     let source = StoreSource {
         store,
         account: account.clone(),
@@ -398,7 +443,7 @@ pub fn tui(context: &Context) -> Result<(), String> {
                 account: account.clone(),
             }) as Box<dyn crate::tui::Remote>
         });
-    crate::tui::run(SafeText::single_line(account.as_str()), &source, remote)
+    crate::tui::run(label, &source, remote)
 }
 
 /// Downloads and syncs for the interface, through the identity gate.
@@ -433,13 +478,13 @@ impl crate::tui::Remote for Network {
 }
 
 /// Reads cached mail for the interface from one account's store.
-pub(crate) struct StoreSource<S> {
-    pub(crate) store: S,
+pub(crate) struct StoreSource {
+    pub(crate) store: SqlCipherMailboxStore,
     pub(crate) account: AccountId,
     pub(crate) executor: tokio::runtime::Runtime,
 }
 
-impl<S: MailboxReader> crate::tui::MailSource for StoreSource<S> {
+impl crate::tui::MailSource for StoreSource {
     fn page(
         &self,
         after: Option<&crate::tui::Row>,
@@ -472,6 +517,19 @@ impl<S: MailboxReader> crate::tui::MailSource for StoreSource<S> {
             .block_on(self.store.get_message(&self.account, id))
             .map(|message| message.map(|message| message.content().as_bytes().to_vec()))
             .map_err(|_error| ())
+    }
+
+    fn account_label(&self) -> SafeText {
+        // A failed read falls back to the id, like a store with no address
+        // yet.
+        self.store
+            .load_email_address(&self.account)
+            .ok()
+            .flatten()
+            .map_or_else(
+                || SafeText::single_line(self.account.as_str()),
+                |email| SafeText::single_line(email.as_str()),
+            )
     }
 }
 

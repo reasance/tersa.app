@@ -132,7 +132,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-fn source(store: SqlCipherMailboxStore) -> StoreSource<SqlCipherMailboxStore> {
+fn source(store: SqlCipherMailboxStore) -> StoreSource {
     StoreSource {
         store,
         account: account(),
