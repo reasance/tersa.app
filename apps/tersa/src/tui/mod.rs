@@ -495,7 +495,7 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
                 // an identity mismatch clears it, so even a failed sync must
                 // drop the bar back to the id instead of keeping a previous
                 // identity's address.
-                app.accounts = source.account_labels();
+                app.set_accounts(source.account_labels());
                 // Read again as many rows as were loaded, so the selection
                 // and the list stay where they were; later pages follow. A
                 // failed sync may have stored envelopes before failing, so
@@ -659,6 +659,7 @@ mod tests {
     use super::{
         App, Done, FIRST_PAGE, MailSource, MessageKey, Pending, Remote, Row, SYNC_EVERY, SyncState,
         WORKER_GONE, Worker, finish_work, load_page, read_page, terminal_open, unreadable_status,
+        view,
     };
 
     /// Records the order work finishes in; syncs wait for the test.
@@ -879,7 +880,7 @@ mod tests {
     /// download.
     #[test]
     fn downloads_of_the_same_id_in_two_accounts_run_separately() {
-        let (log, _entries) = mpsc::channel();
+        let (log, entries) = mpsc::channel();
         let mut worker = Worker::start(Box::new(Recorder {
             log,
             release: Mutex::new(None),
@@ -905,6 +906,17 @@ mod tests {
             ["acct_a m", "acct_b m"],
             "each download asks its own account"
         );
+        // The remote itself was asked through each account's store.
+        let mut asked = Vec::new();
+        for _ in 0..2 {
+            asked.push(
+                entries
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("work finishes"),
+            );
+        }
+        asked.sort();
+        assert_eq!(asked, ["fetch acct_a m", "fetch acct_b m"]);
     }
 
     struct Empty;
@@ -1132,6 +1144,23 @@ mod tests {
         assert!(finish_work(&mut worker, app, source, 0));
     }
 
+    /// The screen as text lines, so a test can read what was drawn.
+    fn drawn(app: &mut App) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| view::draw(frame, app, 1_761_000_000_000))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..24)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     fn selected_id(app: &App) -> Option<&str> {
         app.shown_row(app.selected).map(|row| row.id.as_str())
     }
@@ -1202,6 +1231,24 @@ mod tests {
         }
     }
 
+    /// Two accounts whose labels change between reads, like stores that gain
+    /// their Gmail addresses on a start-up sync.
+    struct Relabeled(Vec<Row>, std::cell::RefCell<Vec<(AccountId, SafeText)>>);
+
+    impl MailSource for Relabeled {
+        fn page(&self, _loaded: &[Row], _limit: u16) -> Result<Vec<Row>, ()> {
+            Ok(self.0.clone())
+        }
+
+        fn message(&self, _account: &AccountId, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
+            Ok(None)
+        }
+
+        fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
+            self.1.borrow().clone()
+        }
+    }
+
     #[test]
     fn every_finished_sync_picks_up_the_top_bar_label() {
         let source = Labeled(Pages::new(2), std::cell::RefCell::new(None));
@@ -1227,6 +1274,34 @@ mod tests {
         *source.1.borrow_mut() = None;
         finished_sync(&mut app, &source, Err("offline".to_owned()));
         assert_eq!(app.accounts[0].1.as_str(), "acct_1234");
+    }
+
+    #[test]
+    fn a_finished_sync_refreshes_the_open_message_header() {
+        let source = Relabeled(
+            vec![
+                Row::sample("acct_a", "a", "Ann", "Lunch", false),
+                Row::sample("acct_b", "b", "Bob", "Report", false),
+            ],
+            std::cell::RefCell::new(labeled(&["acct_a", "acct_b"])),
+        );
+        let mut app = App::new(
+            source.account_labels(),
+            source.page(&[], FIRST_PAGE).expect("page"),
+        );
+        app.show_message(key("acct_a", "a"), Ok(None));
+        assert!(
+            drawn(&mut app).join("\n").contains("Account: acct_a"),
+            "the header is cached with the label it was drawn with"
+        );
+        // The start-up sync stores the account's Gmail address.
+        *source.1.borrow_mut() = vec![
+            (account("acct_a"), SafeText::single_line("ann@example.com")),
+            (account("acct_b"), SafeText::single_line("acct_b")),
+        ];
+        finished_sync(&mut app, &source, Ok(()));
+        let text = drawn(&mut app).join("\n");
+        assert!(text.contains("Account: ann@example.com"), "{text:?}");
     }
 
     #[test]

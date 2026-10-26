@@ -310,6 +310,19 @@ impl App {
         }
     }
 
+    /// Replaces the account labels, read again after a finished sync. A
+    /// changed label must reach the open message's header, whose lines are
+    /// cached with the old one, so that cache is dropped; the scroll
+    /// position survives the rebuild.
+    pub fn set_accounts(&mut self, accounts: Vec<(AccountId, SafeText)>) {
+        if self.accounts != accounts
+            && let Screen::Message(view) = &mut self.screen
+        {
+            view.layout = None;
+        }
+        self.accounts = accounts;
+    }
+
     fn position_of(&self, key: &MessageKey) -> Option<usize> {
         self.shown.iter().position(|&index| {
             self.rows
