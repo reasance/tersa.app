@@ -52,9 +52,10 @@ pub trait MailSource {
     /// Returns `Err(())` when the local store cannot be read.
     fn message(&self, id: &MessageId) -> Result<Option<Vec<u8>>, ()>;
 
-    /// The account's label for the top bar, read again after a sync. `None`
-    /// keeps the label the interface already shows.
-    fn account_label(&self) -> Option<SafeText>;
+    /// The account's label for the top bar, read again after every finished
+    /// sync: the stored Gmail address when there is one, otherwise the
+    /// account id.
+    fn account_label(&self) -> SafeText;
 }
 
 /// Work that finishes later, on the network thread.
@@ -477,15 +478,13 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
             }
             Done::Synced(result) => {
                 worker.syncing = false;
-                // The start-up sync is when a first-session store gains the
-                // account's Gmail address; the label is read again so the bar
-                // shows it instead of the opaque id. A failed sync has not
-                // stored one, and `None` keeps the current label.
-                if result.is_ok()
-                    && let Some(label) = source.account_label()
-                {
-                    app.account = label;
-                }
+                // The label follows the store after every finished sync,
+                // success or failure: the start-up sync is when a
+                // first-session store gains the account's Gmail address, and
+                // an identity mismatch clears it, so even a failed sync must
+                // drop the bar back to the id instead of keeping a previous
+                // identity's address.
+                app.account = source.account_label();
                 // Read again as many rows as were loaded, so the selection
                 // and the list stay where they were; later pages follow. A
                 // failed sync may have stored envelopes before failing, so
@@ -859,8 +858,8 @@ mod tests {
             Ok(None)
         }
 
-        fn account_label(&self) -> Option<SafeText> {
-            None
+        fn account_label(&self) -> SafeText {
+            SafeText::single_line("acct")
         }
     }
 
@@ -922,8 +921,8 @@ mod tests {
             Ok(None)
         }
 
-        fn account_label(&self) -> Option<SafeText> {
-            None
+        fn account_label(&self) -> SafeText {
+            SafeText::single_line("acct")
         }
     }
 
@@ -992,8 +991,8 @@ mod tests {
                 Ok(None)
             }
 
-            fn account_label(&self) -> Option<SafeText> {
-                None
+            fn account_label(&self) -> SafeText {
+                SafeText::single_line("acct")
             }
         }
         let source = OlderFail(Pages::new(1_234));
@@ -1031,8 +1030,8 @@ mod tests {
                 Ok(None)
             }
 
-            fn account_label(&self) -> Option<SafeText> {
-                None
+            fn account_label(&self) -> SafeText {
+                SafeText::single_line("acct")
             }
         }
         let source = FailAfterSync(Pages::new(1_234), std::cell::Cell::new(false));
@@ -1114,8 +1113,10 @@ mod tests {
         assert!(matches!(app.sync, SyncState::Failed(_)));
     }
 
-    /// A cache whose top-bar label appears once a sync succeeds, like a store
-    /// that gains the account's Gmail address on the start-up sync.
+    /// A cache whose stored Gmail address appears and disappears between
+    /// syncs, like a store that gains it on the start-up sync and loses it on
+    /// an identity mismatch. The label is the stored address when there is
+    /// one, otherwise the account id.
     struct Labeled(Pages, std::cell::RefCell<Option<SafeText>>);
 
     impl MailSource for Labeled {
@@ -1127,13 +1128,16 @@ mod tests {
             Ok(None)
         }
 
-        fn account_label(&self) -> Option<SafeText> {
-            self.1.borrow().clone()
+        fn account_label(&self) -> SafeText {
+            self.1
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| SafeText::single_line("acct_1234"))
         }
     }
 
     #[test]
-    fn a_successful_sync_picks_up_the_top_bar_label() {
+    fn every_finished_sync_picks_up_the_top_bar_label() {
         let source = Labeled(Pages::new(2), std::cell::RefCell::new(None));
         let mut app = App::new(
             SafeText::single_line("acct_1234"),
@@ -1146,14 +1150,17 @@ mod tests {
             "no stored label yet keeps the id"
         );
         // The start-up sync stored the account's Gmail address; the next
-        // successful sync shows it on the bar.
+        // finished sync shows it on the bar.
         *source.1.borrow_mut() = Some(SafeText::single_line("me@example.com"));
         finished_sync(&mut app, &source, Ok(()));
         assert_eq!(app.account.as_str(), "me@example.com");
-        // A failed sync has not stored an address, so the label stays.
-        *source.1.borrow_mut() = Some(SafeText::single_line("other@example.com"));
+        // An identity mismatch clears the address, and its sync may fail
+        // after the clear; the bar must not keep the replaced identity's
+        // address, so the failed sync reads the store again and falls back
+        // to the id.
+        *source.1.borrow_mut() = None;
         finished_sync(&mut app, &source, Err("offline".to_owned()));
-        assert_eq!(app.account.as_str(), "me@example.com");
+        assert_eq!(app.account.as_str(), "acct_1234");
     }
 
     #[test]

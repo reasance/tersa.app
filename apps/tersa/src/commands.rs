@@ -519,13 +519,17 @@ impl crate::tui::MailSource for StoreSource {
             .map_err(|_error| ())
     }
 
-    fn account_label(&self) -> Option<SafeText> {
-        // A failed read keeps the label the interface already shows.
+    fn account_label(&self) -> SafeText {
+        // A failed read falls back to the id, like a store with no address
+        // yet.
         self.store
             .load_email_address(&self.account)
             .ok()
             .flatten()
-            .map(|email| SafeText::single_line(email.as_str()))
+            .map_or_else(
+                || SafeText::single_line(self.account.as_str()),
+                |email| SafeText::single_line(email.as_str()),
+            )
     }
 }
 
