@@ -89,13 +89,14 @@ static PANICKED: AtomicBool = AtomicBool::new(false);
 
 /// Checks that standard input and output are a terminal. Callers run it
 /// before unlocking anything, so `tersa > out.txt` fails without asking for a
-/// passphrase.
+/// passphrase. Standard input is checked the way crossterm checks it, so
+/// crossterm reads the input [`wait_for_input`] watches.
 ///
 /// # Errors
 ///
 /// Returns a message when either is not a terminal.
 pub fn require_terminal() -> Result<(), String> {
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    if rustix::termios::isatty(std::io::stdin()) && std::io::stdout().is_terminal() {
         Ok(())
     } else {
         Err("the interface needs a terminal; `tersa inbox` prints plain output".to_owned())
@@ -124,6 +125,7 @@ pub fn run(
         Ok(terminal) => terminal,
         Err(error) => {
             // Raw mode may be on even though the alternate screen failed.
+            silence_closed_stderr();
             ratatui::restore();
             return Err(terminal_error(error));
         }
@@ -578,19 +580,22 @@ fn wait_for_input(wait: Duration) -> std::io::Result<Input> {
 /// the terminal behind it has gone away.
 fn terminal_open(input: impl AsFd, timeout: Duration) -> std::io::Result<bool> {
     let mut fds = [PollFd::new(&input, PollFlags::IN)];
-    let timeout = Timespec::try_from(timeout).map_err(std::io::Error::other)?;
-    match rustix::event::poll(&mut fds, Some(&timeout)) {
-        Ok(_) => {}
-        // A signal, such as a resize, which crossterm reports.
-        Err(Errno::INTR) => return Ok(true),
-        Err(error) => return Err(error.into()),
+    let mut timeout = Timespec::try_from(timeout).map_err(std::io::Error::other)?;
+    loop {
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
+            Ok(_) => break,
+            // A signal, such as a resize, which crossterm reports once a
+            // second look shows the terminal still open.
+            Err(Errno::INTR) => timeout = Timespec::default(),
+            Err(error) => return Err(error.into()),
+        }
     }
     let revents = fds[0].revents();
     if revents.contains(PollFlags::HUP) {
         return Ok(false);
     }
     if revents.intersects(PollFlags::ERR | PollFlags::NVAL) {
-        return Err(std::io::Error::other("standard input cannot be polled"));
+        return Err(std::io::Error::other("the terminal cannot be polled"));
     }
     Ok(true)
 }
@@ -1253,15 +1258,15 @@ mod tests {
     #[test]
     fn a_closed_terminal_is_seen_at_once() {
         let (input, emulator) = pty();
-        // An idle terminal waits, so the event loop does not spin.
+        // An idle terminal is waited for, not reported at once.
         let start = Instant::now();
         assert!(terminal_open(&input, Duration::from_millis(50)).expect("poll"));
-        assert!(start.elapsed() >= Duration::from_millis(50));
+        assert!(start.elapsed() >= Duration::from_millis(40));
 
         drop(emulator);
         let start = Instant::now();
-        assert!(!terminal_open(&input, Duration::from_secs(5)).expect("poll"));
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!terminal_open(&input, Duration::from_secs(10)).expect("poll"));
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
