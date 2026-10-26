@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use tersa_presentation::message::{BodyFormat, RenderedMessage};
 use tersa_presentation::terminal::SafeText;
 
-use super::app::{App, Body, MessageView, Row, Screen, SyncState};
+use super::app::{App, Body, MessageView, Row, Screen, SyncState, account_tag};
 use super::wrap::{truncate, width, wrap, wrap_chars};
 use crate::dates;
 
@@ -47,12 +47,21 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, now_millis: i64) {
     .areas(frame.area());
     app.page = usize::from(main.height).max(1);
     draw_top(frame, top, app, now_millis);
+    // The open message's account is named on its header when several
+    // accounts share the interface; read before the view borrows the screen.
+    let account = match (&app.screen, app.accounts.len() > 1) {
+        (Screen::Message(view), true) => Some(app.account_label(&view.key.0).to_owned()),
+        _ => None,
+    };
     if matches!(app.screen, Screen::Inbox) {
         keep_selection_visible(app);
         draw_inbox(frame, main, app, now_millis);
     } else if let Screen::Message(view) = &mut app.screen {
-        let row = app.rows.iter().find(|row| row.id == view.id);
-        draw_message(frame, main, view, row, app.page);
+        let row = app
+            .rows
+            .iter()
+            .find(|row| row.account == view.key.0 && row.id == view.key.1);
+        draw_message(frame, main, view, row, account.as_deref(), app.page);
     }
     draw_bottom(frame, bottom, app);
     if app.help {
@@ -89,7 +98,7 @@ fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
     let left = Line::from(vec![
         Span::styled(" tersa", bold()),
         Span::styled("  ", dim()),
-        Span::raw(truncate(app.account.as_str(), room)),
+        Span::raw(truncate(&app.account_heading(), room)),
         Span::styled(tail, dim()),
     ]);
     let sync_width = u16::try_from(width(&sync))
@@ -176,18 +185,35 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
         return;
     }
     let total = usize::from(area.width);
+    // With one account the rows carry no tag: the bar already names it.
+    let tagged = app.accounts.len() > 1;
     let lines: Vec<Line<'_>> = (app.list_offset..app.shown.len())
         .take(usize::from(area.height))
         .filter_map(|position| Some((position, app.shown_row(position)?)))
-        .map(|(position, row)| inbox_line(row, position == app.selected, total, now_millis))
+        .map(|(position, row)| {
+            let tag = tagged.then(|| app.account_label(&row.account));
+            inbox_line(row, position == app.selected, total, now_millis, tag)
+        })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn inbox_line(row: &Row, selected: bool, total: usize, now_millis: i64) -> Line<'static> {
+/// The list tag holds at most this many columns of an account label.
+const TAG_WIDTH: usize = 12;
+/// The tag column: the tag plus the space that follows it, so the senders
+/// and subjects of every row stay aligned.
+const TAG_COLUMN: usize = TAG_WIDTH + 2;
+
+fn inbox_line(
+    row: &Row,
+    selected: bool,
+    total: usize,
+    now_millis: i64,
+    tag: Option<&str>,
+) -> Line<'static> {
     let sender_width = (total / 4).clamp(10, 24);
     let date = dates::short(row.received_at_millis, now_millis);
-    let fixed = 2 + DATE_WIDTH + 2 + sender_width + 2;
+    let fixed = 2 + DATE_WIDTH + 2 + tag.map_or(0, |_| TAG_COLUMN) + sender_width + 2;
     let remaining = total.saturating_sub(fixed);
     let subject = truncate(row.subject.as_str(), remaining);
     let preview_room = remaining.saturating_sub(width(&subject) + 3);
@@ -195,15 +221,21 @@ fn inbox_line(row: &Row, selected: bool, total: usize, now_millis: i64) -> Line<
     let mut spans = vec![
         Span::styled(if row.unread { "● " } else { "  " }, weight),
         Span::styled(format!("{date:>DATE_WIDTH$}  "), dim()),
-        Span::styled(
-            pad(
-                &truncate(row.sender.as_str(), sender_width),
-                sender_width + 2,
-            ),
-            weight,
-        ),
-        Span::styled(subject, weight),
     ];
+    if let Some(label) = tag {
+        spans.push(Span::styled(
+            pad(&truncate(account_tag(label), TAG_WIDTH), TAG_COLUMN),
+            dim(),
+        ));
+    }
+    spans.push(Span::styled(
+        pad(
+            &truncate(row.sender.as_str(), sender_width),
+            sender_width + 2,
+        ),
+        weight,
+    ));
+    spans.push(Span::styled(subject, weight));
     if preview_room > 4 && !row.preview.as_str().is_empty() {
         spans.push(Span::styled(
             format!(" · {}", truncate(row.preview.as_str(), preview_room)),
@@ -230,6 +262,7 @@ fn draw_message(
     area: Rect,
     view: &mut MessageView,
     row: Option<&Row>,
+    account: Option<&str>,
     page: usize,
 ) {
     let columns = area.width.saturating_sub(2).max(1);
@@ -238,7 +271,10 @@ fn draw_message(
         .as_ref()
         .is_none_or(|(cached, _)| *cached != columns)
     {
-        view.layout = Some((columns, message_lines(view, row, usize::from(columns))));
+        view.layout = Some((
+            columns,
+            message_lines(view, row, account, usize::from(columns)),
+        ));
     }
     let lines = view
         .layout
@@ -254,14 +290,20 @@ fn draw_message(
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
-fn message_lines(view: &MessageView, row: Option<&Row>, columns: usize) -> Vec<StyledLine> {
+fn message_lines(
+    view: &MessageView,
+    row: Option<&Row>,
+    account: Option<&str>,
+    columns: usize,
+) -> Vec<StyledLine> {
     let mut lines = Vec::new();
     match &view.body {
-        Body::Rendered(rendered) => rendered_lines(rendered, row, columns, &mut lines),
+        Body::Rendered(rendered) => rendered_lines(rendered, row, account, columns, &mut lines),
         Body::NotCached | Body::Downloading | Body::DownloadFailed(_) | Body::Failed => {
             if let Some(row) = row {
                 push_wrapped(&mut lines, row.subject.as_str(), columns, bold());
                 header(&mut lines, "From", row.sender.as_str(), columns);
+                header(&mut lines, "Account", account.unwrap_or_default(), columns);
                 header(
                     &mut lines,
                     "Date",
@@ -301,6 +343,7 @@ fn message_lines(view: &MessageView, row: Option<&Row>, columns: usize) -> Vec<S
 fn rendered_lines(
     rendered: &RenderedMessage,
     row: Option<&Row>,
+    account: Option<&str>,
     columns: usize,
     lines: &mut Vec<StyledLine>,
 ) {
@@ -310,6 +353,7 @@ fn rendered_lines(
     };
     push_wrapped(lines, subject, columns, bold());
     header(lines, "From", rendered.from.as_str(), columns);
+    header(lines, "Account", account.unwrap_or_default(), columns);
     header(lines, "To", rendered.to.as_str(), columns);
     header(lines, "Cc", rendered.cc.as_str(), columns);
     if let Some(row) = row {
@@ -469,13 +513,13 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use tersa_application::mailbox::MessageId;
+    use tersa_application::mailbox::{AccountId, MessageId};
     use tersa_presentation::terminal::SafeText;
 
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::draw;
-    use crate::tui::app::{App, Row, SyncState};
+    use crate::tui::app::{App, MessageKey, Row, SyncState};
 
     fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -492,14 +536,29 @@ mod tests {
             .collect()
     }
 
+    fn account(text: &str) -> AccountId {
+        AccountId::new(text).expect("account")
+    }
+
+    fn key(account_text: &str, id_text: &str) -> MessageKey {
+        (account(account_text), MessageId::new(id_text).expect("id"))
+    }
+
+    fn labeled(labels: &[&str]) -> Vec<(AccountId, SafeText)> {
+        labels
+            .iter()
+            .map(|label| (account(label), SafeText::single_line(label)))
+            .collect()
+    }
+
     fn row(sender: &str, subject: &str, unread: bool) -> Row {
-        Row::sample("m", sender, subject, unread)
+        Row::sample("acct", "m", sender, subject, unread)
     }
 
     #[test]
     fn inbox_rows_fit_the_width_and_mark_unread() {
         let mut app = App::new(
-            SafeText::single_line("acct_1234"),
+            labeled(&["acct_1234"]),
             vec![
                 row("Ann", "Hello there", true),
                 row(
@@ -532,6 +591,60 @@ mod tests {
     }
 
     #[test]
+    fn several_accounts_share_the_bar_and_tag_their_rows() {
+        // One account: the bar names it alone and the rows carry no tag.
+        let mut app = App::new(labeled(&["acct_single"]), vec![row("Ann", "Lunch", true)]);
+        let lines = screen(&mut app, 60, 4);
+        assert!(lines[0].starts_with(" tersa  acct_single  ·  1 message"));
+        assert!(
+            !lines[1].contains("acct_single"),
+            "with one account the bar names it, not the rows: {lines:?}"
+        );
+        app.show_message(key("acct_single", "m"), Ok(None));
+        assert!(
+            !screen(&mut app, 60, 8).join("\n").contains("Account:"),
+            "one account needs no per-message header"
+        );
+
+        // Two accounts: the bar counts and every row carries its tag, cut to
+        // the tag width.
+        let accounts = vec![
+            (account("acct_a"), SafeText::single_line("ann@example.com")),
+            (
+                account("acct_b"),
+                SafeText::single_line("bob-newsletters.example"),
+            ),
+        ];
+        let mut app = App::new(
+            accounts,
+            vec![
+                Row::sample("acct_a", "a", "Ann", "Lunch", true),
+                Row::sample("acct_b", "b", "Bob", "Report", false),
+            ],
+        );
+        let lines = screen(&mut app, 90, 5);
+        assert!(
+            lines[0].starts_with(" tersa  2 accounts  ·  2 messages"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains(&format!("ann{}Ann", " ".repeat(11))),
+            "the tag takes its column, then the sender: {lines:?}"
+        );
+        assert!(
+            lines[2].contains(&format!("bob-newslet…{}Bob", " ".repeat(2))),
+            "a tag without `@` shows whole, cut to the width: {lines:?}"
+        );
+        // The open message names its account in full.
+        app.show_message(key("acct_a", "a"), Ok(None));
+        let lines = screen(&mut app, 60, 8);
+        assert!(
+            lines.join("\n").contains("Account: ann@example.com"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
     fn hostile_text_never_reaches_the_screen_as_controls() {
         use tersa_application::mailbox::{
             HeaderText, MessageEnvelope, MessageId, ThreadId, UnixTimestampMillis,
@@ -547,7 +660,7 @@ mod tests {
             UnixTimestampMillis::new(1_760_990_000_000).expect("time"),
             true,
         );
-        let hostile = Row::from_envelope(&envelope);
+        let hostile = Row::from_envelope(&envelope, &account("acct"));
         // ratatui also drops graphemes that hold control characters, so only
         // the row itself shows whether SafeText removed them.
         assert_eq!(hostile.preview.as_str(), "]52;c;cGF5bG9hZA==pre31mview");
@@ -565,7 +678,7 @@ mod tests {
             );
         }
         // Bidi controls are printable to ratatui, so the screen check matters.
-        let mut app = App::new(SafeText::single_line("acct"), vec![hostile]);
+        let mut app = App::new(labeled(&["acct"]), vec![hostile]);
         for line in screen(&mut app, 80, 4) {
             assert!(
                 !line.chars().any(|character| character.is_control()
@@ -580,11 +693,8 @@ mod tests {
     fn an_open_message_shows_headers_body_and_links() {
         let raw = b"From: Ann <ann@example.com>\r\nTo: me@example.com\r\nSubject: Plans\r\n\
 Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>.</p>";
-        let mut app = App::new(
-            SafeText::single_line("acct"),
-            vec![row("Ann", "Plans", true)],
-        );
-        app.show_message(MessageId::new("m").expect("id"), Ok(Some(raw.to_vec())));
+        let mut app = App::new(labeled(&["acct"]), vec![row("Ann", "Plans", true)]);
+        app.show_message(key("acct", "m"), Ok(Some(raw.to_vec())));
         let lines = screen(&mut app, 50, 14);
         let text = lines.join("\n");
         assert!(text.contains("Plans"));
@@ -595,21 +705,21 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
 
     #[test]
     fn tiny_terminals_do_not_panic() {
-        let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "b", true)]);
+        let mut app = App::new(labeled(&["acct"]), vec![row("a", "b", true)]);
         for (width, height) in [(1, 1), (5, 2), (12, 3)] {
             let _ = screen(&mut app, width, height);
             app.help = true;
             let _ = screen(&mut app, width, height);
             app.help = false;
         }
-        app.show_message(MessageId::new("m").expect("id"), Ok(None));
+        app.show_message(key("acct", "m"), Ok(None));
         let _ = screen(&mut app, 3, 3);
     }
 
     #[test]
     fn the_search_line_and_sync_state_are_drawn_safely() {
         let mut app = App::new(
-            SafeText::single_line("acct"),
+            labeled(&["acct"]),
             vec![row("Ann", "Lunch", true), row("Bob", "Report", false)],
         );
         app.sync = SyncState::Running;
@@ -642,7 +752,7 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
 
     #[test]
     fn a_long_query_shows_its_end() {
-        let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "b", true)]);
+        let mut app = App::new(labeled(&["acct"]), vec![row("a", "b", true)]);
         app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         for character in "abcdefghijklmnopqrstuvwxyz".chars() {
             app.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
@@ -658,8 +768,8 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
     fn a_huge_message_is_laid_out_up_to_a_bound() {
         let mut raw = b"Subject: long\r\n\r\n".to_vec();
         raw.extend(b"x\n".repeat(200_000));
-        let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "long", true)]);
-        app.show_message(MessageId::new("m").expect("id"), Ok(Some(raw)));
+        let mut app = App::new(labeled(&["acct"]), vec![row("a", "long", true)]);
+        app.show_message(key("acct", "m"), Ok(Some(raw)));
         let _ = screen(&mut app, 40, 5);
         let crate::tui::app::Screen::Message(view) = &app.screen else {
             panic!("message screen");
@@ -674,8 +784,8 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
         let laid_out_len = |body_lines: usize| {
             let mut raw = b"Subject: long\r\n\r\n".to_vec();
             raw.extend(b"x\n".repeat(body_lines));
-            let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "long", true)]);
-            app.show_message(MessageId::new("m").expect("id"), Ok(Some(raw)));
+            let mut app = App::new(labeled(&["acct"]), vec![row("a", "long", true)]);
+            app.show_message(key("acct", "m"), Ok(Some(raw)));
             let _ = screen(&mut app, 40, 5);
             laid_out(&app)
         };
@@ -700,8 +810,8 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
             anchors.push_str("\">l</a> ");
         }
         let raw = format!("Subject: links\r\nContent-Type: text/html\r\n\r\n<p>{anchors}</p>");
-        let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "links", true)]);
-        app.show_message(MessageId::new("m").expect("id"), Ok(Some(raw.into_bytes())));
+        let mut app = App::new(labeled(&["acct"]), vec![row("a", "links", true)]);
+        app.show_message(key("acct", "m"), Ok(Some(raw.into_bytes())));
         let _ = screen(&mut app, 8, 5);
         let crate::tui::app::Screen::Message(view) = &app.screen else {
             panic!("message screen");
@@ -747,19 +857,16 @@ Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/html\
 <p>body &#27;[31m red &#x9b;1m <a href=\"https://e.com/&#27;]8;;x\">link</a></p>\r\n\
 --b\r\nContent-Type: application/octet-stream\r\n\
 Content-Disposition: attachment; filename=\"\u{1b}[2Jevil\u{202e}fdp.exe\"\r\n\r\nxx\r\n--b--\r\n";
-        let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "b", true)]);
-        app.show_message(
-            MessageId::new("m").expect("id"),
-            Ok(Some(raw.as_bytes().to_vec())),
-        );
+        let mut app = App::new(labeled(&["acct"]), vec![row("a", "b", true)]);
+        app.show_message(key("acct", "m"), Ok(Some(raw.as_bytes().to_vec())));
         let lines = screen(&mut app, 60, 30);
         assert!(lines.join("\n").contains("Attachments"), "{lines:?}");
         assert_no_controls(&lines);
         assert_no_controls(&laid_out(&app));
 
-        app.show_message(MessageId::new("m").expect("id"), Ok(None));
+        app.show_message(key("acct", "m"), Ok(None));
         app.downloaded(
-            MessageId::new("m").expect("id"),
+            key("acct", "m"),
             Err("\u{1b}]52;c;eA==\u{7}\u{202e}offline".to_owned()),
         );
         let lines = screen(&mut app, 60, 12);
@@ -774,8 +881,8 @@ Content-Disposition: attachment; filename=\"\u{1b}[2Jevil\u{202e}fdp.exe\"\r\n\r
         for line in 0..100 {
             raw.extend(format!("line {line}\n").as_bytes());
         }
-        let mut app = App::new(SafeText::single_line("acct"), vec![row("a", "long", true)]);
-        app.show_message(MessageId::new("m").expect("id"), Ok(Some(raw)));
+        let mut app = App::new(labeled(&["acct"]), vec![row("a", "long", true)]);
+        app.show_message(key("acct", "m"), Ok(Some(raw)));
         let _ = screen(&mut app, 40, 12);
         app.key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE));
         for _ in 0..5 {

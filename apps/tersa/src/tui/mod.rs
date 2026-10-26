@@ -28,34 +28,34 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
-use tersa_application::mailbox::{MessageId, StoreLimit};
+use tersa_application::mailbox::{AccountId, MessageId, StoreLimit};
 use tersa_presentation::terminal::SafeText;
 
-pub use app::Row;
 use app::{App, Request, SyncState};
+pub use app::{MessageKey, Row, account_tag};
 
 /// Where the interface reads cached mail from.
 pub trait MailSource {
-    /// Up to `limit` cached rows after `after`, newest first, or from the
-    /// newest when `after` is `None`.
+    /// Up to `limit` cached rows that follow `loaded` in the unified order
+    /// (received time descending, then account and identifier ascending), or
+    /// from the newest when `loaded` is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(())` when any local store cannot be read.
+    fn page(&self, loaded: &[Row], limit: u16) -> Result<Vec<Row>, ()>;
+
+    /// The cached raw message `id` of `account`; `Ok(None)` when only the
+    /// envelope is cached.
     ///
     /// # Errors
     ///
     /// Returns `Err(())` when the local store cannot be read.
-    fn page(&self, after: Option<&Row>, limit: u16) -> Result<Vec<Row>, ()>;
+    fn message(&self, account: &AccountId, id: &MessageId) -> Result<Option<Vec<u8>>, ()>;
 
-    /// The cached raw message `id`; `Ok(None)` when only the envelope is
-    /// cached.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(())` when the local store cannot be read.
-    fn message(&self, id: &MessageId) -> Result<Option<Vec<u8>>, ()>;
-
-    /// The account's label for the top bar, read again after every finished
-    /// sync: the stored Gmail address when there is one, otherwise the
-    /// account id.
-    fn account_label(&self) -> SafeText;
+    /// Every account the source reads, in registry order, each with its
+    /// stored Gmail address or its id. Read again after every finished sync.
+    fn account_labels(&self) -> Vec<(AccountId, SafeText)>;
 }
 
 /// Work that finishes later, on the network thread.
@@ -64,12 +64,12 @@ pub type Pending<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + 'a>>;
 /// Talks to Gmail on the network thread, so the interface stays responsive
 /// while the network is slow. Downloads and syncs may run at the same time.
 pub trait Remote: Send + 'static {
-    /// Downloads, caches, and returns the raw message `id`; fails with a
-    /// short reason for the reader.
-    fn fetch<'a>(&'a self, id: &'a MessageId) -> Pending<'a, Vec<u8>>;
+    /// Downloads, caches, and returns the raw message `id` of `account`;
+    /// fails with a short reason for the reader.
+    fn fetch<'a>(&'a self, account: &'a AccountId, id: &'a MessageId) -> Pending<'a, Vec<u8>>;
 
-    /// Syncs recent mail into the cache; fails with a short reason for the
-    /// reader.
+    /// Syncs recent mail of every account into the cache; fails with a
+    /// short reason for the reader.
     fn sync(&self) -> Pending<'_, ()>;
 }
 
@@ -108,6 +108,15 @@ pub fn require_terminal() -> Result<(), String> {
     }
 }
 
+/// The status line for accounts whose store could not be opened; `None`
+/// when every account opened. It says how many without naming any.
+fn unreadable_status(unreadable: usize) -> Option<String> {
+    (unreadable > 0).then(|| match unreadable {
+        1 => "1 account could not be read; its mail is not shown".to_owned(),
+        count => format!("{count} accounts could not be read; their mail is not shown"),
+    })
+}
+
 /// Runs the interface until the user quits.
 ///
 /// # Errors
@@ -115,15 +124,17 @@ pub fn require_terminal() -> Result<(), String> {
 /// Returns a message when standard input or output is not a terminal, the
 /// cache cannot be read, or the terminal fails.
 pub fn run(
-    account: SafeText,
+    unreadable: usize,
     source: &dyn MailSource,
     remote: Option<Box<dyn Remote>>,
 ) -> Result<(), String> {
     require_terminal()?;
-    let (rows, more) = read_page(source, None, FIRST_PAGE)
+    let accounts = source.account_labels();
+    let (rows, more) = read_page(source, &[], FIRST_PAGE)
         .map_err(|()| "could not read the local mailbox".to_owned())?;
-    let mut app = App::new(account, rows);
+    let mut app = App::new(accounts, rows);
     app.more_rows = more;
+    app.status = unreadable_status(unreadable);
     let mut worker = remote.map(Worker::start);
     // Installs a panic hook that restores the terminal before reporting.
     let mut terminal = match ratatui::try_init() {
@@ -150,16 +161,16 @@ pub fn run(
 
 /// One piece of network work.
 enum Job {
-    Fetch(MessageId),
+    Fetch(MessageKey),
     Sync,
 }
 
 /// A finished piece of network work.
 enum Done {
-    Fetched(MessageId, Result<Vec<u8>, String>),
+    Fetched(MessageKey, Result<Vec<u8>, String>),
     /// The message was no longer open when its turn came, so it was not
     /// downloaded.
-    Skipped(MessageId),
+    Skipped(MessageKey),
     Synced(Result<(), String>),
 }
 
@@ -170,11 +181,11 @@ enum Done {
 struct Worker {
     jobs: tokio::sync::mpsc::UnboundedSender<Job>,
     done: Receiver<Done>,
-    fetching: HashSet<MessageId>,
+    fetching: HashSet<MessageKey>,
     /// The open message. Opening another one stops the download of the
     /// previous one, queued or running, so at most one download runs and
     /// one large message is held in memory at a time.
-    open: tokio::sync::watch::Sender<Option<MessageId>>,
+    open: tokio::sync::watch::Sender<Option<MessageKey>>,
     syncing: bool,
     /// When the last sync started, on both clocks: the monotonic clock stops
     /// while the machine sleeps, the wall clock does not.
@@ -202,20 +213,20 @@ impl Drop for Worker {
     }
 }
 
-/// Downloads `id` unless another message is opened first: then it stops,
+/// Downloads `key` unless another message is opened first: then it stops,
 /// whether it is still queued or already running. Going back to the list
 /// does not stop it, so the message is cached when the reader returns.
 async fn download(
     remote: &dyn Remote,
-    mut open: tokio::sync::watch::Receiver<Option<MessageId>>,
-    id: MessageId,
+    mut open: tokio::sync::watch::Receiver<Option<MessageKey>>,
+    key: MessageKey,
 ) -> Done {
     let other_opened = async {
         loop {
             if open
                 .borrow_and_update()
                 .as_ref()
-                .is_some_and(|open| open != &id)
+                .is_some_and(|open| open != &key)
             {
                 break;
             }
@@ -227,9 +238,9 @@ async fn download(
     };
     // Checked first, so a download queued for a message the reader already
     // left never starts.
-    match first(other_opened, remote.fetch(&id)).await {
-        First::Left(()) => Done::Skipped(id),
-        First::Right(result) => Done::Fetched(id, result),
+    match first(other_opened, remote.fetch(&key.0, &key.1)).await {
+        First::Left(()) => Done::Skipped(key),
+        First::Right(result) => Done::Fetched(key, result),
     }
 }
 
@@ -260,7 +271,7 @@ impl Worker {
     fn start(remote: Box<dyn Remote>) -> Self {
         let (jobs, incoming) = tokio::sync::mpsc::unbounded_channel::<Job>();
         let (outgoing, done) = mpsc::channel();
-        let (open, wanted) = tokio::sync::watch::channel(None::<MessageId>);
+        let (open, wanted) = tokio::sync::watch::channel(None::<MessageKey>);
         let (alive, stopped) = mpsc::channel::<()>();
         std::thread::spawn(move || {
             // Dropped last, once the runtime, its tasks and the remote (with
@@ -309,24 +320,24 @@ impl Worker {
     }
 
     /// Records which message is open, so downloads of others stop.
-    fn set_open(&self, id: Option<&MessageId>) {
+    fn set_open(&self, key: Option<&MessageKey>) {
         self.open.send_if_modified(|open| {
-            let changed = open.as_ref() != id;
+            let changed = open.as_ref() != key;
             if changed {
-                *open = id.cloned();
+                *open = key.cloned();
             }
             changed
         });
     }
 
-    /// Asks for message `id`; returns false when the thread is gone.
-    fn fetch(&mut self, id: &MessageId) -> bool {
-        if self.fetching.contains(id) {
+    /// Asks for the message `key`; returns false when the thread is gone.
+    fn fetch(&mut self, key: &MessageKey) -> bool {
+        if self.fetching.contains(key) {
             return true;
         }
-        let sent = self.jobs.send(Job::Fetch(id.clone())).is_ok();
+        let sent = self.jobs.send(Job::Fetch(key.clone())).is_ok();
         if sent {
-            self.fetching.insert(id.clone());
+            self.fetching.insert(key.clone());
         }
         sent
     }
@@ -372,7 +383,7 @@ fn event_loop(
                 start_sync(worker, app, now);
                 dirty = true;
             }
-            worker.set_open(app.open_id());
+            worker.set_open(app.open_key());
         }
         if dirty || drawn.elapsed() >= REDRAW_EVERY {
             if std::mem::take(&mut app.repaint) {
@@ -410,23 +421,23 @@ fn event_loop(
         };
         dirty = true;
         match app.key(key) {
-            Some(Request::OpenMessage(id)) => {
-                let raw = source.message(&id);
+            Some(Request::OpenMessage(key)) => {
+                let raw = source.message(&key.0, &key.1);
                 let missing = matches!(raw, Ok(None));
-                app.show_message(id.clone(), raw);
+                app.show_message(key.clone(), raw);
                 if let Some(worker) = worker.as_mut()
                     && missing
                 {
-                    worker.set_open(Some(&id));
-                    if worker.fetch(&id) {
-                        app.downloading(&id);
+                    worker.set_open(Some(&key));
+                    if worker.fetch(&key) {
+                        app.downloading(&key);
                     } else {
-                        app.downloaded(id, Err(WORKER_GONE.to_owned()));
+                        app.downloaded(key, Err(WORKER_GONE.to_owned()));
                     }
                 }
             }
-            Some(Request::Reformat(id, preference)) => match source.message(&id) {
-                Ok(Some(raw)) => app.reformat(&id, &raw, preference),
+            Some(Request::Reformat(key, preference)) => match source.message(&key.0, &key.1) {
+                Ok(Some(raw)) => app.reformat(&key, &raw, preference),
                 _ => app.status = Some("The message could not be read again.".to_owned()),
             },
             Some(Request::Sync) => match worker.as_mut() {
@@ -465,26 +476,26 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
         };
         changed = true;
         match done {
-            Done::Fetched(id, result) => {
-                worker.fetching.remove(&id);
-                app.downloaded(id, result);
+            Done::Fetched(key, result) => {
+                worker.fetching.remove(&key);
+                app.downloaded(key, result);
             }
-            Done::Skipped(id) => {
-                worker.fetching.remove(&id);
+            Done::Skipped(key) => {
+                worker.fetching.remove(&key);
                 // Reopened while its skipped job was finishing: ask again.
-                if app.open_id() == Some(&id) && !worker.fetch(&id) {
-                    app.downloaded(id, Err(WORKER_GONE.to_owned()));
+                if app.open_key() == Some(&key) && !worker.fetch(&key) {
+                    app.downloaded(key, Err(WORKER_GONE.to_owned()));
                 }
             }
             Done::Synced(result) => {
                 worker.syncing = false;
-                // The label follows the store after every finished sync,
+                // The labels follow the stores after every finished sync,
                 // success or failure: the start-up sync is when a
                 // first-session store gains the account's Gmail address, and
                 // an identity mismatch clears it, so even a failed sync must
                 // drop the bar back to the id instead of keeping a previous
                 // identity's address.
-                app.account = source.account_label();
+                app.accounts = source.account_labels();
                 // Read again as many rows as were loaded, so the selection
                 // and the list stay where they were; later pages follow. A
                 // failed sync may have stored envelopes before failing, so
@@ -492,7 +503,7 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
                 let loaded = u16::try_from(app.rows.len())
                     .unwrap_or(u16::MAX)
                     .clamp(FIRST_PAGE, StoreLimit::MAX);
-                if let Ok((rows, more)) = read_page(source, None, loaded) {
+                if let Ok((rows, more)) = read_page(source, &[], loaded) {
                     app.reload(rows, more);
                     // Bring back a selection the reload pushed past the rows
                     // read, before the next frame shows another row.
@@ -513,10 +524,10 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
     changed
 }
 
-/// Reads the page after the last loaded row; returns whether it changed the
-/// list.
+/// Reads the page that follows the loaded rows; returns whether it changed
+/// the list.
 fn load_page(app: &mut App, source: &dyn MailSource) -> bool {
-    match read_page(source, app.rows.last(), PAGE) {
+    match read_page(source, &app.rows, PAGE) {
         Ok((rows, more)) => {
             app.more_rows = more;
             app.append(rows);
@@ -527,17 +538,13 @@ fn load_page(app: &mut App, source: &dyn MailSource) -> bool {
     true
 }
 
-/// Reads up to `limit` rows after `after`, and whether older rows follow. It
-/// asks for one row more than it keeps, so a page that ends the cache is not
-/// taken for an unfinished one.
-fn read_page(
-    source: &dyn MailSource,
-    after: Option<&Row>,
-    limit: u16,
-) -> Result<(Vec<Row>, bool), ()> {
+/// Reads up to `limit` rows that follow `loaded` in the unified order, and
+/// whether older rows follow. It asks for one row more than it keeps, so a
+/// page that ends the cache is not taken for an unfinished one.
+fn read_page(source: &dyn MailSource, loaded: &[Row], limit: u16) -> Result<(Vec<Row>, bool), ()> {
     // A read is capped; at the cap a full page counts as unfinished.
     let probe = limit.saturating_add(1).min(StoreLimit::MAX);
-    let mut rows = source.page(after, probe)?;
+    let mut rows = source.page(loaded, probe)?;
     let kept = usize::from(limit);
     let more = rows.len() > kept || (probe == limit && rows.len() == kept);
     rows.truncate(kept);
@@ -552,8 +559,8 @@ fn fail_pending(worker: &mut Worker, app: &mut App, now: i64) -> bool {
         app.synced(Err(WORKER_GONE.to_owned()), now);
         changed = true;
     }
-    for id in std::mem::take(&mut worker.fetching) {
-        app.downloaded(id, Err(WORKER_GONE.to_owned()));
+    for key in std::mem::take(&mut worker.fetching) {
+        app.downloaded(key, Err(WORKER_GONE.to_owned()));
         changed = true;
     }
     changed
@@ -643,15 +650,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
 
-    use tersa_application::mailbox::MessageId;
+    use tersa_application::mailbox::{AccountId, MessageId};
     use tersa_presentation::terminal::SafeText;
 
     use super::app::{Body, Screen};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        App, Done, FIRST_PAGE, MailSource, Pending, Remote, Row, SYNC_EVERY, SyncState,
-        WORKER_GONE, Worker, finish_work, load_page, read_page, terminal_open,
+        App, Done, FIRST_PAGE, MailSource, MessageKey, Pending, Remote, Row, SYNC_EVERY, SyncState,
+        WORKER_GONE, Worker, finish_work, load_page, read_page, terminal_open, unreadable_status,
     };
 
     /// Records the order work finishes in; syncs wait for the test.
@@ -661,9 +668,11 @@ mod tests {
     }
 
     impl Remote for Recorder {
-        fn fetch<'a>(&'a self, id: &'a MessageId) -> Pending<'a, Vec<u8>> {
+        fn fetch<'a>(&'a self, account: &'a AccountId, id: &'a MessageId) -> Pending<'a, Vec<u8>> {
             Box::pin(async move {
-                let _ = self.log.send(format!("fetch {}", id.as_str()));
+                let _ = self
+                    .log
+                    .send(format!("fetch {} {}", account.as_str(), id.as_str()));
                 Ok(Vec::new())
             })
         }
@@ -684,6 +693,22 @@ mod tests {
         MessageId::new(text).expect("id")
     }
 
+    fn account(text: &str) -> AccountId {
+        AccountId::new(text).expect("account")
+    }
+
+    fn key(account_text: &str, id_text: &str) -> MessageKey {
+        (account(account_text), id(id_text))
+    }
+
+    /// The interface over one account with the given labels.
+    fn labeled(labels: &[&str]) -> Vec<(AccountId, SafeText)> {
+        labels
+            .iter()
+            .map(|label| (account(label), SafeText::single_line(label)))
+            .collect()
+    }
+
     #[test]
     fn downloads_finish_while_a_sync_is_still_running() {
         let (log, entries) = mpsc::channel();
@@ -699,13 +724,13 @@ mod tests {
         };
         assert!(worker.sync());
         assert!(worker.sync(), "a second request joins the running sync");
-        worker.set_open(Some(&id("a")));
-        assert!(worker.fetch(&id("a")));
-        assert!(worker.fetch(&id("a")), "a repeat is merged");
-        assert_eq!(next(), "fetch a");
-        worker.set_open(Some(&id("b")));
-        assert!(worker.fetch(&id("b")));
-        assert_eq!(next(), "fetch b");
+        worker.set_open(Some(&key("acct_a", "a")));
+        assert!(worker.fetch(&key("acct_a", "a")));
+        assert!(worker.fetch(&key("acct_a", "a")), "a repeat is merged");
+        assert_eq!(next(), "fetch acct_a a");
+        worker.set_open(Some(&key("acct_a", "b")));
+        assert!(worker.fetch(&key("acct_a", "b")));
+        assert_eq!(next(), "fetch acct_a b");
         release.send(()).expect("release");
         assert_eq!(next(), "sync");
         let mut fetched = 0;
@@ -738,22 +763,22 @@ mod tests {
             log,
             release: Mutex::new(None),
         }));
-        worker.set_open(Some(&id("now")));
+        worker.set_open(Some(&key("acct_a", "now")));
         for stale in ["s1", "s2", "s3", "s4", "s5", "s6"] {
-            assert!(worker.fetch(&id(stale)));
+            assert!(worker.fetch(&key("acct_a", stale)));
         }
-        assert!(worker.fetch(&id("now")));
+        assert!(worker.fetch(&key("acct_a", "now")));
         assert_eq!(
             entries
                 .recv_timeout(Duration::from_secs(5))
                 .expect("work finishes"),
-            "fetch now"
+            "fetch acct_a now"
         );
         let mut skipped = 0;
         for _ in 0..7 {
             match worker.done.recv_timeout(Duration::from_secs(5)) {
                 Ok(Done::Skipped(_)) => skipped += 1,
-                Ok(Done::Fetched(id, Ok(_))) => assert_eq!(id.as_str(), "now"),
+                Ok(Done::Fetched(key, Ok(_))) => assert_eq!(key.1.as_str(), "now"),
                 _ => panic!("unexpected result"),
             }
         }
@@ -772,7 +797,7 @@ mod tests {
     }
 
     impl Remote for Gated {
-        fn fetch<'a>(&'a self, id: &'a MessageId) -> Pending<'a, Vec<u8>> {
+        fn fetch<'a>(&'a self, _account: &'a AccountId, id: &'a MessageId) -> Pending<'a, Vec<u8>> {
             Box::pin(async move {
                 let _ = self.log.send(format!("start {}", id.as_str()));
                 if id.as_str().starts_with("slow") {
@@ -801,18 +826,20 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("work starts")
         };
-        worker.set_open(Some(&id("slow")));
-        assert!(worker.fetch(&id("slow")));
+        worker.set_open(Some(&key("acct_a", "slow")));
+        assert!(worker.fetch(&key("acct_a", "slow")));
         assert_eq!(next(), "start slow");
-        worker.set_open(Some(&id("now")));
-        assert!(worker.fetch(&id("now")));
+        worker.set_open(Some(&key("acct_a", "now")));
+        assert!(worker.fetch(&key("acct_a", "now")));
         assert_eq!(next(), "start now");
         assert_eq!(next(), "fetch now", "it did not wait for the slow one");
         let mut results = Vec::new();
         for _ in 0..2 {
             match worker.done.recv_timeout(Duration::from_secs(5)) {
-                Ok(Done::Skipped(id)) => results.push(format!("skipped {}", id.as_str())),
-                Ok(Done::Fetched(id, Ok(_))) => results.push(format!("fetched {}", id.as_str())),
+                Ok(Done::Skipped(key)) => results.push(format!("skipped {}", key.1.as_str())),
+                Ok(Done::Fetched(key, Ok(_))) => {
+                    results.push(format!("fetched {}", key.1.as_str()));
+                }
                 _ => panic!("unexpected result"),
             }
         }
@@ -833,8 +860,8 @@ mod tests {
             log,
             gate: Arc::clone(&gate),
         }));
-        worker.set_open(Some(&id("slow")));
-        assert!(worker.fetch(&id("slow")));
+        worker.set_open(Some(&key("acct_a", "slow")));
+        assert!(worker.fetch(&key("acct_a", "slow")));
         assert_eq!(
             entries.recv_timeout(Duration::from_secs(5)).expect("start"),
             "start slow"
@@ -843,23 +870,56 @@ mod tests {
         gate.add_permits(1);
         assert!(matches!(
             worker.done.recv_timeout(Duration::from_secs(5)),
-            Ok(Done::Fetched(id, Ok(_))) if id.as_str() == "slow"
+            Ok(Done::Fetched(key, Ok(_))) if key.1.as_str() == "slow"
         ));
+    }
+
+    /// A worker fetch is named by the account and the identifier: the same
+    /// identifier in another account is another message and runs its own
+    /// download.
+    #[test]
+    fn downloads_of_the_same_id_in_two_accounts_run_separately() {
+        let (log, _entries) = mpsc::channel();
+        let mut worker = Worker::start(Box::new(Recorder {
+            log,
+            release: Mutex::new(None),
+        }));
+        // No message is open, so neither download is superseded by another.
+        assert!(worker.fetch(&key("acct_a", "m")));
+        assert!(
+            worker.fetch(&key("acct_b", "m")),
+            "the other account's same id is not merged into the running one"
+        );
+        let mut fetched = Vec::new();
+        for _ in 0..2 {
+            match worker.done.recv_timeout(Duration::from_secs(5)) {
+                Ok(Done::Fetched(key, Ok(_))) => {
+                    fetched.push(format!("{} {}", key.0.as_str(), key.1.as_str()));
+                }
+                _ => panic!("unexpected result"),
+            }
+        }
+        fetched.sort();
+        assert_eq!(
+            fetched,
+            ["acct_a m", "acct_b m"],
+            "each download asks its own account"
+        );
     }
 
     struct Empty;
 
     impl MailSource for Empty {
-        fn page(&self, _after: Option<&Row>, _limit: u16) -> Result<Vec<Row>, ()> {
+        fn page(&self, _loaded: &[Row], _limit: u16) -> Result<Vec<Row>, ()> {
             Ok(Vec::new())
         }
 
-        fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
+        fn message(&self, _account: &AccountId, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
             Ok(None)
         }
 
-        fn account_label(&self) -> SafeText {
-            SafeText::single_line("acct")
+        fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
+            vec![(account("acct"), SafeText::single_line("acct"))]
         }
     }
 
@@ -891,7 +951,7 @@ mod tests {
                         .expect("time"),
                         false,
                     );
-                    Row::from_envelope(&envelope)
+                    Row::from_envelope(&envelope, &account("acct"))
                 })
                 .collect();
             Self {
@@ -902,12 +962,12 @@ mod tests {
     }
 
     impl MailSource for Pages {
-        fn page(&self, after: Option<&Row>, limit: u16) -> Result<Vec<Row>, ()> {
+        fn page(&self, loaded: &[Row], limit: u16) -> Result<Vec<Row>, ()> {
             self.reads.set(self.reads.get() + 1);
-            let start = after.map_or(0, |after| {
+            let start = loaded.last().map_or(0, |last| {
                 self.rows
                     .iter()
-                    .position(|row| row.id == after.id)
+                    .position(|row| row.id == last.id)
                     .map_or(self.rows.len(), |position| position + 1)
             });
             Ok(self.rows[start..]
@@ -917,20 +977,20 @@ mod tests {
                 .collect())
         }
 
-        fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
+        fn message(&self, _account: &AccountId, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
             Ok(None)
         }
 
-        fn account_label(&self) -> SafeText {
-            SafeText::single_line("acct")
+        fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
+            vec![(account("acct"), SafeText::single_line("acct"))]
         }
     }
 
     #[test]
     fn older_rows_load_a_page_at_a_time_and_join_the_search() {
         let source = Pages::new(1_234);
-        let first = source.page(None, FIRST_PAGE).expect("page");
-        let mut app = App::new(SafeText::single_line("acct"), first);
+        let first = source.page(&[], FIRST_PAGE).expect("page");
+        let mut app = App::new(labeled(&["acct"]), first);
         app.more_rows = true;
         // Searching before the older rows arrive still covers them later.
         app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
@@ -961,13 +1021,13 @@ mod tests {
     #[test]
     fn a_page_that_ends_the_cache_is_not_taken_for_an_unfinished_one() {
         let source = Pages::new(100);
-        let (rows, more) = read_page(&source, None, FIRST_PAGE).expect("page");
+        let (rows, more) = read_page(&source, &[], FIRST_PAGE).expect("page");
         assert_eq!(rows.len(), 100);
         assert!(!more, "exactly one first page");
 
         let source = Pages::new(600);
-        let (rows, more) = read_page(&source, None, FIRST_PAGE).expect("page");
-        let mut app = App::new(SafeText::single_line("acct"), rows);
+        let (rows, more) = read_page(&source, &[], FIRST_PAGE).expect("page");
+        let mut app = App::new(labeled(&["acct"]), rows);
         app.more_rows = more;
         while app.more_rows {
             load_page(&mut app, &source);
@@ -980,24 +1040,28 @@ mod tests {
     fn a_failed_older_page_outlasts_the_next_key() {
         struct OlderFail(Pages);
         impl MailSource for OlderFail {
-            fn page(&self, after: Option<&Row>, limit: u16) -> Result<Vec<Row>, ()> {
-                if after.is_some() {
+            fn page(&self, loaded: &[Row], limit: u16) -> Result<Vec<Row>, ()> {
+                if loaded.last().is_some() {
                     return Err(());
                 }
-                self.0.page(after, limit)
+                self.0.page(loaded, limit)
             }
 
-            fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
+            fn message(
+                &self,
+                _account: &AccountId,
+                _id: &MessageId,
+            ) -> Result<Option<Vec<u8>>, ()> {
                 Ok(None)
             }
 
-            fn account_label(&self) -> SafeText {
-                SafeText::single_line("acct")
+            fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
+                vec![(account("acct"), SafeText::single_line("acct"))]
             }
         }
         let source = OlderFail(Pages::new(1_234));
-        let (rows, more) = read_page(&source, None, FIRST_PAGE).expect("page");
-        let mut app = App::new(SafeText::single_line("acct"), rows);
+        let (rows, more) = read_page(&source, &[], FIRST_PAGE).expect("page");
+        let mut app = App::new(labeled(&["acct"]), rows);
         app.more_rows = more;
         app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         for character in "odd".chars() {
@@ -1019,24 +1083,28 @@ mod tests {
     fn a_failed_reload_after_a_sync_stops_paging() {
         struct FailAfterSync(Pages, std::cell::Cell<bool>);
         impl MailSource for FailAfterSync {
-            fn page(&self, after: Option<&Row>, limit: u16) -> Result<Vec<Row>, ()> {
+            fn page(&self, loaded: &[Row], limit: u16) -> Result<Vec<Row>, ()> {
                 if self.1.get() {
                     return Err(());
                 }
-                self.0.page(after, limit)
+                self.0.page(loaded, limit)
             }
 
-            fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
+            fn message(
+                &self,
+                _account: &AccountId,
+                _id: &MessageId,
+            ) -> Result<Option<Vec<u8>>, ()> {
                 Ok(None)
             }
 
-            fn account_label(&self) -> SafeText {
-                SafeText::single_line("acct")
+            fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
+                vec![(account("acct"), SafeText::single_line("acct"))]
             }
         }
         let source = FailAfterSync(Pages::new(1_234), std::cell::Cell::new(false));
-        let (rows, more) = read_page(&source, None, FIRST_PAGE).expect("page");
-        let mut app = App::new(SafeText::single_line("acct"), rows);
+        let (rows, more) = read_page(&source, &[], FIRST_PAGE).expect("page");
+        let mut app = App::new(labeled(&["acct"]), rows);
         app.more_rows = more;
         source.1.set(true);
         finished_sync(&mut app, &source, Ok(()));
@@ -1071,16 +1139,13 @@ mod tests {
     #[test]
     fn a_selection_the_sync_removed_stops_the_catch_up() {
         let mut source = Pages::new(1_234);
-        let mut app = App::new(
-            SafeText::single_line("acct"),
-            source.page(None, 600).expect("page"),
-        );
+        let mut app = App::new(labeled(&["acct"]), source.page(&[], 600).expect("page"));
         app.more_rows = true;
         for _ in 0..599 {
             app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         }
         let newer: Vec<Row> = (0..600)
-            .map(|index| Row::sample(&format!("new{index}"), "Zed", "Fresh", true))
+            .map(|index| Row::sample("acct", &format!("new{index}"), "Zed", "Fresh", true))
             .collect();
         source.rows.retain(|row| row.id.as_str() != "m00599");
         source.rows.splice(0..0, newer);
@@ -1100,13 +1165,13 @@ mod tests {
     fn a_failed_sync_still_reads_the_list_again() {
         let mut source = Pages::new(50);
         let mut app = App::new(
-            SafeText::single_line("acct"),
-            source.page(None, FIRST_PAGE).expect("page"),
+            labeled(&["acct"]),
+            source.page(&[], FIRST_PAGE).expect("page"),
         );
         // Envelopes stored before a later step of the sync failed.
         source
             .rows
-            .insert(0, Row::sample("new", "Zed", "Fresh", true));
+            .insert(0, Row::sample("acct", "new", "Zed", "Fresh", true));
         finished_sync(&mut app, &source, Err("bodies failed".to_owned()));
         assert_eq!(app.rows.len(), 51);
         assert_eq!(app.rows[0].id.as_str(), "new");
@@ -1120,19 +1185,20 @@ mod tests {
     struct Labeled(Pages, std::cell::RefCell<Option<SafeText>>);
 
     impl MailSource for Labeled {
-        fn page(&self, after: Option<&Row>, limit: u16) -> Result<Vec<Row>, ()> {
-            self.0.page(after, limit)
+        fn page(&self, loaded: &[Row], limit: u16) -> Result<Vec<Row>, ()> {
+            self.0.page(loaded, limit)
         }
 
-        fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
+        fn message(&self, _account: &AccountId, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
             Ok(None)
         }
 
-        fn account_label(&self) -> SafeText {
-            self.1
-                .borrow()
-                .clone()
-                .unwrap_or_else(|| SafeText::single_line("acct_1234"))
+        fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
+            let stored = self.1.borrow().clone();
+            vec![(
+                account("acct_1234"),
+                stored.unwrap_or_else(|| SafeText::single_line("acct_1234")),
+            )]
         }
     }
 
@@ -1140,12 +1206,12 @@ mod tests {
     fn every_finished_sync_picks_up_the_top_bar_label() {
         let source = Labeled(Pages::new(2), std::cell::RefCell::new(None));
         let mut app = App::new(
-            SafeText::single_line("acct_1234"),
-            source.page(None, FIRST_PAGE).expect("page"),
+            labeled(&["acct_1234"]),
+            source.page(&[], FIRST_PAGE).expect("page"),
         );
         finished_sync(&mut app, &source, Ok(()));
         assert_eq!(
-            app.account.as_str(),
+            app.accounts[0].1.as_str(),
             "acct_1234",
             "no stored label yet keeps the id"
         );
@@ -1153,23 +1219,20 @@ mod tests {
         // finished sync shows it on the bar.
         *source.1.borrow_mut() = Some(SafeText::single_line("me@example.com"));
         finished_sync(&mut app, &source, Ok(()));
-        assert_eq!(app.account.as_str(), "me@example.com");
+        assert_eq!(app.accounts[0].1.as_str(), "me@example.com");
         // An identity mismatch clears the address, and its sync may fail
         // after the clear; the bar must not keep the replaced identity's
         // address, so the failed sync reads the store again and falls back
         // to the id.
         *source.1.borrow_mut() = None;
         finished_sync(&mut app, &source, Err("offline".to_owned()));
-        assert_eq!(app.account.as_str(), "acct_1234");
+        assert_eq!(app.accounts[0].1.as_str(), "acct_1234");
     }
 
     #[test]
     fn a_sync_reloads_as_many_rows_as_were_loaded() {
         let source = Pages::new(1_234);
-        let mut app = App::new(
-            SafeText::single_line("acct"),
-            source.page(None, 600).expect("page"),
-        );
+        let mut app = App::new(labeled(&["acct"]), source.page(&[], 600).expect("page"));
         app.more_rows = true;
         for _ in 0..300 {
             app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -1183,10 +1246,7 @@ mod tests {
     #[test]
     fn a_selection_pushed_past_the_reload_comes_back_with_its_page() {
         let mut source = Pages::new(1_234);
-        let mut app = App::new(
-            SafeText::single_line("acct"),
-            source.page(None, 600).expect("page"),
-        );
+        let mut app = App::new(labeled(&["acct"]), source.page(&[], 600).expect("page"));
         app.more_rows = true;
         for _ in 0..599 {
             app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -1195,7 +1255,7 @@ mod tests {
         // The sync stored more newer messages than one page holds, so the
         // 600 rows read again end before the selected one.
         let newer: Vec<Row> = (0..600)
-            .map(|index| Row::sample(&format!("new{index}"), "Zed", "Fresh", true))
+            .map(|index| Row::sample("acct", &format!("new{index}"), "Zed", "Fresh", true))
             .collect();
         source.rows.splice(0..0, newer);
         finished_sync(&mut app, &source, Ok(()));
@@ -1226,7 +1286,11 @@ mod tests {
     }
 
     impl Remote for Stalled {
-        fn fetch<'a>(&'a self, _id: &'a MessageId) -> Pending<'a, Vec<u8>> {
+        fn fetch<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            _id: &'a MessageId,
+        ) -> Pending<'a, Vec<u8>> {
             Box::pin(async { Ok(Vec::new()) })
         }
 
@@ -1354,15 +1418,15 @@ mod tests {
         let mut worker = Worker {
             jobs,
             done,
-            fetching: HashSet::from([id("a")]),
-            open: tokio::sync::watch::channel(Some(id("a"))).0,
+            fetching: HashSet::from([key("acct_a", "a")]),
+            open: tokio::sync::watch::channel(Some(key("acct_a", "a"))).0,
             syncing: true,
             last_sync: Some((Instant::now(), SystemTime::now())),
             stopped: mpsc::channel().1,
         };
-        let mut app = App::new(SafeText::single_line("me@example.com"), Vec::new());
-        app.show_message(id("a"), Ok(None));
-        app.downloading(&id("a"));
+        let mut app = App::new(labeled(&["acct_a"]), Vec::new());
+        app.show_message(key("acct_a", "a"), Ok(None));
+        app.downloading(&key("acct_a", "a"));
         assert!(finish_work(&mut worker, &mut app, &Empty, 0));
         assert!(matches!(&app.sync, SyncState::Failed(error) if error == WORKER_GONE));
         assert!(
@@ -1390,5 +1454,18 @@ mod tests {
         assert!(worker.sync_due());
         worker.last_sync = Some((Instant::now(), SystemTime::now()));
         assert!(!worker.sync_due());
+    }
+
+    #[test]
+    fn unreadable_accounts_are_reported_without_identity() {
+        assert_eq!(unreadable_status(0), None);
+        assert_eq!(
+            unreadable_status(1).as_deref(),
+            Some("1 account could not be read; its mail is not shown")
+        );
+        assert_eq!(
+            unreadable_status(2).as_deref(),
+            Some("2 accounts could not be read; their mail is not shown")
+        );
     }
 }

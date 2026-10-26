@@ -5,7 +5,7 @@
 //! Interface state and key handling, free of terminal I/O so it can be tested.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tersa_application::mailbox::{MessageEnvelope, MessageId};
+use tersa_application::mailbox::{AccountId, MessageEnvelope, MessageId};
 use tersa_presentation::html::decode_entities;
 use tersa_presentation::message::{BodyFormat, BodyPreference, RenderedMessage, render_message};
 use tersa_presentation::terminal::SafeText;
@@ -13,9 +13,14 @@ use tersa_presentation::terminal::SafeText;
 /// The longest search query, in bytes.
 const MAX_QUERY_LEN: usize = 256;
 
+/// One message of one account. Gmail identifiers are only unique within one
+/// mailbox, so everything that names a message goes through both.
+pub type MessageKey = (AccountId, MessageId);
+
 /// One inbox row, already sanitized.
 #[derive(Clone, Debug)]
 pub struct Row {
+    pub account: AccountId,
     pub id: MessageId,
     pub sender: SafeText,
     pub subject: SafeText,
@@ -28,9 +33,10 @@ pub struct Row {
 }
 
 impl Row {
-    pub fn from_envelope(envelope: &MessageEnvelope) -> Self {
+    pub fn from_envelope(envelope: &MessageEnvelope, account: &AccountId) -> Self {
         let from = SafeText::single_line(envelope.from().as_str());
         Self::new(
+            account.clone(),
             envelope.message_id().clone(),
             &from,
             SafeText::single_line(sender_name(from.as_str())),
@@ -42,7 +48,12 @@ impl Row {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one row's fields, each of them needed"
+    )]
     fn new(
+        account: AccountId,
         id: MessageId,
         from: &SafeText,
         sender: SafeText,
@@ -59,6 +70,7 @@ impl Row {
         )
         .to_lowercase();
         Self {
+            account,
             id,
             sender,
             subject,
@@ -76,10 +88,17 @@ impl Row {
             .all(|word| self.haystack.contains(word.as_str()))
     }
 
+    /// The row's account and identifier, the key a request or a download
+    /// goes through.
+    pub fn message_key(&self) -> MessageKey {
+        (self.account.clone(), self.id.clone())
+    }
+
     #[cfg(test)]
-    pub fn sample(id: &str, sender: &str, subject: &str, unread: bool) -> Self {
+    pub fn sample(account: &str, id: &str, sender: &str, subject: &str, unread: bool) -> Self {
         let sender = SafeText::single_line(sender);
         Self::new(
+            AccountId::new(account).expect("account"),
             MessageId::new(id).expect("id"),
             &sender,
             sender.clone(),
@@ -88,6 +107,16 @@ impl Row {
             1_760_990_000_000,
             unread,
         )
+    }
+}
+
+/// The short form of an account label shown before the sender when several
+/// accounts share one list: the label up to (not including) its `@`, or the
+/// whole label when it has none.
+pub fn account_tag(label: &str) -> &str {
+    match label.split_once('@') {
+        Some((name, _)) => name,
+        None => label,
     }
 }
 
@@ -131,7 +160,7 @@ pub enum Body {
 /// An open message and its scroll position.
 #[derive(Debug)]
 pub struct MessageView {
-    pub id: MessageId,
+    pub key: MessageKey,
     pub body: Body,
     pub preference: BodyPreference,
     pub scroll: usize,
@@ -170,12 +199,12 @@ pub struct Search {
 /// Work the interface needs from the outside world.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
-    /// Load the cached message with this identifier.
-    OpenMessage(MessageId),
+    /// Load the cached message named by this account and identifier.
+    OpenMessage(MessageKey),
     /// Read the open message again to show it in this format; raw messages
     /// can be large, so they are not kept in memory.
-    Reformat(MessageId, BodyPreference),
-    /// Sync the account now.
+    Reformat(MessageKey, BodyPreference),
+    /// Sync the accounts now.
     Sync,
 }
 
@@ -183,7 +212,9 @@ pub enum Request {
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools, reason = "independent interface flags")]
 pub struct App {
-    pub account: SafeText,
+    /// Every account the source reads, in registry order, each with its
+    /// stored Gmail address or its id.
+    pub accounts: Vec<(AccountId, SafeText)>,
     /// Every loaded row, newest first.
     pub rows: Vec<Row>,
     /// Indexes into `rows` of the rows the list shows, in order.
@@ -212,24 +243,26 @@ pub struct App {
     /// The row selected before a reload pushed it past the reloaded rows,
     /// with its received time; it is selected again when its page arrives,
     /// unless a key comes first.
-    pending_selection: Option<(MessageId, i64)>,
+    pending_selection: Option<(MessageKey, i64)>,
     /// Whether the status line counts the matches of a finished search, so
     /// pages that arrive later update it.
     counting_matches: bool,
 }
 
-/// Whether `row` comes after the message `id` received at `received_at` in
-/// the listing order: received time descending, then identifier ascending.
-fn listed_after(row: &Row, id: &MessageId, received_at: i64) -> bool {
+/// Whether `row` comes after the message `key` received at `received_at` in
+/// the unified order: received time descending, then account and identifier
+/// ascending.
+fn listed_after(row: &Row, key: &MessageKey, received_at: i64) -> bool {
     row.received_at_millis < received_at
-        || (row.received_at_millis == received_at && row.id.as_str() > id.as_str())
+        || (row.received_at_millis == received_at
+            && (row.account.as_str(), row.id.as_str()) > (key.0.as_str(), key.1.as_str()))
 }
 
 impl App {
-    pub fn new(account: SafeText, rows: Vec<Row>) -> Self {
+    pub fn new(accounts: Vec<(AccountId, SafeText)>, rows: Vec<Row>) -> Self {
         let shown = (0..rows.len()).collect();
         Self {
-            account,
+            accounts,
             rows,
             shown,
             selected: 0,
@@ -260,10 +293,29 @@ impl App {
             .and_then(|&index| self.rows.get(index))
     }
 
-    fn position_of(&self, id: &MessageId) -> Option<usize> {
-        self.shown
+    /// The label of `account`: its stored Gmail address, or its id.
+    pub fn account_label<'a>(&'a self, account: &'a AccountId) -> &'a str {
+        self.accounts
             .iter()
-            .position(|&index| self.rows.get(index).is_some_and(|row| &row.id == id))
+            .find(|(known, _)| known == account)
+            .map_or(account.as_str(), |(_, label)| label.as_str())
+    }
+
+    /// The account text of the top bar: the one account's label, or how many
+    /// accounts the list draws from.
+    pub fn account_heading(&self) -> String {
+        match self.accounts.len() {
+            1 => self.accounts[0].1.as_str().to_owned(),
+            count => format!("{count} accounts"),
+        }
+    }
+
+    fn position_of(&self, key: &MessageKey) -> Option<usize> {
+        self.shown.iter().position(|&index| {
+            self.rows
+                .get(index)
+                .is_some_and(|row| row.account == key.0 && row.id == key.1)
+        })
     }
 
     /// Whether a search is narrowing the list.
@@ -279,14 +331,14 @@ impl App {
         let rows = &self.rows;
         self.shown
             .extend((start..rows.len()).filter(|&index| rows[index].matches(&words)));
-        if let Some((id, received_at)) = self.pending_selection.clone() {
-            if let Some(position) = self.position_of(&id) {
+        if let Some((key, received_at)) = self.pending_selection.clone() {
+            if let Some(position) = self.position_of(&key) {
                 self.selected = position;
                 self.pending_selection = None;
             } else if self
                 .rows
                 .last()
-                .is_some_and(|last| listed_after(last, &id, received_at))
+                .is_some_and(|last| listed_after(last, &key, received_at))
             {
                 // The listing has passed where it would be: the sync removed it.
                 self.pending_selection = None;
@@ -300,7 +352,7 @@ impl App {
     pub fn reload(&mut self, rows: Vec<Row>, more: bool) {
         let selected = self
             .shown_row(self.selected)
-            .map(|row| (row.id.clone(), row.received_at_millis));
+            .map(|row| (row.message_key(), row.received_at_millis));
         self.rows = rows;
         self.more_rows = more;
         self.rows_unreadable = false;
@@ -368,7 +420,7 @@ impl App {
     }
 
     fn set_query(&mut self, query: String) {
-        let selected = self.shown_row(self.selected).map(|row| row.id.clone());
+        let selected = self.shown_row(self.selected).map(Row::message_key);
         self.search.query = query;
         self.selected = 0;
         self.list_offset = 0;
@@ -430,7 +482,7 @@ impl App {
                 match key.code {
                     KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self
                         .shown_row(self.selected)
-                        .map(|row| Request::OpenMessage(row.id.clone())),
+                        .map(|row| Request::OpenMessage(row.message_key())),
                     KeyCode::Char('/') => {
                         self.search.editing = true;
                         self.set_query(String::new());
@@ -509,26 +561,26 @@ impl App {
         let Screen::Message(view) = &self.screen else {
             return None;
         };
-        let current = self.position_of(&view.id).unwrap_or(self.selected);
+        let current = self.position_of(&view.key).unwrap_or(self.selected);
         let next = current.checked_add_signed(delta)?;
-        let request = Request::OpenMessage(self.shown_row(next)?.id.clone());
+        let request = Request::OpenMessage(self.shown_row(next)?.message_key());
         self.selected = next;
         Some(request)
     }
 
-    /// Shows the message `id` with its cached raw bytes, if any.
-    pub fn show_message(&mut self, id: MessageId, raw: Result<Option<Vec<u8>>, ()>) {
+    /// Shows the message `key` with its cached raw bytes, if any.
+    pub fn show_message(&mut self, key: MessageKey, raw: Result<Option<Vec<u8>>, ()>) {
         let body = match raw {
             Ok(Some(raw)) => Body::Rendered(Box::new(render_message(&raw, self.preference))),
             Ok(None) => Body::NotCached,
             Err(()) => Body::Failed,
         };
-        if let Some(position) = self.position_of(&id) {
+        if let Some(position) = self.position_of(&key) {
             self.selected = position;
         }
         self.repaint = true;
         self.screen = Screen::Message(MessageView {
-            id,
+            key,
             body,
             preference: self.preference,
             scroll: 0,
@@ -536,22 +588,22 @@ impl App {
         });
     }
 
-    fn is_open(&self, id: &MessageId) -> bool {
-        self.open_id() == Some(id)
+    fn is_open(&self, key: &MessageKey) -> bool {
+        self.open_key() == Some(key)
     }
 
-    /// The open message, if any.
-    pub fn open_id(&self) -> Option<&MessageId> {
+    /// The open message's account and identifier, if any.
+    pub fn open_key(&self) -> Option<&MessageKey> {
         match &self.screen {
-            Screen::Message(view) => Some(&view.id),
+            Screen::Message(view) => Some(&view.key),
             Screen::Inbox => None,
         }
     }
 
     /// Marks the open message as downloading.
-    pub fn downloading(&mut self, id: &MessageId) {
+    pub fn downloading(&mut self, key: &MessageKey) {
         if let Screen::Message(view) = &mut self.screen
-            && &view.id == id
+            && &view.key == key
         {
             view.body = Body::Downloading;
             view.layout = None;
@@ -561,12 +613,12 @@ impl App {
 
     /// Takes a finished download. It is shown only if that message is still
     /// open; it is cached either way.
-    pub fn downloaded(&mut self, id: MessageId, result: Result<Vec<u8>, String>) {
-        if !self.is_open(&id) {
+    pub fn downloaded(&mut self, key: MessageKey, result: Result<Vec<u8>, String>) {
+        if !self.is_open(&key) {
             return;
         }
         match result {
-            Ok(raw) => self.show_message(id, Ok(Some(raw))),
+            Ok(raw) => self.show_message(key, Ok(Some(raw))),
             Err(error) => {
                 if let Screen::Message(view) = &mut self.screen {
                     view.body = Body::DownloadFailed(error);
@@ -601,15 +653,15 @@ impl App {
             Some(BodyFormat::Html) => BodyPreference::Plain,
             _ => BodyPreference::Html,
         };
-        Some(Request::Reformat(view.id.clone(), other))
+        Some(Request::Reformat(view.key.clone(), other))
     }
 
-    /// Shows the open message `id` again from `raw` in `preference`, which
+    /// Shows the open message `key` again from `raw` in `preference`, which
     /// then applies to the messages opened after it. Nothing changes, the
-    /// preference included, when `id` is no longer open.
-    pub fn reformat(&mut self, id: &MessageId, raw: &[u8], preference: BodyPreference) {
+    /// preference included, when `key` is no longer open.
+    pub fn reformat(&mut self, key: &MessageKey, raw: &[u8], preference: BodyPreference) {
         if let Screen::Message(view) = &mut self.screen
-            && &view.id == id
+            && &view.key == key
         {
             self.preference = preference;
             view.body = Body::Rendered(Box::new(render_message(raw, preference)));
@@ -647,13 +699,31 @@ fn signed(value: usize) -> isize {
 #[cfg(test)]
 mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use tersa_application::mailbox::MessageId;
+    use tersa_application::mailbox::{AccountId, MessageId};
     use tersa_presentation::terminal::SafeText;
 
-    use super::{App, Body, BodyPreference, Request, Row, Screen, SyncState, sender_name};
+    use super::{
+        App, Body, BodyPreference, MessageKey, Request, Row, Screen, SyncState, sender_name,
+    };
 
     fn id(text: &str) -> MessageId {
         MessageId::new(text).expect("id")
+    }
+
+    fn account(text: &str) -> AccountId {
+        AccountId::new(text).expect("account")
+    }
+
+    fn key(account_text: &str, id_text: &str) -> MessageKey {
+        (account(account_text), id(id_text))
+    }
+
+    /// The interface over one account with the given labels.
+    fn labeled(labels: &[&str]) -> Vec<(AccountId, SafeText)> {
+        labels
+            .iter()
+            .map(|label| (account(label), SafeText::single_line(label)))
+            .collect()
     }
 
     fn press(app: &mut App, code: KeyCode) -> Option<Request> {
@@ -668,10 +738,16 @@ mod tests {
 
     fn app(rows: usize) -> App {
         App::new(
-            SafeText::single_line("acct"),
+            labeled(&["acct"]),
             (0..rows)
                 .map(|index| {
-                    Row::sample(&format!("m{index}"), "Sender", &format!("s{index}"), true)
+                    Row::sample(
+                        "acct",
+                        &format!("m{index}"),
+                        "Sender",
+                        &format!("s{index}"),
+                        true,
+                    )
                 })
                 .collect(),
         )
@@ -679,7 +755,7 @@ mod tests {
 
     fn open(app: &App) -> Option<&str> {
         match &app.screen {
-            Screen::Message(view) => Some(view.id.as_str()),
+            Screen::Message(view) => Some(view.key.1.as_str()),
             Screen::Inbox => None,
         }
     }
@@ -696,7 +772,7 @@ mod tests {
             tersa_application::mailbox::UnixTimestampMillis::new(0).expect("time"),
             false,
         );
-        let row = Row::from_envelope(&envelope);
+        let row = Row::from_envelope(&envelope, &account("acct"));
         assert_eq!(row.preview.as_str(), "I don't & [2J");
         assert_eq!(row.sender.as_str(), "A");
     }
@@ -744,17 +820,17 @@ mod tests {
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            Some(Request::OpenMessage(id("m1")))
+            Some(Request::OpenMessage(key("acct", "m1")))
         );
-        app.show_message(id("m1"), Ok(None));
+        app.show_message(key("acct", "m1"), Ok(None));
         assert!(
             matches!(&app.screen, Screen::Message(view) if matches!(view.body, Body::NotCached))
         );
         assert_eq!(
             press(&mut app, KeyCode::Char('p')),
-            Some(Request::OpenMessage(id("m0")))
+            Some(Request::OpenMessage(key("acct", "m0")))
         );
-        app.show_message(id("m0"), Ok(None));
+        app.show_message(key("acct", "m0"), Ok(None));
         assert_eq!(press(&mut app, KeyCode::Char('p')), None, "already first");
         press(&mut app, KeyCode::Char('q'));
         assert!(matches!(app.screen, Screen::Inbox));
@@ -765,16 +841,19 @@ mod tests {
     #[test]
     fn downloads_land_only_on_the_message_still_open() {
         let mut app = app(2);
-        app.show_message(id("m0"), Ok(None));
-        app.downloading(&id("m0"));
+        app.show_message(key("acct", "m0"), Ok(None));
+        app.downloading(&key("acct", "m0"));
         assert!(
             matches!(&app.screen, Screen::Message(view) if matches!(view.body, Body::Downloading))
         );
-        app.downloaded(id("m1"), Ok(b"Subject: other\r\n\r\nx".to_vec()));
+        app.downloaded(key("acct", "m1"), Ok(b"Subject: other\r\n\r\nx".to_vec()));
         assert!(
             matches!(&app.screen, Screen::Message(view) if matches!(view.body, Body::Downloading))
         );
-        app.downloaded(id("m0"), Ok(b"Subject: s\r\n\r\nfull body".to_vec()));
+        app.downloaded(
+            key("acct", "m0"),
+            Ok(b"Subject: s\r\n\r\nfull body".to_vec()),
+        );
         let Screen::Message(view) = &app.screen else {
             panic!("message screen");
         };
@@ -782,11 +861,62 @@ mod tests {
             panic!("rendered");
         };
         assert_eq!(rendered.body.as_str(), "full body");
-        app.show_message(id("m1"), Ok(None));
-        app.downloaded(id("m1"), Err("offline".to_owned()));
+        app.show_message(key("acct", "m1"), Ok(None));
+        app.downloaded(key("acct", "m1"), Err("offline".to_owned()));
         assert!(
             matches!(&app.screen, Screen::Message(view) if matches!(&view.body, Body::DownloadFailed(error) if error == "offline"))
         );
+    }
+
+    /// Gmail identifiers are only unique within one mailbox: a message of
+    /// another account with the same identifier is a different message.
+    #[test]
+    fn the_same_id_in_two_accounts_names_two_messages() {
+        let mut app = App::new(
+            labeled(&["acct_a", "acct_b"]),
+            vec![
+                Row::sample("acct_a", "m", "Ann <a@example.com>", "From a", true),
+                Row::sample("acct_b", "m", "Bob <b@example.com>", "From b", true),
+            ],
+        );
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Some(Request::OpenMessage(key("acct_b", "m"))),
+            "the request names the row's account"
+        );
+        app.show_message(key("acct_b", "m"), Ok(None));
+        app.downloading(&key("acct_b", "m"));
+        // The other account's same-id message finishes downloading first.
+        app.downloaded(key("acct_a", "m"), Ok(b"Subject: From a\r\n\r\na".to_vec()));
+        assert!(
+            matches!(&app.screen, Screen::Message(view) if matches!(view.body, Body::Downloading)),
+            "the other account's download changes nothing here"
+        );
+        app.downloaded(key("acct_b", "m"), Ok(b"Subject: From b\r\n\r\nb".to_vec()));
+        let body = |app: &App| {
+            let Screen::Message(view) = &app.screen else {
+                panic!("message screen");
+            };
+            let Body::Rendered(rendered) = &view.body else {
+                panic!("rendered");
+            };
+            rendered.body.as_str().to_owned()
+        };
+        assert_eq!(body(&app), "b");
+        // Reformatting the same id in the other account leaves this one open.
+        app.reformat(
+            &key("acct_a", "m"),
+            b"Subject: a\r\n\r\na",
+            BodyPreference::Plain,
+        );
+        assert_eq!(body(&app), "b", "still showing account b's");
+        app.reformat(
+            &key("acct_b", "m"),
+            b"Subject: b\r\n\r\nplain b",
+            BodyPreference::Plain,
+        );
+        assert_eq!(body(&app), "plain b");
     }
 
     #[test]
@@ -803,7 +933,7 @@ mod tests {
 Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n\r\n\
 <p>html body</p>\r\n--b--\r\n";
         let mut app = app(1);
-        app.show_message(id("m0"), Ok(Some(raw.to_vec())));
+        app.show_message(key("acct", "m0"), Ok(Some(raw.to_vec())));
         let body = |app: &App| {
             let Screen::Message(view) = &app.screen else {
                 panic!("message screen");
@@ -816,24 +946,24 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
         assert_eq!(body(&app), "html body", "HTML is the default");
         assert_eq!(
             press(&mut app, KeyCode::Char('H')),
-            Some(Request::Reformat(id("m0"), BodyPreference::Plain))
+            Some(Request::Reformat(key("acct", "m0"), BodyPreference::Plain))
         );
         assert_eq!(
             app.preference,
             BodyPreference::Html,
             "nothing changes until the message is shown again"
         );
-        app.reformat(&id("m0"), raw, BodyPreference::Plain);
+        app.reformat(&key("acct", "m0"), raw, BodyPreference::Plain);
         assert_eq!(body(&app), "plain body");
         assert_eq!(app.preference, BodyPreference::Plain);
-        app.reformat(&id("other"), raw, BodyPreference::Html);
+        app.reformat(&key("acct", "other"), raw, BodyPreference::Html);
         assert_eq!(body(&app), "plain body", "only the open message changes");
         assert_eq!(app.preference, BodyPreference::Plain, "nor the preference");
         assert_eq!(
             press(&mut app, KeyCode::Char('H')),
-            Some(Request::Reformat(id("m0"), BodyPreference::Html))
+            Some(Request::Reformat(key("acct", "m0"), BodyPreference::Html))
         );
-        app.reformat(&id("m0"), raw, BodyPreference::Html);
+        app.reformat(&key("acct", "m0"), raw, BodyPreference::Html);
         assert_eq!(body(&app), "html body");
     }
 
@@ -850,11 +980,23 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
 
     fn mailbox() -> App {
         App::new(
-            SafeText::single_line("acct"),
+            labeled(&["acct"]),
             vec![
-                Row::sample("a", "Ann <ann@example.com>", "Lunch on Friday", true),
-                Row::sample("b", "Bob <bob@work.example>", "Quarterly report", false),
-                Row::sample("c", "Ann <ann@example.com>", "Report draft", false),
+                Row::sample(
+                    "acct",
+                    "a",
+                    "Ann <ann@example.com>",
+                    "Lunch on Friday",
+                    true,
+                ),
+                Row::sample(
+                    "acct",
+                    "b",
+                    "Bob <bob@work.example>",
+                    "Quarterly report",
+                    false,
+                ),
+                Row::sample("acct", "c", "Ann <ann@example.com>", "Report draft", false),
             ],
         )
     }
@@ -883,9 +1025,9 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
         );
         assert_eq!(
             press(&mut app, KeyCode::Enter),
-            Some(Request::OpenMessage(id("c")))
+            Some(Request::OpenMessage(key("acct", "c")))
         );
-        app.show_message(id("c"), Ok(None));
+        app.show_message(key("acct", "c"), Ok(None));
         press(&mut app, KeyCode::Char('q'));
         press(&mut app, KeyCode::Esc);
         assert_eq!(shown_ids(&app), ["a", "b", "c"], "esc clears the search");
@@ -927,12 +1069,12 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
         press(&mut app, KeyCode::Char('/'));
         typed(&mut app, "ann");
         press(&mut app, KeyCode::Enter);
-        app.show_message(id("a"), Ok(None));
+        app.show_message(key("acct", "a"), Ok(None));
         assert_eq!(
             press(&mut app, KeyCode::Char('n')),
-            Some(Request::OpenMessage(id("c")))
+            Some(Request::OpenMessage(key("acct", "c")))
         );
-        app.show_message(id("c"), Ok(None));
+        app.show_message(key("acct", "c"), Ok(None));
         assert_eq!(press(&mut app, KeyCode::Char('n')), None);
     }
 
@@ -940,17 +1082,20 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
     fn a_reload_keeps_the_selection_and_the_open_message() {
         let mut app = mailbox();
         press(&mut app, KeyCode::Char('j'));
-        app.show_message(id("b"), Ok(None));
-        let mut rows = vec![Row::sample("new", "Zed", "Fresh", true)];
+        app.show_message(key("acct", "b"), Ok(None));
+        let mut rows = vec![Row::sample("acct", "new", "Zed", "Fresh", true)];
         rows.extend(mailbox().rows);
         app.reload(rows, false);
         assert_eq!(open(&app), Some("b"));
         assert_eq!(app.selected, 2, "b moved down one place");
         assert_eq!(
             press(&mut app, KeyCode::Char('p')),
-            Some(Request::OpenMessage(id("a")))
+            Some(Request::OpenMessage(key("acct", "a")))
         );
-        app.reload(vec![Row::sample("new", "Zed", "Fresh", true)], false);
+        app.reload(
+            vec![Row::sample("acct", "new", "Zed", "Fresh", true)],
+            false,
+        );
         assert_eq!(open(&app), Some("b"), "an open message outlives its row");
         assert_eq!(app.selected, 0);
     }
@@ -966,5 +1111,53 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
         assert_eq!(app.sync, SyncState::Synced(42));
         app.synced(Err("offline".to_owned()), 43);
         assert_eq!(app.sync, SyncState::Failed("offline".to_owned()));
+    }
+
+    /// The unified order breaks equal received times by account, then
+    /// identifier: the catch-up stops only when the listing has passed the
+    /// selection in that order.
+    #[test]
+    fn the_selection_catch_up_follows_the_unified_order() {
+        let mut app = App::new(
+            labeled(&["acct_a", "acct_b"]),
+            vec![Row::sample(
+                "acct_b",
+                "m",
+                "Bob <b@example.com>",
+                "Chosen",
+                true,
+            )],
+        );
+        app.more_rows = true;
+        // A sync stored newer mail on both accounts; the selection is no
+        // longer in the reloaded rows.
+        app.reload(
+            vec![
+                Row::sample("acct_a", "a2", "Ann <a@example.com>", "Fresh", true),
+                Row::sample("acct_b", "a1", "Bob <b@example.com>", "Fresh", true),
+            ],
+            true,
+        );
+        assert!(app.selection_pending());
+        // Older pages arrive; acct_a's row at the same received time sorts
+        // before the selection, so the catch-up goes on...
+        app.append(vec![Row::sample(
+            "acct_a",
+            "z9",
+            "Ann <a@example.com>",
+            "Old",
+            true,
+        )]);
+        assert!(app.selection_pending());
+        // ...until acct_b's own listing passes it: identifier ascending, "z"
+        // comes after "m".
+        app.append(vec![Row::sample(
+            "acct_b",
+            "z9",
+            "Bob <b@example.com>",
+            "Old",
+            true,
+        )]);
+        assert!(!app.selection_pending());
     }
 }
