@@ -1001,6 +1001,24 @@ mod store {
                     if self.take_failpoint()? {
                         return Err(MailboxStoreError::Storage);
                     }
+                    // The display address belongs to the replaced identity's
+                    // mailbox session too: cleared in this same commit, a
+                    // replacement identity starts address-less until its own
+                    // sync stores one, and the previous account's Gmail
+                    // address never reaches the listing or the interface.
+                    let cleared = transaction
+                        .execute(
+                            "UPDATE account_binding SET email_address = NULL WHERE singleton = 1 AND account_id = ?1",
+                            params![account.as_str()],
+                        )
+                        .map_err(store_error)?;
+                    if cleared != 1 {
+                        return Err(MailboxStoreError::Corrupted);
+                    }
+                    #[cfg(test)]
+                    if self.take_failpoint()? {
+                        return Err(MailboxStoreError::Storage);
+                    }
                 }
                 transaction
                     .execute(
@@ -5683,6 +5701,32 @@ mod store {
         }
 
         #[test]
+        fn an_identity_mismatch_clears_the_stored_email_address() {
+            // The address belongs to the mailbox's identity: the clear that
+            // wipes a replaced identity's mail must not leave the previous
+            // account's Gmail address in the binding row for `account list`
+            // and the interface to keep showing.
+            let (database, store) = open("identity-mismatch-clear-email");
+            let first = IdentityHash::from_bytes([1; 32]);
+            run(store.reconcile_identity(&account(), &first, IdentityReconcile::RecordOnly, None))
+                .unwrap();
+            let email = AccountEmail::new("user@example.invalid").unwrap();
+            store.store_email_address(&account(), &email).unwrap();
+            let second = IdentityHash::from_bytes([2; 32]);
+            run(store.reconcile_identity(
+                &account(),
+                &second,
+                IdentityReconcile::ClearMailboxAndRecord,
+                Some(&first),
+            ))
+            .unwrap();
+            assert!(store.load_email_address(&account()).unwrap().is_none());
+            drop(store);
+            let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert!(reopened.load_email_address(&account()).unwrap().is_none());
+        }
+
+        #[test]
         fn identity_reconcile_rolls_back_the_clear_and_the_record_together() {
             let (database, store) = open("identity-reconcile-rollback");
             let recorded = IdentityHash::from_bytes([1; 32]);
@@ -5701,12 +5745,15 @@ mod store {
                 &recorded,
             ))
             .unwrap();
+            let email = AccountEmail::new("user@example.invalid").unwrap();
+            store.store_email_address(&account(), &email).unwrap();
             let replacement = IdentityHash::from_bytes([2; 32]);
             run(store.record_successful_sync(&account(), 1_000)).unwrap();
-            // The clear path has three transaction checkpoints: after mailbox
-            // deletion, lifecycle freshness clear, and identity record. Each
-            // failure must restore all three old-state components together.
-            for checkpoint in 1..=3 {
+            // The clear path has four transaction checkpoints: after mailbox
+            // deletion, lifecycle freshness clear, binding address clear, and
+            // identity record. Each failure must restore all four old-state
+            // components together.
+            for checkpoint in 1..=4 {
                 store.fail_mutation_at(checkpoint);
                 assert_eq!(
                     run(store.reconcile_identity(
@@ -5731,6 +5778,11 @@ mod store {
                         .last_successful_sync_unix_millis(),
                     Some(1_000)
                 );
+                assert_eq!(
+                    store.load_email_address(&account()).unwrap().as_ref(),
+                    Some(&email),
+                    "the recorded identity's address survives the failed clear"
+                );
             }
             drop(store);
             let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
@@ -5747,6 +5799,10 @@ mod store {
                     .unwrap()
                     .last_successful_sync_unix_millis(),
                 Some(1_000)
+            );
+            assert_eq!(
+                reopened.load_email_address(&account()).unwrap().as_ref(),
+                Some(&email)
             );
         }
 
@@ -6224,10 +6280,15 @@ mod store {
             );
         }
 
-        // Builds a shipped version-1 store: the 0001 migration, the binding
-        // row, the ownership marker, and `user_version` 1, in WAL mode as
-        // every shipped open leaves it.
-        fn version_1_store(name: &str) -> TestDatabase {
+        /// Builds a shipped version-1 store: the 0001 migration, the binding
+        /// row, the ownership marker, and `user_version` 1, in WAL mode as
+        /// every shipped open leaves it. Two messages are committed before any
+        /// upgrade — one with a cached body, one envelope-only — and never
+        /// checkpointed: the WAL grows, so the upgrade tests prove mail that
+        /// lives only in the WAL survives. The returned connection stays open
+        /// holding the WAL and its shared-memory index, like the process that
+        /// owns the store while another one opens it.
+        fn version_1_store(name: &str) -> (TestDatabase, Connection) {
             let database = TestDatabase::new(name);
             let connection = raw_connection(&database);
             apply_key(&connection, &key(7).0).unwrap();
@@ -6247,13 +6308,36 @@ mod store {
             connection
                 .execute_batch("PRAGMA journal_mode = WAL;")
                 .unwrap();
-            drop(connection);
-            database
+            // Pre-upgrade mail, committed into the WAL and never checkpointed.
+            let wal_before_mail = fs::metadata(wal_path(&database))
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            let mail = [
+                ("m1", 20, Some(b"cached body".as_slice())),
+                ("m0", 10, None),
+            ];
+            for (id, received_at, content) in mail {
+                connection
+                    .execute(
+                        "INSERT INTO messages (message_id, thread_id, sender, subject, preview, received_at, unread, content) VALUES (?1, 'thread', 'from', 'subject', 'preview', ?2, 1, ?3)",
+                        rusqlite::params![id, received_at, content],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                fs::metadata(wal_path(&database)).unwrap().len() > wal_before_mail,
+                "the pre-upgrade mail is committed into the WAL, not the main file"
+            );
+            // The ownership modes every shipped open leaves, which both open
+            // paths require of pre-existing leaves.
+            fs::set_permissions(wal_path(&database), fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(shm_path(&database), fs::Permissions::from_mode(0o600)).unwrap();
+            (database, connection)
         }
 
         #[test]
         fn a_version_one_store_upgrades_on_a_writable_open() {
-            let database = version_1_store("version-one-upgrade");
+            let (database, anchor) = version_1_store("version-one-upgrade");
             {
                 let connection = raw_existing_connection(&database);
                 apply_key(&connection, &key(7).0).unwrap();
@@ -6283,10 +6367,31 @@ mod store {
                 Some("refresh-token-xyz".to_string())
             );
             assert!(store.load_email_address(&account()).unwrap().is_none());
+            // Every message written before the upgrade survives it, the last
+            // of them still only in the WAL, envelope and cached content
+            // alike.
+            assert_eq!(
+                run(store.list_envelopes(&account(), StoreLimit::new(10).unwrap())).unwrap(),
+                vec![envelope("m1", "thread", 20), envelope("m0", "thread", 10)]
+            );
+            assert_eq!(
+                run(store.message(&account(), &MessageId::new("m1").unwrap()))
+                    .unwrap()
+                    .unwrap()
+                    .content()
+                    .as_bytes(),
+                b"cached body"
+            );
+            assert!(
+                run(store.message(&account(), &MessageId::new("m0").unwrap()))
+                    .unwrap()
+                    .is_none(),
+                "the envelope-only row stays envelope-only"
+            );
             let email = AccountEmail::new("user@example.invalid").unwrap();
             store.store_email_address(&account(), &email).unwrap();
-            run(store.upsert_envelopes(&account(), &[envelope("m1", "t1", 10)])).unwrap();
             drop(store);
+            drop(anchor);
             let reopened = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
             assert_eq!(
                 reopened.load_email_address(&account()).unwrap().as_ref(),
@@ -6298,32 +6403,92 @@ mod store {
                     .iter()
                     .map(|value| value.message_id().as_str())
                     .collect::<Vec<_>>(),
-                ["m1"]
+                ["m1", "m0"]
             );
         }
 
         #[test]
         fn a_version_one_store_opens_read_only_and_stays_version_one() {
-            let database = version_1_store("version-one-read-only");
-            let anchor = raw_existing_connection(&database);
-            apply_key(&anchor, &key(7).0).unwrap();
-            anchor
-                .execute_batch(
-                    "PRAGMA journal_mode = WAL; CREATE TABLE wal_touch (value); DROP TABLE wal_touch;",
-                )
-                .unwrap();
-            fs::set_permissions(wal_path(&database), fs::Permissions::from_mode(0o600)).unwrap();
-            fs::set_permissions(shm_path(&database), fs::Permissions::from_mode(0o600)).unwrap();
+            let (database, anchor) = version_1_store("version-one-read-only");
             let reader =
                 SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
-            drop(reader);
+            // The reader holds the sidecars now, so the writer connection can
+            // go, and the pre-upgrade mail stays readable on version 1.
             drop(anchor);
+            assert_eq!(
+                run(reader.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                ["m1", "m0"]
+            );
+            drop(reader);
             let connection = raw_existing_connection(&database);
             apply_key(&connection, &key(7).0).unwrap();
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(version, SCHEMA_VERSION_1);
+        }
+
+        #[test]
+        fn a_read_only_reader_keeps_reading_through_a_writable_upgrade() {
+            // SQLite's WAL locking admits one writer alongside any number of
+            // readers: the upgrade's BEGIN IMMEDIATE excludes only other
+            // writers, and a reader's shared-memory read marks merely limit
+            // checkpoints, which the open path never runs. So the upgrade
+            // succeeds with the reader held open (only a second WRITER would
+            // block it into the busy timeout and fail closed as storage), the
+            // reader keeps reading its mail either way, and a fresh open sees
+            // the upgraded store.
+            let (database, anchor) = version_1_store("version-one-reader-upgrade");
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            // The reader holds the sidecars now, so the writer connection can
+            // go.
+            drop(anchor);
+            assert_eq!(
+                run(reader.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                ["m1", "m0"]
+            );
+            let store = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                schema_state(&store),
+                (APPLICATION_ID, VERSION, canonical_schema())
+            );
+            assert_eq!(
+                run(reader.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                ["m1", "m0"],
+                "the held reader still reads its mail"
+            );
+            drop(reader);
+            drop(store);
+            let reopened =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            let version: i64 = reopened
+                .connection
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, VERSION);
+            assert_eq!(
+                run(reopened.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.message_id().as_str())
+                    .collect::<Vec<_>>(),
+                ["m1", "m0"]
+            );
         }
 
         #[test]

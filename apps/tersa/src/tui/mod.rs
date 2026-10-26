@@ -51,6 +51,10 @@ pub trait MailSource {
     ///
     /// Returns `Err(())` when the local store cannot be read.
     fn message(&self, id: &MessageId) -> Result<Option<Vec<u8>>, ()>;
+
+    /// The account's label for the top bar, read again after a sync. `None`
+    /// keeps the label the interface already shows.
+    fn account_label(&self) -> Option<SafeText>;
 }
 
 /// Work that finishes later, on the network thread.
@@ -473,6 +477,15 @@ fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now:
             }
             Done::Synced(result) => {
                 worker.syncing = false;
+                // The start-up sync is when a first-session store gains the
+                // account's Gmail address; the label is read again so the bar
+                // shows it instead of the opaque id. A failed sync has not
+                // stored one, and `None` keeps the current label.
+                if result.is_ok()
+                    && let Some(label) = source.account_label()
+                {
+                    app.account = label;
+                }
                 // Read again as many rows as were loaded, so the selection
                 // and the list stay where they were; later pages follow. A
                 // failed sync may have stored envelopes before failing, so
@@ -845,6 +858,10 @@ mod tests {
         fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
             Ok(None)
         }
+
+        fn account_label(&self) -> Option<SafeText> {
+            None
+        }
     }
 
     /// A cache of `total` rows, newest first, that counts its reads.
@@ -903,6 +920,10 @@ mod tests {
 
         fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
             Ok(None)
+        }
+
+        fn account_label(&self) -> Option<SafeText> {
+            None
         }
     }
 
@@ -970,6 +991,10 @@ mod tests {
             fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
                 Ok(None)
             }
+
+            fn account_label(&self) -> Option<SafeText> {
+                None
+            }
         }
         let source = OlderFail(Pages::new(1_234));
         let (rows, more) = read_page(&source, None, FIRST_PAGE).expect("page");
@@ -1004,6 +1029,10 @@ mod tests {
 
             fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
                 Ok(None)
+            }
+
+            fn account_label(&self) -> Option<SafeText> {
+                None
             }
         }
         let source = FailAfterSync(Pages::new(1_234), std::cell::Cell::new(false));
@@ -1083,6 +1112,48 @@ mod tests {
         assert_eq!(app.rows.len(), 51);
         assert_eq!(app.rows[0].id.as_str(), "new");
         assert!(matches!(app.sync, SyncState::Failed(_)));
+    }
+
+    /// A cache whose top-bar label appears once a sync succeeds, like a store
+    /// that gains the account's Gmail address on the start-up sync.
+    struct Labeled(Pages, std::cell::RefCell<Option<SafeText>>);
+
+    impl MailSource for Labeled {
+        fn page(&self, after: Option<&Row>, limit: u16) -> Result<Vec<Row>, ()> {
+            self.0.page(after, limit)
+        }
+
+        fn message(&self, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
+            Ok(None)
+        }
+
+        fn account_label(&self) -> Option<SafeText> {
+            self.1.borrow().clone()
+        }
+    }
+
+    #[test]
+    fn a_successful_sync_picks_up_the_top_bar_label() {
+        let source = Labeled(Pages::new(2), std::cell::RefCell::new(None));
+        let mut app = App::new(
+            SafeText::single_line("acct_1234"),
+            source.page(None, FIRST_PAGE).expect("page"),
+        );
+        finished_sync(&mut app, &source, Ok(()));
+        assert_eq!(
+            app.account.as_str(),
+            "acct_1234",
+            "no stored label yet keeps the id"
+        );
+        // The start-up sync stored the account's Gmail address; the next
+        // successful sync shows it on the bar.
+        *source.1.borrow_mut() = Some(SafeText::single_line("me@example.com"));
+        finished_sync(&mut app, &source, Ok(()));
+        assert_eq!(app.account.as_str(), "me@example.com");
+        // A failed sync has not stored an address, so the label stays.
+        *source.1.borrow_mut() = Some(SafeText::single_line("other@example.com"));
+        finished_sync(&mut app, &source, Err("offline".to_owned()));
+        assert_eq!(app.account.as_str(), "me@example.com");
     }
 
     #[test]
