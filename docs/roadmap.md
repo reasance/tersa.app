@@ -1,8 +1,8 @@
 # Roadmap
 
 tersa is a terminal Gmail client for macOS and Linux. The baseline is
-[ADR 0031](architecture/adr-0031-tui-only-pivot.md). The Apple-era plan is
-kept as [history](history/apple-era-roadmap.md).
+[ADR 0031](architecture/adr-0031-tui-only-pivot.md). Earlier plans remain in
+Git history.
 
 Every milestone ships as reviewed pull requests that pass `cargo xtask verify`
 on Linux and macOS. A failed milestone check changes the plan; it is not
@@ -16,7 +16,7 @@ unmaintained notices (RUSTSEC-2026-0370, -0371, -0372).
 
 | Milestone | Scope | Done when |
 |---|---|---|
-| T0 — Pivot | ADR 0031; Apple sources, FFI crates, and Apple CI removed; minimal `xtask`; docs rewritten | Workspace verifies on Linux and macOS without `apple/` |
+| T0 — Terminal baseline | ADR 0031; portable workspace, minimal `xtask`, terminal architecture docs | Workspace verifies on Linux and macOS |
 | T1 — Portable foundation | Adapters made portable and renamed; TLS and SQLCipher crypto from the OS on macOS and from one static vendored OpenSSL on Linux; `crates/keys`; `adapters/vault` (keyring, optional passphrase, passphrase-only fallback); XDG paths; Rust loopback OAuth; in-process token service; BYO OAuth client config | `tersa account add` and `tersa inbox` work against a real Google account on macOS |
 | T2 — Read-only TUI | `ratatui` shell; paged inbox; thread view; sanitized text; HTML to text; search; offline reopen; background sync with status; first performance harness | Hostile fixtures render safely; budgets measured in the PR |
 | T3 — Multi-account | Encrypted registry; add, remove, reset; per-account sync workers; unified inbox | Two real accounts sync and display without cross-account leakage |
@@ -36,4 +36,4 @@ frame under 100 ms, top-50 list query under 20 ms, idle resident memory under
 
 Full-mailbox offline, AI, MCP, OpenPGP, IMAP/SMTP, non-Gmail accounts, Google
 Contacts, send-as aliases, snooze synchronization, server-side send-later,
-Windows, and any GUI.
+Windows, and graphical clients.

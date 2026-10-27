@@ -10,52 +10,28 @@ one at https://mozilla.org/MPL/2.0/.
 - Amended by: [ADR 0031](adr-0031-tui-only-pivot.md) (terminal-only pivot)
 - Date: 2026-08-29
 
-## Context
+## Implementation status and context
 
-The production SQLCipher store encrypts message data but has no production blob
-format, attachment quota, or app-lock lifecycle. The former blob spike and its
-format were retired diagnostic work; [ADR 0012](adr-0012-chunked-blob-format.md)
-does not authorize a product implementation. The beta needs attachment and
-inline-image storage without plaintext temporary files, while the 10 GiB macOS
-cache constraint in [ADR 0006](adr-0006-product-constraints.md) needs a
-recoverable enforcement model.
+Blob storage, allocated-byte cache budgets, and app-lock lifecycle are accepted
+future T6 work. SQLCipher storage and root-key passphrase wrapping are implemented;
+neither establishes this blob protocol. The terminal app must support bounded
+attachment storage without plaintext temporary caches and preserve local intent
+when recoverable cache is evicted.
 
-An app lock must also mean more than a Swift overlay. The current root-key
-accessibility and a running unlocked process do not protect against privileged
-malware; the product can nevertheless require fresh device-owner authentication
-before reopening mailbox material and can require application-held plaintext
-and derived keys to be evicted on lock.
+Lock must close stores, quiesce work, evict keys/models, and require fresh vault
+authentication before reopening, not merely cover the terminal view. It cannot
+protect content already exposed to a compromised unlocked process.
 
 ## Prerequisite decision and policy slices
 
-No blob, bundle, storage-budget, or app-lock implementation may start until
-these independently reviewed slices are accepted:
-
-1. **P30-dependency policy:** select and pin the exact `chacha20poly1305`
-   version, targets, features, and allowed owners. Argon2 is not part of this
-   ADR's blob-key or app-lock path; any Argon2id dependency remains owned by
-   ADR 0028's separate draft-bundle policy. Retain the verified workspace
-   `rustix =1.1.4` API with its `fs` feature enabled for the additive direct-owner
-   set `{tersa-keychain-macos, tersa-store-sqlcipher-macos,
-   tersa-blob-aead-macos}`. The existing store owner is retained, never dropped.
-   Amend `deny.toml`, dependency rules, and `xtask` owner fixtures accordingly.
-   This ADR invents no new dependency version.
-2. **P30-architecture amendments:** explicitly amend/supersede the retired
-   diagnostic constraints in ADR 0012, ADR 0019, and ADR 0025 only for the new
-   production path; record the direct `rustix` 1.1.4 `fs` ownership amendment,
-   `renameat_with` no-replace policy, and the exact future fixture contract in
-   dependency/policy documentation. This docs-only slice changes no manifest,
-   `deny.toml`, or `xtask` source.
-3. **P30-composition:** approve the new inward edge from trusted
-   `tersa-keychain-macos` composition to `tersa-blob-aead-macos`, its narrow
-   `SecureBlobStore` capability, and the prohibition on raw-key bytes or public
-   key callbacks.
-4. **P30-security documentation:** update the security data flow and threat
-   model for backup, key rotation, File Protection, deletion, diagnostics,
-   allocated-byte accounting, and app-lock/locked-query semantics before code.
-
-These are prerequisite amendments, not claims that the current retired or
-dependency-policy records have already changed.
+Before new blob/budget/lock code, independently review exact dependency versions,
+features, targets, and owners; a narrow account-bound blob capability; the blob
+key purpose and trusted composition; descriptor-relative no-replace publication;
+and security data-flow/threat-model changes for backup, rotation, deletion,
+allocated-byte accounting, authentication, lock, and diagnostics. Existing
+Argon2id/XChaCha20 root wrapping does not authorize blob or draft-bundle formats.
+The separate bundle policy in ADR 0028 still owns its format and recovery gates.
+No version, new adapter path, or dependency permission is invented by this ADR.
 
 ## Decision
 
@@ -64,15 +40,13 @@ dependency-policy records have already changed.
 The domain layer adds `BlobId`, `BlobRef`, `BlobKind`, `BlobManifestV1`, and
 `StorageClass`. `BlobRef` always carries `AccountId`; `StorageClass` is either
 recoverable cache data or non-evictable local intent. The application adds
-`SecureBlobStore` and `StorageBudgetStore` ports. The planned
-`tersa-blob-aead-macos` adapter is the only production owner of
-XChaCha20-Poly1305, direct `rustix` filesystem staging, and manifest
-publication. It is constructed inside trusted `tersa-keychain-macos`
-composition through P30-composition and returns only a narrow `SecureBlobStore`
-capability; no raw key bytes, key callback, or public key-bearing constructor is
-introduced.
+`SecureBlobStore` and `StorageBudgetStore` ports. The future blob adapter owns
+only account-bound encryption, filesystem staging,
+and authenticated publication. Trusted runtime composition supplies derived keys
+and returns only a narrow `SecureBlobStore` capability; it adds no public key
+callback or display/export channel.
 
-The existing private Keychain/HKDF boundary gains the closed
+The trusted key-derivation boundary gains the closed
 `blob/account-content/v1` derivation purpose. It derives a 32-byte per-account
 blob key without exposing root or derived bytes to callers. A blob receives a
 random 128-bit `BlobId`, a separate random 24-byte XChaCha20 nonce for every
@@ -105,19 +79,14 @@ protocol. A failed write cleans only files/directories proven created by that
 attempt and otherwise preserves redacted residue for recovery. This requires no
 libc or unsafe amendment.
 
-P30-architecture amendments supersede ADR 0019's interim active-graph
-prohibition, ADR 0012's retired diagnostic-only status, and ADR 0025's retired
-program boundary only for this exact future policy-approved production adapter.
-The separate P30-dependency `policy-xtask` slice exclusively owns every
-`deny.toml`, manifest, and `xtask` owner-fixture change; the docs-only
-architecture-amendment slice records only the corresponding dependency/policy
-documentation. No other ChaCha path is authorized and no historical diagnostic
-evidence becomes production evidence.
+A separate `policy-xtask` slice owns any dependency/owner-policy amendment;
+this documentation changes no manifest or dependency permission. Existing key
+wrapping and removed feasibility work supply no production blob evidence.
 
 ### Budget and eviction
 
-After P26-policy updates ADR 0006 A5, the per-account default budget is 10 GiB
-with a 50 GiB installation aggregate; a user may lower an account budget, but
+The planned per-account default budget is 10 GiB with a 50 GiB installation
+aggregate; a user may lower an account budget, but
 never below 1 GiB. Accounting uses allocated file bytes, not semantic SQLite
 row sizes: it includes each account database, WAL, SHM, FTS files, blob
 ciphertext/manifests, render/image cache, and registry metadata where allocated
@@ -135,12 +104,12 @@ budget, or a blob referenced by local intent. Downloaded attachments remain
 on-demand; Save/Open is an explicit user-directed declassification and beta
 does not preview hostile documents in-app.
 
-Backup, key rotation, File Protection, deletion, and diagnostics have these
-rules pending the P30-security documentation update: backup copies remain
-encrypted but may be unreadable on another device because the root key is
-device-bound; the beta performs no key rotation; a future rotation requires a
-separate re-encryption/atomic-cutover ADR; macOS makes no unsupported File
-Protection claim beyond owner-only files, encryption, and app-lock lifecycle;
+Backup, key rotation, file permissions, deletion, and diagnostics require
+security documentation before implementation: backup copies remain encrypted,
+but databases without their root key are unreadable on another device; the beta
+performs no key rotation; a future rotation requires a separate re-encryption/
+atomic-cutover ADR; neither platform gains an unsupported filesystem protection
+claim beyond owner-only files, encryption, and the planned lock lifecycle;
 deletion is validated descriptor-relative unlink plus reference removal, not
 SSD secure erase; and diagnostics may record only aggregate sizes, versions,
 and redacted outcome classes, never paths, BlobIds, account IDs, content, or
@@ -207,22 +176,25 @@ SQLCipher pending/reachable state and the account blob inventory:
 
 ### App-lock lifecycle
 
-App lock is opt-in and uses macOS device-owner authentication. Touch ID is used
-when available; the system password/passcode path is the fallback. No biometric
-template, authentication secret, or success token is stored by the app. The
-domain adds `AppLockPolicy` with exactly `Immediate`, `OneMinute`, `FiveMinutes`,
-and `FifteenMinutes`; the default is `FiveMinutes`.
+App lock is planned as opt-in terminal `:lock` and idle lock. Unlock requires
+fresh vault authentication; the exact keyring/passphrase interaction on macOS
+and Linux must be reviewed before implementation. No biometric template,
+authentication secret, or reusable success token is stored by the app. The
+planned `AppLockPolicy` has `Immediate`, `OneMinute`, `FiveMinutes`, and
+`FifteenMinutes`; default `FiveMinutes`. Sleep-trigger support requires explicit
+platform validation, not an assumed terminal capability.
 
 The application `AppLockCoordinator` consumes an abstract authenticated/not-
-authenticated result, not Apple framework types. When lock is enabled it:
+authenticated result, not OS framework types. When lock is enabled it:
 
-1. locks immediately on sleep and after the selected inactivity timeout;
+1. locks on explicit `:lock`, the selected inactivity timeout, and supported
+   platform sleep events;
 2. prevents new sync, render, blob, draft, and outbox work;
 3. cancels/quiesces active workers, closes SQLCipher handles, clears UI models,
    and zeroizes or evicts application-held derived key material;
 4. increments a lock generation that every asynchronous completion must match
    before it can publish state; and
-5. requires a fresh successful device-owner authentication before deriving keys,
+5. requires a fresh successful vault authentication before deriving keys,
    reopening stores, or returning any mailbox document.
 
 An already-dispatched Gmail operation may remain externally ambiguous; its
@@ -246,10 +218,10 @@ Account-scoped attachment/image bytes
   -> SQLCipher atomic BlobRef + actual accounting finalize
   -> explicit open/save declassification only
 
-macOS sleep/timeout
+Explicit terminal lock / idle timeout / supported sleep event
   -> AppLockCoordinator generation fence
   -> stop work, close stores, evict keys/models
-  -> device-owner authentication -> authorized reopen
+  -> vault authentication -> authorized reopen
 ```
 
 - No blob, manifest, usage record, or key can be routed without a validated
@@ -262,29 +234,19 @@ macOS sleep/timeout
   publication/removal.
 - A plaintext attachment exists only in bounded memory while explicitly opened,
   saved, composed, or parsed. The operation cannot silently export it.
-- Lock generation fences apply to Swift UI, bridge replies, XPC replies, and
+- Lock generation fences apply to TUI models, adapter completions, and
   Rust workers; an old unlocked completion cannot repopulate a locked view.
 - Locked fan-out is all-or-nothing: stores are closed and no partial account
   display is permitted until fresh authentication completes.
 
-### Implementation decomposition by change class
+### Implementation decomposition
 
-| Change class | Bounded implementation responsibility |
-| --- | --- |
-| `docs-only` | P30-architecture and P30-security amendments before implementation eligibility. |
-| `policy-xtask` | P30 dependency/owner fixtures for Rustix 1.1.4 `fs`, no-replace staging, ABI, and lock-generation guards only. |
-| `domain` | Add blob/reference/manifest/storage-class, pending/protected-orphan recovery, and app-lock policy values with redacted diagnostics. |
-| `application` | Add `SecureBlobStore`, `StorageBudgetStore`, eviction use case, the sole `BlobCommitCoordinator`, and `AppLockCoordinator` state/fence contract. |
-| `adapter-rust — tersa-blob-aead-macos` | Implement chunk/manifest AEAD, synchronized no-replace staging/publication, authenticated bounded inventory, and ciphertext removal only. |
-| `adapter-rust — tersa-store-sqlcipher-macos` | Implement pending/final BlobRef transactions, allocated-byte accounting, protected-orphan recovery records, eviction selection, and reference transactions only. |
-| `adapter-rust — tersa-keychain-macos` | Implement the private blob derivation/composition edge only. |
-| `token-broker` | Preserve token authority; expose only closed lock quiesce/recovery status. |
-| `bridge-ffi` | Add bounded BlobRef/budget/lock documents with atomic ABI fixture updates. |
-| `swift-ui` | Implement settings, authentication prompt, locked state, and explicit Save/Open warning. |
-
-Every BlobRef/budget/lock ABI change atomically updates the expected-export
-allowlist, count, canonical header, Swift declarations, and positive/negative
-fixtures. It carries no key, path, raw-byte, or store-handle capability.
+Sequence security/architecture documentation and dependency policy before domain
+values, application commit/budget/lock coordinators, one blob/store adapter at a
+time, trusted key/runtime composition, and TUI settings/lock/save recovery. Use
+the current [change classes](../development/agent-playbook.md); adding a new path
+requires an explicit ownership decision before code. Models carry no raw key,
+filesystem path, or store-handle capability to the terminal.
 
 ## Failure handling
 
@@ -328,19 +290,19 @@ falls back to partial rows.
   behavior without evicting drafts/outbox/pending actions.
 - Lifecycle tests cover timeout, sleep, failed authentication, all-store close,
   top-level locked fan-out/no partial rows, key/store/model eviction, and stale
-  completion rejection for sync, worker, and bridge paths.
-- A signed macOS candidate must perform lock/unlock, sleep/lock, attachment
-  save warning, and accessibility walks. Unsigned or source tests do not prove
-  device-owner authentication or final Keychain/process-isolation behavior.
+  completion rejection for sync, worker, and TUI paths.
+- Candidate-specific platform checks must exercise lock/unlock, supported sleep
+  behavior, save warnings, authentication, and accessibility. Source tests do not
+  establish real keyring authentication or release behavior on either platform.
 
 ## Non-claims
 
 This ADR does not implement or approve any prerequisite slice, guarantee secure
 deletion from SSD wear-leveling, add cloud backup/synchronization, preview or
 execute attachments, claim lock protection against a compromised unlocked
-process, change broker token ownership, add iOS/iPadOS, or pass distribution-
-signing evidence. It does not revive the retired diagnostic blob format as
-production proof or invent dependency versions.
+process, change token-service ownership, or pass release-signing evidence. It
+does not turn an accepted storage design into implemented code or invent
+dependency versions.
 
 ## Consequences
 

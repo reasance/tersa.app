@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The production token-broker composition (ADR-0024).
+//! The in-process token-service composition (ADR-0024 and ADR 0031).
 //!
 //! [`BrokerCore`] wires the portable OAuth and token state machines to the
 //! injected transport, refresh-token store, clocks, and entropy ports. It owns
@@ -89,12 +89,9 @@ const MAX_EXPIRES_IN_SECS: u64 = 86_400;
 const MAX_SESSION_TTL: Duration = Duration::from_secs(3_600);
 
 /// The wall-clock skew tolerated when validating `id_token` freshness, in
-/// seconds. This deliberately matches the 120 seconds of the legacy
-/// `oauth-sync-macos` composition the broker replaces at cutover: a tighter
-/// bound would turn identities the shipping app accepts into visible
-/// `IdentityUnverified` terminals during the migration, and there is no
-/// evidence the legacy value was too loose. Conservative here means
-/// cutover-compatible, not maximally tight.
+/// seconds. The established 120-second boundary preserves accepted identity
+/// freshness behavior: tightening it would reject identities currently
+/// accepted by the token service. A change requires explicit policy review.
 const IDENTITY_FRESHNESS_SKEW_SECS: u64 = 120;
 
 /// The public half of a pending authorization: the browser URL and the opaque
@@ -314,7 +311,7 @@ where
     ///
     /// The explicitly under-scoped outcome carries no validated identity by
     /// design (the scope verdict is decided before `id_token` validation),
-    /// and the frozen XPC-shaped begin operation supplies no account
+    /// and the begin operation supplies no account
     /// identity, so no subject-keyed snapshot is possible and none is
     /// fabricated. The fail-safe contract is therefore non-destructive:
     /// nothing is persisted and NOTHING is revoked. An existing stored
@@ -324,7 +321,7 @@ where
     /// Candidly, this can leave a first-connect under-scoped grant active at
     /// Google, and this API CANNOT offer an in-app manual revoke for it: the
     /// minted tokens were dropped and there is no validated subject or
-    /// stored credential to key a revoke against. The point-3 UI must
+    /// stored credential to key a revoke against. The caller must
     /// surface the failure, offer retain-or-retry recovery, and direct the
     /// user to their Google account-permissions page to revoke the grant
     /// manually. That cost is accepted because the alternative can destroy a
@@ -349,9 +346,9 @@ where
     /// dedicated [`BrokerError::AuthorizationCodeRejected`] — the sign-in
     /// lapsed — never [`BrokerError::ConsentRevoked`]: nothing is stored on
     /// this path, so no local deletion is asserted or performed. The variant
-    /// stays distinct from [`BrokerError::ProviderRejected`] so the point-3
-    /// XPC/status mapping can route it to a NEW closed v1 operational status
-    /// the app maps to its existing sign-in-expired UI recovery (ADR-0024).
+    /// stays distinct from [`BrokerError::ProviderRejected`] so callers can
+    /// offer sign-in-expired recovery without conflating provider rejection
+    /// or revoked consent (ADR-0024).
     pub async fn complete_authorization(
         &self,
         session_handle: &str,
@@ -445,12 +442,12 @@ where
             TokenScopeOutcome::InsufficientScope { .. } => {
                 // Fail-safe and non-destructive (see the method
                 // documentation): the under-scoped outcome has no validated
-                // identity and the XPC-shaped begin supplies no account
+                // identity and begin supplies no account
                 // identity, so no subject-keyed snapshot exists to gate a
                 // revoke — and a grant-wide revoke could kill an unknown
                 // prior working grant. Nothing is persisted and nothing is
                 // revoked; a possibly stranded first-connect grant is left
-                // for the point-3 UI to retain/retry or to direct the user
+                // for the caller to retain/retry or to direct the user
                 // to Google's account-permissions page for manual
                 // revocation (this API has no validated subject or stored
                 // credential to revoke against).
@@ -582,8 +579,7 @@ where
     /// (`invalid_token` is Google's revoke-endpoint answer for an unknown or
     /// already-revoked token) — and is confirmed IMMEDIATELY with one call.
     /// Any other failure (transport, provider, or malformed response) is
-    /// retried exactly once, mirroring the legacy composition's
-    /// `revoke_best_effort` the broker replaces; the per-subject permit is
+    /// retried exactly once; the per-subject permit is
     /// held across both awaits and the stored credential is loaded only
     /// once. Two retryable failures map to [`BrokerError::RevokeUnconfirmed`]
     /// and the stored token is NEVER deleted here — ADR-0024's disconnect
@@ -615,8 +611,7 @@ where
         // gone at the provider: the desired end state holds, so the revoke is
         // confirmed immediately, with no pointless retry. (`invalid_token` is
         // Google's observed revoke-endpoint answer for an unknown or
-        // already-revoked token.) Any other failure is retried exactly once —
-        // the legacy composition's `revoke_best_effort` semantics — and two
+        // already-revoked token.) Any other failure is retried exactly once; two
         // retryable failures leave the revoke visibly unconfirmed.
         match self.transport.revoke(&token).await {
             Ok(()) | Err(TokenTransportError::InvalidGrant | TokenTransportError::InvalidToken) => {
@@ -847,9 +842,8 @@ fn map_oauth_error(error: OAuthError) -> BrokerError {
 ///
 /// The exchange-only [`TokenError::AuthorizationCodeRejected`] keeps its own
 /// dedicated broker variant: the sign-in lapsed, nothing is stored on the
-/// exchange path, and the point-3 XPC/status mapping must be able to route it
-/// to a NEW closed v1 operational status the app maps to its existing
-/// sign-in-expired UI recovery (ADR-0024) — folding it into
+/// exchange path, and callers must be able to distinguish sign-in-expired
+/// recovery (ADR-0024) — folding it into
 /// [`BrokerError::ProviderRejected`] would make that input indistinguishable
 /// at the broker surface.
 fn map_token_error(error: TokenError) -> BrokerError {
@@ -2028,11 +2022,11 @@ mod tests {
     #[test]
     fn an_explicitly_under_scoped_completion_is_terminal_and_non_destructive() {
         // The under-scoped outcome has no validated identity by design and
-        // the XPC-shaped begin supplies no account identity, so no
+        // begin supplies no account identity, so no
         // subject-keyed snapshot exists and no grant-wide revoke is safe:
         // the pinned fail-safe contract persists nothing and revokes
-        // nothing. Any stranded first-connect grant is left for the point-3
-        // UI to retain/retry or to direct the user to Google's
+        // nothing. Any stranded first-connect grant is left for the caller
+        // to retain/retry or to direct the user to Google's
         // account-permissions page — this API has no validated subject or
         // stored credential to revoke it against.
         let shared = events();
@@ -2077,9 +2071,8 @@ mod tests {
             // An exchange-time invalid_grant is a stale or used authorization
             // code: the token layer keeps it distinct as
             // `TokenError::AuthorizationCodeRejected`, and the broker preserves
-            // that distinction in its closed surface so point 3 can map it to
-            // a NEW closed v1 operational status routed to the app's existing
-            // sign-in-expired UI recovery — NEVER ConsentRevoked, which claims
+            // that distinction so callers can offer sign-in-expired recovery
+            // — NEVER ConsentRevoked, which claims
             // a stored credential was deleted (none exists on this path), and
             // never folded into the ordinary ProviderRejected.
             (
@@ -2235,11 +2228,10 @@ mod tests {
 
     #[test]
     fn the_identity_freshness_skew_matches_the_legacy_120_second_boundary() {
-        // The broker deliberately aligns with the 120-second skew of the
-        // legacy `oauth-sync-macos` composition it replaces at cutover (see
-        // IDENTITY_FRESHNESS_SKEW_SECS), so an identity the shipping app
-        // accepts must stay accepted: one second inside the boundary is
-        // fresh, exactly on it is stale or future.
+        // Preserve the established 120-second skew (see
+        // IDENTITY_FRESHNESS_SKEW_SECS): one second inside the expiry boundary
+        // is fresh; exactly on it is stale. Future-issued claims at the skew
+        // boundary remain accepted by the existing validation contract.
         for claims in [
             claims_for(SUBJECT, NOW - 3_720, NOW - 119), // exp one second inside the skew
             claims_for(SUBJECT, NOW + 120, NOW + 7_200), // iat exactly at the future skew

@@ -672,7 +672,7 @@ Content-Transfer-Encoding: base64\r\n\r\n/9j/4AAQ\r\n\
 
     #[test]
     fn every_inline_text_part_is_shown_in_order() {
-        // Apple Mail style: text, an inline image, more text.
+        // Multipart mixed body: text, an inline image, more text.
         let mixed = b"Subject: s\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n\
 --x\r\nContent-Type: text/plain\r\n\r\nSee the photo:\r\n\
 --x\r\nContent-Type: image/jpeg\r\nContent-Disposition: inline\r\n\

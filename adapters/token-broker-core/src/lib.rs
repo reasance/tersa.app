@@ -2,15 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Portable token-broker lifecycle core (ADR-0024, pass A).
+//! In-process token-service lifecycle core (ADR-0024 and ADR 0031).
 //!
-//! This crate is the runtime-agnostic composition the separately signed macOS
-//! token-broker process will host: it owns OAuth code exchange, refresh,
+//! This runtime-agnostic in-process service owns OAuth code exchange, refresh,
 //! refresh-token persistence, rotation, deletion, and provider revoke over
 //! generic ports, and never exposes a refresh token, PKCE verifier, state, or
-//! authorization code across its API. It deliberately contains no
-//! Keychain/Security.framework code, no C ABI, and no IPC: pass B binds these
-//! ports to the macOS Keychain and the closed XPC protocol.
+//! authorization code across its API. It contains no OS keyring code or IPC.
+//! `tersa-sync-runtime` supplies the Google transport, loopback listener, and
+//! account-bound `SQLCipher` credential store. This logical capability boundary
+//! provides no process isolation from the installation root key (ADR 0031).
 //!
 //! Security invariants enforced here:
 //!
@@ -35,13 +35,13 @@
 //!   working connection. An unreadable snapshot fails closed as
 //!   `PersistenceFailed` before any store write or revoke.
 //! - An explicitly under-scoped completion carries no validated identity and
-//!   the XPC-shaped begin operation supplies no account identity, so no
+//!   the begin operation supplies no account identity, so no
 //!   subject-keyed snapshot is possible: it fails safe and non-destructively
 //!   (nothing persisted, nothing revoked). This can leave a first-connect
 //!   under-scoped grant active at the provider, and this API cannot offer an
 //!   in-app manual revoke for it — the minted tokens were dropped and there
 //!   is no validated subject or stored credential to revoke against. The
-//!   point-3 UI must surface the failure, offer retain-or-retry recovery,
+//!   caller must surface the failure, offer retain-or-retry recovery,
 //!   and direct the user to their Google account-permissions page for manual
 //!   revocation.
 //! - Success values carry only a zeroizing access token, a zeroizing subject,
@@ -50,9 +50,8 @@
 //! - The closed broker error vocabulary keeps an exchange-time
 //!   authorization-code rejection (`BrokerError::AuthorizationCodeRejected` —
 //!   the sign-in lapsed) distinct from an ordinary provider rejection, so the
-//!   point-3 XPC/status mapping can route it to a NEW closed v1 operational
-//!   status, which the app maps to its existing sign-in-expired UI recovery
-//!   (ADR-0024).
+//!   caller can distinguish sign-in-expired recovery from provider rejection
+//!   and revoked consent (ADR-0024).
 
 #![forbid(unsafe_code)]
 

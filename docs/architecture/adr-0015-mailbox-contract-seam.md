@@ -5,8 +5,8 @@
 
 ## Context
 
-The macOS-first product needs portable mailbox contracts before a Gmail
-transport or SQLCipher-backed store exists. The contracts must avoid selecting
+The terminal client needs portable mailbox contracts shared by the Gmail
+transport and SQLCipher-backed store. The contracts must avoid selecting
 an async runtime or exposing user-controlled data in diagnostics.
 
 ## Decision
@@ -47,7 +47,6 @@ and belongs to a reviewed sync protocol.
 
 ## Consequences
 
-Future macOS adapters implement these ports inward. This change makes no
-iPhone or iPad implementation claim and adds no Gmail DTOs, OAuth exchange,
-sync, mutations, labels, attachments, MIME structure, search, cache policy,
-storage implementation, UI or Apple types. It makes no gate status changes.
+Adapters implement these ports inward. The contract seam adds no transport,
+storage engine, runtime, renderer, or platform types. Sync, mutation, search,
+and cache behavior require their own reviewed contracts.

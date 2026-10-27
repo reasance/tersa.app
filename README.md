@@ -43,8 +43,8 @@ tersa has no releases yet. From a checkout:
 ## Project status
 
 See the [roadmap](docs/roadmap.md) and
-[ADR 0031](docs/architecture/adr-0031-tui-only-pivot.md), which moved tersa
-from a native Apple client to a terminal client. Security boundaries are in
+[ADR 0031](docs/architecture/adr-0031-tui-only-pivot.md) for the terminal
+architecture. Security boundaries are in
 the [threat model](docs/security/threat-model.md) and
 [data flow](docs/security/data-flow.md).
 
