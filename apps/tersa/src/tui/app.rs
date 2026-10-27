@@ -210,7 +210,18 @@ pub enum SyncState {
     /// The last sync finished at this time.
     Synced(i64),
     /// The last sync failed, with a message for the reader.
-    Failed(String),
+    Failed(SafeText),
+}
+
+/// Independent display state for one account's sync cycle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountSync {
+    pub account: AccountId,
+    pub state: SyncState,
+    /// Retained even when a later attempt fails or is still running.
+    pub last_success: Option<i64>,
+    /// Wall-clock display of the worker's next five-minute start deadline.
+    pub next_sync: Option<i64>,
 }
 
 /// A search over the loaded rows.
@@ -255,7 +266,7 @@ pub struct App {
     pub list_offset: usize,
     pub screen: Screen,
     pub search: Search,
-    pub sync: SyncState,
+    pub sync: Vec<AccountSync>,
     pub help: bool,
     pub status: Option<String>,
     pub quit: bool,
@@ -291,6 +302,15 @@ fn listed_after(row: &Row, key: &MessageKey, received_at: i64) -> bool {
 impl App {
     pub fn new(accounts: Vec<(AccountId, SafeText)>, rows: Vec<Row>) -> Self {
         let shown = (0..rows.len()).collect();
+        let sync = accounts
+            .iter()
+            .map(|(account, _)| AccountSync {
+                account: account.clone(),
+                state: SyncState::Idle,
+                last_success: None,
+                next_sync: None,
+            })
+            .collect();
         Self {
             accounts,
             unavailable_accounts: Vec::new(),
@@ -301,7 +321,7 @@ impl App {
             list_offset: 0,
             screen: Screen::Inbox,
             search: Search::default(),
-            sync: SyncState::Idle,
+            sync,
             help: false,
             status: None,
             quit: false,
@@ -675,12 +695,42 @@ impl App {
         }
     }
 
-    /// Records the end of a sync.
-    pub fn synced(&mut self, result: Result<(), String>, now_millis: i64) {
-        self.sync = match result {
-            Ok(()) => SyncState::Synced(now_millis),
-            Err(error) => SyncState::Failed(error),
+    /// Records only this account's admission, without erasing prior success.
+    pub fn sync_started(&mut self, account: &AccountId, next: Option<i64>) -> bool {
+        let Some(sync) = self.sync.iter_mut().find(|sync| &sync.account == account) else {
+            return false;
         };
+        let changed = sync.state != SyncState::Running || sync.next_sync != next;
+        sync.state = SyncState::Running;
+        sync.next_sync = next;
+        changed
+    }
+
+    /// Records an account-specific completion without overwriting its peers.
+    pub fn synced(
+        &mut self,
+        account: &AccountId,
+        result: Result<(), String>,
+        now_millis: i64,
+        next: Option<i64>,
+    ) {
+        let Some(sync) = self.sync.iter_mut().find(|sync| &sync.account == account) else {
+            return;
+        };
+        sync.state = match result {
+            Ok(()) => {
+                sync.last_success = Some(now_millis);
+                SyncState::Synced(now_millis)
+            }
+            Err(error) => SyncState::Failed(SafeText::single_line(&error)),
+        };
+        sync.next_sync = next;
+    }
+
+    pub fn syncing(&self) -> bool {
+        self.sync
+            .iter()
+            .any(|sync| sync.state == SyncState::Running)
     }
 
     /// Asks to show the open message in its other format.
@@ -1153,10 +1203,20 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
             app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
             Some(Request::Sync)
         );
-        app.synced(Ok(()), 42);
-        assert_eq!(app.sync, SyncState::Synced(42));
-        app.synced(Err("offline".to_owned()), 43);
-        assert_eq!(app.sync, SyncState::Failed("offline".to_owned()));
+        app.synced(&account("acct"), Ok(()), 42, Some(300_042));
+        assert_eq!(app.sync[0].state, SyncState::Synced(42));
+        assert_eq!(app.sync[0].last_success, Some(42));
+        app.synced(
+            &account("acct"),
+            Err("offline".to_owned()),
+            43,
+            Some(300_043),
+        );
+        assert_eq!(
+            app.sync[0].state,
+            SyncState::Failed(SafeText::single_line("offline"))
+        );
+        assert_eq!(app.sync[0].last_success, Some(42));
     }
 
     /// The unified order breaks equal received times by account, then
