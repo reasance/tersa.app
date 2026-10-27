@@ -49,13 +49,9 @@ pub enum BrokerError {
     /// mismatched, so the sign-in itself lapsed. Non-destructive: nothing is
     /// stored on the exchange path, so this is never a deletion license and
     /// never [`Self::ConsentRevoked`]. The broker keeps this terminal distinct
-    /// from [`Self::ProviderRejected`] so the point-3 XPC/status mapping can
-    /// route it to a NEW closed v1 operational status (today's five v1
-    /// skeleton cases carry no operational recovery status; point 3 extends
-    /// the reviewed closed set) that the app maps to its existing
-    /// sign-in-expired "sign in again" UI recovery (ADR-0024); it widens
-    /// neither the broker surface beyond this closed variant nor the wire
-    /// protocol into an open-ended channel.
+    /// from [`Self::ProviderRejected`] so callers can offer sign-in-expired
+    /// "sign in again" recovery (ADR-0024) without exposing provider data or
+    /// conflating it with revoked consent.
     AuthorizationCodeRejected,
     /// The token or revocation endpoint could not be reached.
     Transport,
@@ -69,7 +65,7 @@ pub enum BrokerError {
     /// non-destructive — it can leave a first-connect under-scoped grant
     /// active at the provider, which this API cannot revoke in-app (the
     /// minted tokens were dropped and no validated subject or stored
-    /// credential exists to revoke against). The point-3 UI must offer
+    /// credential exists to revoke against). The caller must offer
     /// retain-or-retry recovery and direct the user to their Google
     /// account-permissions page for manual revocation; the contract can
     /// never destroy an unknown prior working grant. On refresh any rotated
@@ -101,7 +97,7 @@ pub enum BrokerError {
     /// pre-mutation snapshot during completion fails closed the same way,
     /// before any store write or provider revoke.
     ///
-    /// Point 3 must not treat every `PersistenceFailed` as an ordinary
+    /// Callers must not treat every `PersistenceFailed` as an ordinary
     /// transient: after a definitive refresh-time `invalid_grant`, a delete
     /// failure intentionally fails closed HERE instead of reporting
     /// [`Self::ConsentRevoked`], withholding the re-connect signal until the

@@ -5,8 +5,8 @@
 //! The narrow ports the broker composition is generic over.
 //!
 //! [`RefreshTokenStore`] is keyed ONLY by validated subject text: no generic
-//! key, query, service, or access-group parameter exists, so a caller cannot
-//! turn the credential store into a general-purpose Keychain RPC (ADR-0024).
+//! key, query, or service parameter exists, so a caller cannot turn the
+//! credential store into a general-purpose secret-store interface (ADR-0024).
 //! [`SessionHandleEntropy`] makes session-handle randomness injectable so
 //! deterministic tests never depend on OS randomness; the production default
 //! uses `getrandom`.

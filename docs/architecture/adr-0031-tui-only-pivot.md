@@ -11,19 +11,15 @@ one at https://mozilla.org/MPL/2.0/.
 
 ## Context
 
-tersa was planned as a macOS-first native client: a SwiftUI/AppKit
-application over a shared Rust core, an Apple bridge with a closed C ABI, a
-separately signed XPC token broker (ADR 0024), App Group and Data Protection
-Keychain storage (ADR 0019), and Apple signed-distribution acceptance gates
-(ADR 0013, ADR 0021). Most of the remaining Phase 1 work was Apple
-distribution, signing, and UI acceptance rather than mail-client behavior.
+The product owner decided on 2026-10-03 that tersa is a **terminal (TUI)
+client only**, built around portable Rust domain invariants, mailbox ports,
+PKCE/token lifecycle, identity gating, bounded sync, metadata search, the Gmail
+REST adapter, and SQLCipher. macOS and Linux remain supported.
 
-The product owner decided on 2026-10-03 that tersa becomes **a terminal (TUI)
-client only**. The Rust core already holds the portable value: domain
-invariants, mailbox ports, PKCE and token lifecycle, the identity gate, bounded
-sync, metadata search, the Gmail REST adapter, and the SQLCipher store.
-
-The last commit of the Apple-era tree is tagged `pre-tui-pivot`.
+Earlier architecture and removed implementation records remain in Git history
+and at the `pre-tui-pivot` tag. This ADR defines the current architecture;
+accepted future work is distinguished from implementation in the
+[roadmap](../roadmap.md) and [security data flow](../security/data-flow.md).
 
 ## Decision
 
@@ -32,14 +28,13 @@ The last commit of the Apple-era tree is tagged `pre-tui-pivot`.
 - tersa is one Rust binary, `tersa`, that runs a full-screen terminal UI.
   Non-interactive subcommands (`account add|list|remove`, `sync`, `doctor`)
   share the same core.
-- Supported platforms are **macOS and Linux** (x86_64 and aarch64). Windows,
-  iOS, iPadOS, and any GUI surface are out of scope.
+- Supported platforms are **macOS and Linux** (x86_64 and aarch64). Windows
+  and graphical clients are out of scope.
 - The MVP is a full client: multi-account with a unified inbox, reading,
   search, offline reopen, triage (archive, read state, labels, trash, undo),
   and composition (local-first drafts, reply, forward, attachments, and an
   idempotent outbox). Composition uses `$EDITOR`.
-- Distribution is a Homebrew tap with prebuilt binaries. A notarized DMG and
-  the Mac App Store are no longer planned.
+- Planned distribution is a Homebrew tap with prebuilt terminal binaries.
 - Gmail access remains the official Gmail API with OAuth 2.0 PKCE and a
   loopback redirect. Users configure their own Google Cloud "Desktop app"
   OAuth client until the project has a Google-verified client.
@@ -69,7 +64,7 @@ Accepted residual: without separately signed processes there is no runtime
 barrier between the refresh token and the root key inside one user account.
 Same-user code that can read the keyring item, or capture the passphrase, can
 decrypt local data. Linux Secret Service has no per-application access
-control. These residuals replace the ADR 0024 process-isolation claim.
+control. These are the current token-custody residuals recorded in ADR 0024.
 
 ### TLS and native crypto
 
@@ -118,21 +113,22 @@ control. These residuals replace the ADR 0024 process-isolation claim.
 - ADRs are written only for decisions that change architecture, security
   boundaries, or the data model.
 
-### Superseded and amended decisions
+### Retained decisions
 
-| ADR | Effect |
+ADR numbers are stable; removed documents are not renumbered. Retired-only
+planning and diagnostic records live in Git history rather than current guidance.
+
+| ADR | Current decision |
 | --- | --- |
-| 0013 macOS-first phasing | Superseded. |
-| 0014 macOS production dependency boundaries | Superseded by the layering rules above and `cargo deny`. |
-| 0016 Gmail REST adapter | Amended: renamed `tersa-gmail-rest` and made portable (macOS and Linux). |
-| 0017 production macOS account store | Amended: renamed `tersa-store-sqlcipher` and made portable (macOS and Linux). |
-| 0019 macOS key provisioning and read-only CLI | Amended: HKDF framing retained; Keychain access groups, App Group layout, and CLI authority split superseded. |
-| 0020 macOS production UI toolkit | Superseded. |
-| 0021 macOS UI vertical slice | Superseded. |
-| 0022 performance as a primary constraint | Amended: TUI budgets below replace the macOS acceptance-protocol budgets. |
-| 0023 OAuth and bounded sync | Amended: loopback listener moves to Rust; BYO client configuration. |
-| 0024 macOS token process isolation | Superseded by the accepted residual above. |
-| 0026–0030 | Amended: their data-model, sync, outbox, and blob decisions carry over; Apple surfaces (App Group, Swift UI, WebKit/native rich rendering, Face ID app lock) are replaced by the terminal equivalents in this ADR. |
+| 0006 | No project-operated backend; OSI-approved production dependencies. |
+| 0015–0018 | Portable mailbox contracts, Gmail REST, SQLCipher, bounded snapshot sync. |
+| 0019 | Purpose-separated HKDF, trusted provisioning, strict read-only store access and filesystem residuals. |
+| 0022 | Performance as a primary, continuously measured constraint. |
+| 0023–0024 | Rust loopback OAuth, immutable subject identity gate, in-process lifecycle, encrypted token custody and recovery residuals. |
+| 0026 | Account isolation and registry decisions; bounded unified-query and reset/FTS plans. |
+| 0027–0028 | Future capability-gated History/commands, durable drafts and reconciled outbox. |
+| 0029 | Sanitized terminal content, no remote resource fetch, validated editor/MIME boundary. |
+| 0030 | Future encrypted blob publication/recovery, allocated-byte budget and vault-authenticated lock. |
 
 ### Initial TUI performance budgets
 
@@ -146,7 +142,7 @@ ADR changes the budget.
 
 | Milestone | Scope |
 | --- | --- |
-| T0 | This ADR; removal of Apple sources, FFI crates, and Apple CI; minimal `xtask`. |
+| T0 | Terminal architecture baseline, portable workspace boundaries, minimal `xtask`. |
 | T1 | Portable adapters, `crates/keys`, `adapters/vault`, Rust loopback OAuth, in-process token service, `tersa account add`. |
 | T2 | Read-only TUI: inbox, thread, search, offline reopen, background sync, sanitizer, HTML to text. |
 | T3 | Multi-account registry and unified inbox. |
@@ -161,14 +157,10 @@ every pull request and gets its manual validation and packaging in T8.
 
 ## Consequences
 
-- `apple/`, the Apple bridge, the mailbox-sync and token-broker FFI crates,
-  Apple CI lanes, macOS acceptance and distribution protocols, and their
-  evidence are removed. They remain available at the `pre-tui-pivot` tag.
-- The Gmail and SQLCipher adapters are renamed and made portable in T1a;
-  `tersa-keychain-macos`, `tersa-oauth-sync-macos`, and `tersa-cli-macos`
-  remain macOS-only until T1d replaces them.
-- PR 33b, Apple signing campaigns, and the Phase 1 item 7 and item 8 gates are
-  closed as not applicable.
+- Core crates retain pure contracts; platform/network/storage behavior belongs
+  to adapters, composed by the terminal app and account runtime.
+- The current tree contains the terminal product and its applicable decisions;
+  Git history and tags retain removed implementation records.
 - On macOS, keyring access control is tied to the binary's code signature.
   Unstably signed builds re-prompt for Keychain access; T7 decides the
   release-signing approach.

@@ -1,8 +1,7 @@
 # Dependency rules
 
-The Apple-era per-crate dependency allowlists were retired by
-[ADR 0031](adr-0031-tui-only-pivot.md); the previous text is available at the
-`pre-tui-pivot` tag.
+Current dependency boundaries follow [ADR 0031](adr-0031-tui-only-pivot.md),
+`CORE_POLICY` in `xtask/src/main.rs`, and `cargo deny`.
 
 ## Layers
 

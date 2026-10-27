@@ -10,6 +10,12 @@ one at https://mozilla.org/MPL/2.0/.
 - Amended by: [ADR 0031](adr-0031-tui-only-pivot.md) (terminal-only pivot)
 - Date: 2026-08-29
 
+## Implementation status
+
+History, modify capability, and mailbox commands are accepted future T4 work.
+The current terminal mailbox adapter remains read-only; the following contracts
+are requirements for future slices, not implemented behavior.
+
 ## Context
 
 [ADR 0023](adr-0023-step3-oauth-and-bounded-sync.md) intentionally delivered a
@@ -22,39 +28,24 @@ of truth or allow a permanent-delete operation.
 The existing Gmail adapter is GET-only and the broker is the sole refresh-token
 authority. Those are current implementation facts, not obstacles to a reviewed
 extension: the new write transport and the capability upgrade must remain
-separate from token custody, local store ownership, and the narrow ABI.
+separate from token custody, local store ownership, and bounded terminal models.
 
 ## Prerequisite decision and policy slices
 
-No modify, History, or mailbox-command implementation may start until an
-independent `docs-only`/`policy-xtask` sequence does all of the following:
+Before T4 implementation, independently review:
 
-1. amend ADR 0023's read-only enforcement so it remains strict for
-   `ReadOnly` accounts and becomes an explicit, subject-validated
-   `Modify` capability gate for upgraded accounts;
-2. add **P27-oauth capability policy**: replace
-   `crates/application/src/oauth.rs::REQUESTED_SCOPE`,
-   `prepare_authorization`, and `AuthorizationSession::finish` scope predicate
-   with a capability-parameterized request/predicate pair. `ReadOnly` requests
-   and requires `gmail.readonly`; `Modify` requests and requires `gmail.modify`.
-   The same requested capability must parameterize the
-   `adapters/gmail-rest-macos` token-response scope predicate. Positive and
-   negative fixtures prove both cross-capability mismatches fail closed;
-3. amend ADR 0016's GET-only `GmailMailbox` decision by retaining that read
-   component and introducing a separately allowlisted modify component, rather
-   than silently teaching the existing GET-only object to write;
-4. amend ADR 0018's History/mutation/outbox non-claims and define the bounded
-   snapshot interaction below; and
-5. repoint the ABI, adapter, dependency, and tracked-source guards to those
-   exact read/modify components, with negative fixtures proving that a
-   `ReadOnly` account cannot reach a modify endpoint; and
-6. add **P27-security documentation** before new provider write egress or
-   History persistence: amend the security data flow and threat model for
-   encryption, File Protection posture, backup, deletion, app lock, diagnostics,
-   desired state, and ambiguous command recovery.
+1. A capability-parameterized OAuth request and response predicate for both
+   callback and token transport. `ReadOnly` requests/requires `gmail.readonly`;
+   `Modify` requests/requires `gmail.modify`. Positive/negative fixtures must
+   reject both cross-capability mismatches.
+2. A separate allowlisted modify component alongside GET-only `GmailMailbox`,
+   with endpoint/owner/dependency policy and negative ReadOnly write fixtures.
+3. The interaction with bounded snapshot sync in ADR 0018, transactional History
+   persistence, and the account-bound command ports below.
+4. Security data-flow/threat-model updates for encryption, file permissions,
+   backup, deletion, lock, diagnostics, desired state, and ambiguous recovery.
 
-These amendments are prerequisites, not claims that the existing ADRs or
-guards have already changed.
+These prerequisites do not claim current guards or read-only scope have changed.
 
 ## Decision
 
@@ -78,9 +69,8 @@ upgrade response explicitly omitting `gmail.modify` follows ADR 0024's
 stranded-under-scoped-grant residual: it is not persisted or revoked in-app
 because it has no validated identity/revocation handle. The UI presents manual
 Google Account revocation guidance, preserves any old read-only grant, and
-exposes no mutation capability. The broker protocol reports capability as a
-closed status/document field; it never reports scope strings, a refresh token,
-or token response data to Swift.
+exposes no mutation capability. Terminal models report capability as a closed field; they never expose scope
+strings, refresh tokens, or raw token responses.
 
 The Gmail adapter gains two account-bound inward ports:
 
@@ -145,8 +135,7 @@ and history cursor is validated before constructing a URL or local query.
 ### Invariants and data flow
 
 ```text
-Swift user intent
-  -> versioned bridge command (AccountId + bounded command document)
+Terminal user intent (AccountId + bounded command)
   -> MailboxCommandCoordinator
   -> SQLCipher desired-state transaction
   -> account-bound Gmail modify request
@@ -165,24 +154,15 @@ Swift user intent
   message.
 - The main process continues to own Gmail mailbox access and SQLCipher. The
   broker retains OAuth exchange, refresh, rotation, revoke, and token deletion.
-- Any new C ABI symbol is versioned, bounded, data-only, and accompanied by the
-  exact export allowlist, count, canonical header, Swift declaration, reviewed
-  Swift-call table, policy, and positive/negative fixture update required by
-  ADR 0021.
+- Terminal command/recovery models carry only bounded, sanitized data and closed
+  statuses. No direct UI network mutation bypasses the coordinator.
 
-### Implementation decomposition by change class
+### Implementation decomposition
 
-| Change class | Bounded implementation responsibility |
-| --- | --- |
-| `docs-only` | Amend ADRs 0016, 0018, and 0023 plus P27-security documentation before implementation. |
-| `policy-xtask` | Parameterize scope/endpoint/ABI/dependency guards and add cross-capability fixtures only. |
-| `domain` | Add cursor, command, desired-state, label, and per-account result values. |
-| `application` | Add History/command ports and runtime-neutral coordinator state machines. |
-| `adapter-rust — tersa-gmail-rest-macos` | Add the separately allowlisted History and modify transport components. |
-| `adapter-rust — tersa-store-sqlcipher-macos` | Add cursor, desired-state, label, and atomic reconciliation transactions. |
-| `token-broker` | Add the same-subject `ReadOnly` to `Modify` capability upgrade through XPC. |
-| `bridge-ffi` | Add one reviewed command/history status surface after the contract slices. |
-| `swift-ui` | Add capability-upgrade, pending, partial, ambiguous, and recovery states. |
+Sequence capability and security policy, domain values, application ports and
+coordinator, one adapter at a time (`tersa-gmail-rest` or
+`tersa-store-sqlcipher`), runtime composition, and TUI recovery. Each slice uses
+the current [change classes](../development/agent-playbook.md).
 
 ## Failure handling
 
@@ -218,17 +198,16 @@ supports it.
   idempotent replay after restart.
 - Adapter tests use bounded provider fixtures for every approved endpoint and
   reject a wrong account, ID, scope, URL, or response shape before mutation.
-- A signed Apple Development run must demonstrate same-account capability
-  upgrade, a command, History convergence, and both Keychain wrong-group
-  denials before real modify use is treated as operational evidence. A Developer
-  ID/notarized candidate remains required for release acceptance.
+- Separately authorized live evidence must demonstrate same-account capability
+  upgrade, a command, and History convergence on the exact candidate. Local fakes
+  do not prove provider writes, keyring runtime behavior, or release acceptance.
 
 ## Non-claims
 
 This ADR does not implement the ports, approve the prerequisite amendments,
 grant Google verification, prove a live modify exchange, add a relay/push
 service, execute background jobs, support permanent delete or mute/unmute,
-create a mutable CLI/MCP surface, or pass signed-distribution evidence. It does
+create an MCP surface, or pass release validation. It does
 not allow `gmail.send` or `mail.google.com`, and it does not promise lossless
 full-mailbox synchronization beyond the bounded recovery protocol or claim
 in-app cleanup of an ADR-0024 stranded under-scoped grant.

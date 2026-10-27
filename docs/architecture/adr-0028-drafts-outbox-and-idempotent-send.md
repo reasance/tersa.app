@@ -10,37 +10,34 @@ one at https://mozilla.org/MPL/2.0/.
 - Amended by: [ADR 0031](adr-0031-tui-only-pivot.md) (terminal-only pivot)
 - Date: 2026-08-29
 
-## Context
+## Implementation status and context
 
-The current macOS composer is intentionally in-memory only. A usable beta
-needs local drafts, Gmail draft synchronization, attachments, and sending, but
-a provider timeout after accepting a message makes a simple retry capable of
-mailing a duplicate. The outbox must therefore be a durable Rust-owned state
-machine, not a Swift queue or a best-effort network callback.
+Drafts, composition, attachments, and send are accepted future T5 work. The
+terminal editing surface is `$EDITOR` under ADR 0031; the durable outbox remains
+a Rust-owned state machine. A provider timeout after accepting a message makes
+blind retry capable of mailing a duplicate.
 
-This ADR depends on the account/capability boundary in
-[ADR 0026](adr-0026-macos-multi-account-and-unified-mailbox.md), the
-`gmail.modify` command capability in
-[ADR 0027](adr-0027-gmail-modify-history-and-mailbox-commands.md), the native
-rich-composition model in
-[ADR 0029](adr-0029-safe-html-native-rendering-and-rich-composition.md), and
-encrypted blobs in
+This plan depends on account isolation in
+[ADR 0026](adr-0026-multi-account-and-unified-mailbox.md), capability and History
+in [ADR 0027](adr-0027-gmail-modify-history-and-mailbox-commands.md), safe content
+and composition boundaries in
+[ADR 0029](adr-0029-safe-content-and-composition.md), and encrypted blobs in
 [ADR 0030](adr-0030-encrypted-blobs-storage-budget-and-app-lock.md).
 
 ## Prerequisite decision and policy slices
 
 No draft, send, attachment, or export implementation may start until the
-proposed ADRs 0026–0030 and their prerequisite policies are independently
+ADRs 0026–0030 and their prerequisite policies are independently
 accepted. A dedicated `docs-only` security ADR must additionally define an
 importable encrypted draft-bundle format, explicit passphrase UI, versioning,
 verification, import conflict behavior, and recovery. A separate `policy-xtask`
-slice, coordinated with ADR 0030 P30-dependency policy, must select/pin the
-Argon2id/XChaCha20-Poly1305 dependency path and add the required redaction/ABI
+slice, coordinated with ADR 0030 dependency policy, must select/pin the
+Argon2id/XChaCha20-Poly1305 dependency path and add the required redaction and format
 fixtures before bundle code is eligible.
 
-Before draft/outbox persistence or Gmail send egress, **P28-security
+Before draft/outbox persistence or Gmail send egress, **security
 documentation** must amend the security data flow and threat model for encrypted
-drafts/outbox, File Protection posture, backup/export/import, deletion,
+drafts/outbox, file-permission posture, backup/export/import, deletion,
 app-lock behavior, diagnostics, stable identifiers, and ambiguous-send recovery.
 
 ## Decision
@@ -66,10 +63,9 @@ stable message ID, MIME digest, encoded length, and closed phase `Prepared` or
 `Dispatched`; it contains no token and no plaintext MIME.
 
 `DraftStore` persists each account-scoped edit transactionally before the UI
-reports it saved. It stores the structured `RichComposeDocument`, recipients,
+reports it saved. It stores the validated editor text, recipients,
 references, attachment `BlobRef`s, local draft ID, optional replaceable Gmail
-draft ID, and the last observed remote draft revision. There is no in-memory
-only draft path after this ADR lands.
+draft ID, and the last observed remote draft revision. There is no in-memory-only draft path after implementation.
 
 `GmailDraftTransport` synchronizes a local saved draft only when the account is
 online and has `Modify` capability. A local dirty draft always wins over an
@@ -86,14 +82,14 @@ stable `DraftId` remains the local user route.
 The application layer adds `DraftStore`, `OutboxStore`, `GmailDraftTransport`,
 `GmailSendTransport`, and `OutboxCoordinator` as runtime-neutral ports/use
 cases. The coordinator is the sole production owner of state transitions and
-is invoked on a bounded Rust worker; Swift observes versioned state documents
-and submits intents only.
+runs on a bounded Rust worker; the TUI observes bounded sanitized state and
+submits intents only.
 
 Sending transitions are exact:
 
 1. `Queued` records the immutable `RfcMessageId` and selected draft revision.
 2. `Preparing` reads the encrypted selected revision and attachment `BlobRef`s,
-   compiles the structured document into plain text plus allowed HTML, and builds
+   validates the saved editor document and builds
    the complete transfer-encoded MIME source deterministically. The 20 MiB cap is
    checked before any provider request; an over-limit item remains an editable
    local draft and creates no provider-side attempt. The bounded MIME bytes are
@@ -144,13 +140,14 @@ Sending transitions are exact:
     `AbandonedAmbiguous`; it is never retried automatically or manually as the
     same draft-create or send attempt.
 
-The MIME compiler creates `multipart/alternative` for plain text plus HTML,
-`multipart/related` when inline CID resources exist, and `multipart/mixed` when
-attachments exist. It accepts only the AST from ADR 0029, never raw editor HTML.
-There is no blind second send, no mutable message-ID, and no provider retry
-outside this state machine. The app resumes a durable outbox only while it is
-running and has connectivity; it makes no scheduling or delivery guarantee
-while the Mac is asleep, off, or the app is not running.
+The terminal MVP compiles validated plain editor text and attachment references
+into deterministic MIME; multipart framing is used when attachments require it.
+Any future structured compose model must deterministically generate plain/allowed
+HTML from a closed AST, never accept arbitrary editor HTML as trusted markup.
+Such an extension requires its own reviewed scope decision under ADR 0029.
+There is no blind second send, mutable message ID, or provider retry outside the
+state machine. Durable outbox work resumes only while tersa runs with connectivity;
+there is no scheduling/delivery guarantee while the host sleeps or is off.
 
 Disconnect is blocked when an account has a nonterminal draft/outbox obligation.
 The user must explicitly send it, delete it, complete a verified encrypted
@@ -163,15 +160,14 @@ revoke/delete and local account purge proceed.
 ### Invariants and data flow
 
 ```text
-Native TextKit editor
-  -> versioned compose document over the bridge
+$EDITOR text validated by Rust
   -> DraftStore transaction in the account SQLCipher store
   -> deterministic complete MIME + 20 MiB check
   -> ADR-0030 non-evictable PreparedMimeRef
   -> durable pre-ID DraftCreateAttempt -> Gmail draft transport
   -> persisted GmailDraftId -> Gmail send transport
   -> History/message-ID reconciliation
-  -> closed state document back to Swift
+  -> closed sanitized state back to the TUI
 ```
 
 - Drafts, outbox entries, attachments, remote draft IDs, and message-ID
@@ -191,28 +187,21 @@ Native TextKit editor
   after dispatch from a newer draft revision.
 - The broker continues to provide only transient access tokens. Tokens, keys,
   raw MIME, recipients, subject, and message IDs never appear in diagnostics or
-  bridge error text.
+  terminal error text.
 - The 20 MiB limit measures the complete transfer-encoded MIME source, not
   only attachment files, and is checked before `drafts.create`, `drafts.update`,
   or send dispatch. Over-limit items remain editable local drafts and produce no
   provider upload or partial remote draft.
-- Every draft/outbox C ABI addition must atomically update the exact expected
-  export allowlist, export count, canonical header, Swift declarations, and
-  positive/negative fixtures; no name-only allowance is valid.
+- The TUI submits intents through application use cases and never sends directly.
+  Persistence, preparation, dispatch, and reconciliation remain distinct and tested.
 
-### Implementation decomposition by change class
+### Implementation decomposition
 
-| Change class | Bounded implementation responsibility |
-| --- | --- |
-| `docs-only` | Define the importable bundle ADR and P28-security documentation before persistence/egress code. |
-| `policy-xtask` | Select bundle dependencies and add outbound, ABI, redaction, and no-direct-Swift-send guards only. |
-| `domain` | Add draft/outbox IDs, MIME digest/prepared-reference and pre-ID attempt values, conflict/tombstone values, closed state machine, and redacted result types. |
-| `application` | Add draft/outbox ports and the sole prepare/draft-create/send/reconciliation transition coordinator. |
-| `adapter-rust — tersa-store-sqlcipher-macos` | Add account-scoped drafts, prepared-MIME references, pre-ID attempts, outbox/tombstone state, and atomic transition storage. |
-| `adapter-rust — tersa-gmail-rest-macos` | Add Gmail draft create/update, exact-Message-ID draft lookup, send, search, and upload transport under `gmail.modify`. |
-| `bridge-ffi` | Expose one bounded draft/outbox document and intent surface with atomic ABI fixtures. |
-| `swift-ui` | Replace the ephemeral composer with autosave, conflict, abandon, verified-export, and recovery UI. |
-| `token-broker` | Consume ADR 0027 capability/status only; add no credential operation. |
+Sequence the importable bundle/security decisions and dependency policy before
+domain states, application coordinator, one SQLCipher/Gmail adapter at a time,
+runtime composition, and TUI/editor recovery. Use the current
+[change classes](../development/agent-playbook.md). No new provider endpoint or
+persistence format is authorized by incidental UI wiring.
 
 ## Failure handling
 
@@ -249,7 +238,7 @@ obligations are explicitly resolved.
   ambiguous initial create, bounded exact-Message-ID draft adoption, zero/multiple
   pre-ID matches remaining unresolved, no second create, send success with lost
   response, and draft-ID-first/Message-ID-secondary send reconciliation.
-- Swift tests cover autosave, accessible conflict/send recovery, blocked
+- TUI/editor tests cover durable saving, accessible conflict/send recovery, blocked
   disconnect, and no direct network send path.
 - A live Gmail send merge gate requires a separate owner authorization for one
   exact attempt that proves persisted-draft send, Message-ID round trip, and
@@ -262,7 +251,7 @@ obligations are explicitly resolved.
 This ADR does not implement sending, approve the bundle/security prerequisite,
 grant `gmail.send`, guarantee delivery when the app is absent, support scheduled
 send, aliases, permanent delete, unbounded attachments, plaintext export,
-iOS/iPadOS, a mutating CLI/MCP path, or release evidence. It does not claim that
+an MCP path, or release evidence. It does not claim that
 Gmail offers an idempotency key; duplicate prevention is the application's
 reconciliation protocol and retains documented ambiguity until resolved or
 explicitly abandoned.

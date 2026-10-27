@@ -5,7 +5,5 @@
 *.jpeg binary
 *.gif binary
 *.pdf binary
-*.xcworkspace/** linguist-generated
-*.xcodeproj/** linguist-generated
 Cargo.lock linguist-generated=false
 *.patch -whitespace

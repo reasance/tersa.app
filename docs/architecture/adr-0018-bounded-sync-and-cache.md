@@ -5,7 +5,7 @@
 
 ## Context
 
-Phase 1 needs an offline recent inbox without making a lossless mailbox-sync,
+The terminal client needs an offline recent inbox without making a lossless mailbox-sync,
 background-refresh, or cache-budget claim. The Gmail adapter can return an
 empty page with a fresh continuation token when all attempted message hydrations
 were 404, so bounded pagination must permit that case without risking a loop.
@@ -43,7 +43,7 @@ headers, or bodies.
 This is bounded recent-snapshot bootstrap/refresh only. It adds no Gmail
 History/cursor, deletion reconciliation, retry, background work,
 mutations/outbox/labels, blob/search/CLI/UI, real credentials/network tests,
-mobile implementation, or gate-status change. Older or deleted remote rows may
+platform-runtime evidence. Older or deleted remote rows may
 remain locally until deterministic pruning displaces them. Cache budgets remain
 constraints, not evidence.
 
@@ -52,4 +52,4 @@ constraints, not evidence.
 The local store remains responsible for atomic reconcile and conditional cache
 writes. Adapters continue to own their transaction and cancellation evidence;
 the application layer stays independent of runtimes, transports, storage
-engines, Apple APIs, and UI frameworks.
+engines, OS APIs, and terminal frameworks.
