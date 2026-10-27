@@ -4,7 +4,10 @@
 
 //! The ADR 0031 performance budgets, measured on a full cache: an encrypted
 //! store holding 10,000 envelopes (the most a cache can keep; the default
-//! sync policy keeps 100) and 25 bodies.
+//! sync policy keeps 100) and 25 bodies. A second case reads five accounts'
+//! caches of 2,000 envelopes each, whose timestamps interleave, as one
+//! merged list. First frames request 100 global rows (per-account probes 101);
+//! later pages and reloads request at most 200 (per-account probes at most 201).
 //!
 //! These tests are ignored by default and kept out of CI, which is for
 //! correctness. Run them on a release build:
@@ -34,14 +37,12 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use tersa_application::mailbox::{
-    AccountId, HeaderText, MailboxReader, MailboxStore, Message, MessageContent, MessageEnvelope,
-    MessageId, StoreLimit, ThreadId, UnixTimestampMillis,
+    AccountEmail, AccountId, HeaderText, MailboxReader, MailboxStore, Message, MessageContent,
+    MessageEnvelope, MessageId, StoreLimit, ThreadId, UnixTimestampMillis,
 };
-use tersa_presentation::terminal::SafeText;
 use tersa_store_sqlcipher::{DatabaseKey, IntegrityScan, SqlCipherMailboxStore};
 
-use super::app::App;
-use super::{FIRST_PAGE, PAGE, load_page, read_page, view};
+use super::{PAGE, load_page, view};
 use crate::commands::StoreSource;
 
 /// ADR 0031 budgets.
@@ -51,6 +52,11 @@ const IDLE_RSS_MIB: f64 = 50.0;
 
 const MESSAGES: usize = 10_000;
 const BODIES: usize = 25;
+
+/// The multi-account case: this many caches of [`ACCOUNT_MESSAGES`]
+/// envelopes each, whose timestamps interleave, in one merged list.
+const ACCOUNTS: usize = 5;
+const ACCOUNT_MESSAGES: usize = 2_000;
 
 /// A temporary directory removed when dropped.
 struct Fixture {
@@ -134,11 +140,91 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 fn source(store: SqlCipherMailboxStore) -> StoreSource {
     StoreSource {
-        store,
-        account: account(),
+        stores: vec![(account(), Some(store))],
+        requests: std::cell::RefCell::default(),
         executor: tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap(),
+    }
+}
+
+fn multi_account(number: usize) -> AccountId {
+    AccountId::new(format!("acct_perf_{number}")).unwrap()
+}
+
+/// The multi-account fixture: one cache per account, each holding its share
+/// of the envelopes so the merged list interleaves them, and one stored
+/// Gmail address for its label.
+struct AccountsFixture {
+    directory: PathBuf,
+    paths: Vec<PathBuf>,
+}
+
+impl AccountsFixture {
+    /// Builds the caches once per test.
+    fn build() -> Self {
+        let directory = std::env::temp_dir().join(format!(
+            "tersa-perf-multi-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut paths = Vec::new();
+        for number in 0..ACCOUNTS {
+            let account = multi_account(number);
+            let path = directory.join(format!("mail{number}.sqlite3"));
+            let store = SqlCipherMailboxStore::open_with_scan(
+                account.clone(),
+                &path,
+                DatabaseKey::new([7; 32]),
+                IntegrityScan::Full,
+            )
+            .unwrap();
+            // Every account holds every `ACCOUNTS`-th envelope, so the
+            // timestamps of the caches interleave in the merged order.
+            let envelopes: Vec<MessageEnvelope> = (0..ACCOUNT_MESSAGES)
+                .map(|index| envelope(index * ACCOUNTS + number))
+                .collect();
+            block_on(store.upsert_envelopes(&account, &envelopes)).unwrap();
+            store
+                .store_email_address(
+                    &account,
+                    &AccountEmail::new(format!("reader{number}@newsletter.example")).unwrap(),
+                )
+                .unwrap();
+            paths.push(path);
+        }
+        Self { directory, paths }
+    }
+
+    /// One store per account, opened like the interface opens them.
+    fn open_store(&self, number: usize) -> SqlCipherMailboxStore {
+        SqlCipherMailboxStore::open_with_scan(
+            multi_account(number),
+            &self.paths[number],
+            DatabaseKey::new([7; 32]),
+            IntegrityScan::Skip,
+        )
+        .unwrap()
+    }
+
+    /// The source over every cache, as `tersa` builds it.
+    fn source(&self) -> StoreSource {
+        StoreSource {
+            stores: (0..ACCOUNTS)
+                .map(|number| (multi_account(number), Some(self.open_store(number))))
+                .collect(),
+            requests: std::cell::RefCell::default(),
+            executor: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
+        }
+    }
+}
+
+impl Drop for AccountsFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
 
@@ -208,9 +294,7 @@ fn perf_full_cache_budgets() {
     let warm = source(store);
     let (first_frame, first_frame_slowest, mut app) = timed(5, || {
         let fresh = source(open(&fixture.path, IntegrityScan::Skip));
-        let (rows, more) = read_page(&fresh, None, FIRST_PAGE).unwrap();
-        let mut app = App::new(SafeText::single_line("acct_perf"), rows);
-        app.more_rows = more;
+        let mut app = super::initial_app(&fresh).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
             .draw(|frame| view::draw(frame, &mut app, 1_761_000_000_000))
@@ -218,7 +302,7 @@ fn perf_full_cache_budgets() {
         app
     });
     report_budget(
-        "first frame (open, first page, draw)",
+        "first frame (open, global 100, per-account probe 101, draw)",
         first_frame,
         first_frame_slowest,
         FIRST_FRAME,
@@ -235,9 +319,10 @@ fn perf_full_cache_budgets() {
     report("load the other 9,900 rows", loading.elapsed());
     report(&format!("slowest page of {PAGE}"), slowest_page);
 
-    let loaded = u16::try_from(MESSAGES).unwrap();
-    let (reload, _, (rows, _more)) = timed(3, || read_page(&warm, None, loaded).unwrap());
-    assert_eq!(rows.len(), MESSAGES);
+    let (reload, _, reloaded) = timed(3, || super::read_rows(&warm, MESSAGES).unwrap());
+    assert_eq!(reloaded.rows.len(), MESSAGES);
+    assert!(warm.requests.borrow().iter().all(|size| *size <= 200));
+    println!("global pages <=200; per-account query probes <=201; reload uses bounded pages");
     report("reload all rows after a sync", reload);
 
     let (search, _, ()) = timed(5, || {
@@ -258,7 +343,7 @@ fn perf_full_cache_budgets() {
     });
     report("type a 9-character search over 10,000 rows", search);
 
-    drop(rows);
+    drop(reloaded);
 
     // The fixture and the timings above allocated a lot in this process, so
     // the resident size is measured in a fresh one that does only what the
@@ -286,6 +371,54 @@ fn perf_full_cache_budgets() {
     }
 }
 
+#[test]
+#[ignore = "performance: run on a release build, see the module documentation"]
+fn perf_five_account_budgets() {
+    let fixture = AccountsFixture::build();
+
+    // The merged first frame opens every store, reads one page from each,
+    // and draws, against the same budget as one account.
+    let (first_frame, first_frame_slowest, mut app) = timed(5, || {
+        let fresh = fixture.source();
+        let mut app = super::initial_app(&fresh).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| view::draw(frame, &mut app, 1_761_000_000_000))
+            .unwrap();
+        app
+    });
+    report_budget(
+        &format!(
+            "first frame, {ACCOUNTS} accounts (open, global 100, per-account probe 101, draw)"
+        ),
+        first_frame,
+        first_frame_slowest,
+        FIRST_FRAME,
+    );
+
+    let warm = fixture.source();
+    let mut slowest_page = Duration::ZERO;
+    while app.more_rows {
+        let start = Instant::now();
+        load_page(&mut app, &warm);
+        slowest_page = slowest_page.max(start.elapsed());
+    }
+    assert_eq!(app.rows.len(), ACCOUNTS * ACCOUNT_MESSAGES);
+    assert!(warm.requests.borrow().iter().all(|size| *size <= 200));
+    let (reload, _, reloaded) = timed(3, || {
+        super::read_rows(&warm, ACCOUNTS * ACCOUNT_MESSAGES).unwrap()
+    });
+    assert_eq!(reloaded.rows.len(), ACCOUNTS * ACCOUNT_MESSAGES);
+    report(
+        "reload five-account total 10,000 rows in global pages <=200 (probes <=201)",
+        reload,
+    );
+    report(
+        &format!("slowest page of {PAGE} across {ACCOUNTS} accounts"),
+        slowest_page,
+    );
+}
+
 /// Where [`perf_full_cache_budgets`] tells its child process the fixture is.
 const CHILD_DATABASE: &str = "TERSA_PERF_DATABASE";
 
@@ -297,9 +430,7 @@ fn perf_idle_rss_child() {
         return;
     };
     let source = source(open(std::path::Path::new(&path), IntegrityScan::Skip));
-    let (rows, more) = read_page(&source, None, FIRST_PAGE).unwrap();
-    let mut app = App::new(SafeText::single_line("acct_perf"), rows);
-    app.more_rows = more;
+    let mut app = super::initial_app(&source).unwrap();
     while app.more_rows {
         load_page(&mut app, &source);
     }
