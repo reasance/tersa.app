@@ -7,11 +7,12 @@
 use std::process::{Command as Process, Stdio};
 use std::sync::Arc;
 
-use tersa_application::mailbox::{
-    AccountId, EnvelopeCursor, MailboxReader, MessageEnvelope, MessageId, StoreLimit,
-    UnixTimestampMillis,
-};
+use tersa_application::mailbox::{AccountId, MailboxReader, MessageId};
 use tersa_application::sync::SyncReport;
+use tersa_application::unified_mailbox::{
+    MAX_PAGE_SIZE, UnavailableAccountState, UnifiedMailboxContinuation, UnifiedMailboxDocument,
+    UnifiedMailboxQuery, UnifiedMailboxResult, UnifiedMailboxSource,
+};
 use tersa_keys::RootKey;
 use tersa_presentation::terminal::SafeText;
 use tersa_store_sqlcipher::SqlCipherMailboxStore;
@@ -368,13 +369,13 @@ pub fn sync(context: &Context, raw: Option<&str>) -> Result<(), String> {
 }
 
 /// Prints the cached mail of one account, or of every account in one merged
-/// list when no account is named. The merge and its order are the
-/// interface's, so both surfaces read the cache alike.
+/// list when no account is named. Both surfaces use the bounded application
+/// query and its deterministic account-scoped order.
 ///
 /// # Errors
 ///
 /// Returns a message when the installation cannot be opened, no account
-/// matches `raw`, a store cannot be opened or read, or `limit` is invalid.
+/// matches `raw`, or `limit` is invalid. Unavailable accounts are reported.
 pub fn inbox(context: &Context, raw: Option<&str>, limit: u16) -> Result<(), String> {
     let locked = require_installation(context)?;
     let installation = Arc::clone(&locked.installation);
@@ -385,29 +386,30 @@ pub fn inbox(context: &Context, raw: Option<&str>, limit: u16) -> Result<(), Str
     if accounts.is_empty() {
         return Err(NO_ACCOUNTS.to_owned());
     }
-    let stores = accounts
-        .into_iter()
-        .map(|account| {
-            installation
-                .open_store(&account)
-                .map(|store| (account, store))
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    let source = StoreSource {
-        stores,
-        executor: executor()?,
-    };
-    let limit = StoreLimit::new(limit).map_err(|_error| "invalid limit".to_owned())?;
-    let envelopes = source
-        .envelope_page(&[], limit)
-        .map_err(|_error| "could not read the local mailbox".to_owned())?;
-    if envelopes.is_empty() {
+    let source = StoreSource::open(accounts, executor()?, |account| {
+        installation.open_store(account)
+    });
+    let document = source
+        .inbox_document(limit)
+        .map_err(|()| "could not read the local mailbox".to_owned())?;
+    let unavailable = document.unavailable_accounts.len();
+    if unavailable > 0 {
+        let noun = if unavailable == 1 {
+            "account"
+        } else {
+            "accounts"
+        };
+        println!("{unavailable} {noun} unavailable; their mail is not shown.");
+    }
+    let envelopes = document.rows;
+    if envelopes.is_empty() && unavailable == 0 {
         println!("No cached mail. Run `tersa sync`.");
     }
     let labels = crate::tui::MailSource::account_labels(&source);
     let tagged = source.stores.len() > 1;
-    for (account, envelope) in envelopes {
+    for row in envelopes {
+        let account = row.account_id;
+        let envelope = row.envelope;
         let marker = if envelope.is_unread() { '*' } else { ' ' };
         let from = truncate(&SafeText::single_line(envelope.from().as_str()), 28);
         let subject = SafeText::single_line(envelope.subject().as_str());
@@ -415,11 +417,8 @@ pub fn inbox(context: &Context, raw: Option<&str>, limit: u16) -> Result<(), Str
         if tagged {
             // One tag column when several accounts share the list, like the
             // interface's rows.
-            let label = labels
-                .iter()
-                .find(|(id, _)| *id == account)
-                .map_or("", |(_, label)| label.as_str());
-            let tag = truncate(&SafeText::single_line(crate::tui::account_tag(label)), 12);
+            let tag = SafeText::single_line(&crate::tui::account_tag_label(&labels, &account));
+            let tag = tag.as_str();
             println!("{marker} {date}  {tag:<12}  {from:<28}  {subject}");
         } else {
             println!("{marker} {date}  {from:<28}  {subject}");
@@ -433,8 +432,8 @@ pub fn inbox(context: &Context, raw: Option<&str>, limit: u16) -> Result<(), Str
 ///
 /// # Errors
 ///
-/// Returns a message when there is no installation, no account, or none of
-/// the stores can be opened.
+/// Returns a message when there is no installation or no registered account,
+/// or when the terminal fails. Unavailable stores remain visible in the UI.
 pub fn tui(context: &Context) -> Result<(), String> {
     crate::tui::require_terminal()?;
     let locked = require_installation(context)?;
@@ -443,29 +442,9 @@ pub fn tui(context: &Context) -> Result<(), String> {
     if accounts.is_empty() {
         return Err(NO_ACCOUNTS.to_owned());
     }
-    let mut stores = Vec::new();
-    let mut unreadable = 0_usize;
-    // The first open failure is the one reported when no store opens at all.
-    let mut first_failure: Option<String> = None;
-    for account in accounts {
-        // The first frame does not wait for the integrity scan; the start-up
-        // sync's first open runs it. A store that cannot open contributes no
-        // rows; the interface starts with a line about it.
-        match installation.open_store_for_display(&account) {
-            Ok(store) => stores.push((account, store)),
-            Err(error) => {
-                unreadable += 1;
-                first_failure.get_or_insert(error.to_string());
-            }
-        }
-    }
-    if stores.is_empty() {
-        return Err(first_failure.unwrap_or_else(|| "could not read the local mailbox".to_owned()));
-    }
-    let source = StoreSource {
-        stores,
-        executor: executor()?,
-    };
+    let source = StoreSource::open(accounts, executor()?, |account| {
+        installation.open_store_for_display(account)
+    });
     // Network work needs the OAuth client; without it the interface still
     // reads the cache.
     let remote = runtime(context, Arc::clone(&locked.installation))
@@ -476,11 +455,12 @@ pub fn tui(context: &Context) -> Result<(), String> {
                 accounts: source
                     .stores
                     .iter()
+                    .filter(|(_, store)| store.is_some())
                     .map(|(account, _)| account.clone())
                     .collect(),
             }) as Box<dyn crate::tui::Remote>
         });
-    crate::tui::run(unreadable, &source, remote)
+    crate::tui::run(&source, remote)
 }
 
 /// The message when some accounts' syncs fail: how many, and the first
@@ -532,95 +512,112 @@ impl crate::tui::Remote for Network {
     }
 }
 
-/// Reads cached mail for the interface from every account's store, one
-/// `(account, store)` pair each.
+/// Concrete `SQLCipher` sources. A failed open retains its account and original
+/// unavailable disposition for the whole query chain; no auth state is inferred.
 pub(crate) struct StoreSource {
-    pub(crate) stores: Vec<(AccountId, SqlCipherMailboxStore)>,
+    pub(crate) stores: Vec<(AccountId, Option<SqlCipherMailboxStore>)>,
     pub(crate) executor: tokio::runtime::Runtime,
+    #[cfg(test)]
+    pub(crate) requests: std::cell::RefCell<Vec<u16>>,
 }
 
 impl StoreSource {
-    /// Each account's keyset cursor for its next page: where its own last
-    /// loaded row sits, found by scanning `loaded` from the end and stopping
-    /// once every account is found.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(())` when a loaded row's time is out of range.
-    fn cursors(&self, loaded: &[crate::tui::Row]) -> Result<Vec<Option<EnvelopeCursor>>, ()> {
-        let mut cursors: Vec<Option<EnvelopeCursor>> = vec![None; self.stores.len()];
-        let mut found = 0_usize;
-        for row in loaded.iter().rev() {
-            if found == self.stores.len() {
-                break;
-            }
-            let Some(index) = self
-                .stores
-                .iter()
-                .position(|(account, _)| *account == row.account)
-            else {
-                continue;
-            };
-            if cursors[index].is_some() {
-                continue;
-            }
-            let at = UnixTimestampMillis::new(row.received_at_millis).map_err(|_error| ())?;
-            cursors[index] = Some(EnvelopeCursor::new(at, row.id.clone()));
-            found += 1;
+    fn open<E>(
+        accounts: Vec<AccountId>,
+        executor: tokio::runtime::Runtime,
+        mut open: impl FnMut(&AccountId) -> Result<SqlCipherMailboxStore, E>,
+    ) -> Self {
+        Self {
+            stores: accounts
+                .into_iter()
+                .map(|account| {
+                    let store = open(&account).ok();
+                    (account, store)
+                })
+                .collect(),
+            executor,
+            #[cfg(test)]
+            requests: std::cell::RefCell::default(),
         }
-        Ok(cursors)
     }
 
-    /// Up to `limit` envelopes past `loaded` per account, read from each
-    /// store, then merged into the unified order: received time descending,
-    /// then account and message identifier ascending.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(())` when any account's store cannot be read. The page
-    /// fails rather than silently missing one account's rows.
-    fn envelope_page(
+    /// Retains the same sources for a continuation chain, including ready
+    /// readers whose query later fails. Only a fresh query retries that failure.
+    fn document(
         &self,
-        loaded: &[crate::tui::Row],
-        limit: StoreLimit,
-    ) -> Result<Vec<(AccountId, MessageEnvelope)>, ()> {
-        let cursors = self.cursors(loaded)?;
-        let mut merged: Vec<(AccountId, MessageEnvelope)> = Vec::new();
-        for ((account, store), cursor) in self.stores.iter().zip(cursors) {
-            let envelopes = self
-                .executor
-                .block_on(store.list_envelopes_after(account, cursor.as_ref(), limit))
-                .map_err(|_error| ())?;
-            merged.extend(
-                envelopes
-                    .into_iter()
-                    .map(|envelope| (account.clone(), envelope)),
-            );
+        continuation: Option<&UnifiedMailboxContinuation>,
+        limit: u16,
+    ) -> Result<UnifiedMailboxDocument, ()> {
+        #[cfg(test)]
+        self.requests.borrow_mut().push(limit);
+        let sources: Vec<_> = self
+            .stores
+            .iter()
+            .map(|(account, store)| match store {
+                // The concrete SQLCipher type overrides list_envelopes_after with
+                // indexed keyset SQL. No trait-default 10,000-row reader is wired.
+                Some(store) => UnifiedMailboxSource::Ready {
+                    account_id: account.clone(),
+                    reader: store,
+                },
+                None => UnifiedMailboxSource::Unavailable {
+                    account_id: account.clone(),
+                    state: UnavailableAccountState::StoreUnavailable,
+                },
+            })
+            .collect();
+        match self
+            .executor
+            .block_on(UnifiedMailboxQuery.execute(&sources, limit, continuation, false))
+            .map_err(|_error| ())?
+        {
+            UnifiedMailboxResult::Available(document) => Ok(document),
+            UnifiedMailboxResult::Locked => Err(()),
         }
-        merged.sort_unstable_by(|(left_account, left), (right_account, right)| {
-            right
-                .received_at()
-                .cmp(&left.received_at())
-                .then_with(|| left_account.as_str().cmp(right_account.as_str()))
-                .then_with(|| left.message_id().as_str().cmp(right.message_id().as_str()))
-        });
-        merged.truncate(usize::from(limit.get()));
-        Ok(merged)
+    }
+
+    /// CLI limits retain their existing 1..=500 range with at most three
+    /// application pages, each capped at 200, independent of account count.
+    fn inbox_document(&self, limit: u16) -> Result<UnifiedMailboxDocument, ()> {
+        if !(1..=500).contains(&limit) {
+            return Err(());
+        }
+        let mut document = self.document(None, limit.min(MAX_PAGE_SIZE))?;
+        let mut pages = 1;
+        while document.rows.len() < usize::from(limit)
+            && document.continuation.is_some()
+            && pages < 3
+        {
+            pages += 1;
+            let size = u16::try_from(usize::from(limit) - document.rows.len())
+                .map_err(|_error| ())?
+                .min(MAX_PAGE_SIZE);
+            let next = self.document(document.continuation.as_ref(), size)?;
+            document.rows.extend(next.rows);
+            document.continuation = next.continuation;
+            document.unavailable_accounts = next.unavailable_accounts;
+            document.rows.retain(|row| {
+                !document
+                    .unavailable_accounts
+                    .iter()
+                    .any(|entry| entry.account_id == row.account_id)
+            });
+        }
+        Ok(document)
     }
 }
 
 impl crate::tui::MailSource for StoreSource {
-    fn page(&self, loaded: &[crate::tui::Row], limit: u16) -> Result<Vec<crate::tui::Row>, ()> {
-        let limit = StoreLimit::new(limit).map_err(|_error| ())?;
-        Ok(self
-            .envelope_page(loaded, limit)?
-            .into_iter()
-            .map(|(account, envelope)| crate::tui::Row::from_envelope(&envelope, &account))
-            .collect())
+    fn page(
+        &self,
+        continuation: Option<&UnifiedMailboxContinuation>,
+        limit: u16,
+    ) -> Result<crate::tui::MailPage, ()> {
+        self.document(continuation, limit).map(Into::into)
     }
 
     fn message(&self, account: &AccountId, id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
-        let Some((_, store)) = self.stores.iter().find(|(known, _)| known == account) else {
+        let Some((_, Some(store))) = self.stores.iter().find(|(known, _)| known == account) else {
             return Err(());
         };
         self.executor
@@ -633,12 +630,9 @@ impl crate::tui::MailSource for StoreSource {
         self.stores
             .iter()
             .map(|(account, store)| {
-                // A failed read falls back to the id, like a store with no
-                // address yet.
                 let label = store
-                    .load_email_address(account)
-                    .ok()
-                    .flatten()
+                    .as_ref()
+                    .and_then(|store| store.load_email_address(account).ok().flatten())
                     .map_or_else(
                         || SafeText::single_line(account.as_str()),
                         |email| SafeText::single_line(email.as_str()),
@@ -857,13 +851,19 @@ mod tests {
     impl Stores {
         /// One store per named account, in a new temporary directory.
         fn open(names: &[&str]) -> Self {
+            static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let root =
-                std::env::temp_dir().join(format!("tersa-inbox-{}-{nanos}", std::process::id()));
+            let sequence = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "tersa-inbox-{}-{nanos}-{sequence}",
+                std::process::id()
+            ));
             std::fs::create_dir_all(&root).expect("temp dir");
+            let directory = Directory(root.clone());
             let pairs = names
                 .iter()
                 .map(|name| {
@@ -878,7 +878,7 @@ mod tests {
                 })
                 .collect();
             Self {
-                _directory: Directory(root),
+                _directory: directory,
                 pairs,
             }
         }
@@ -919,14 +919,21 @@ mod tests {
             seed(stores.account(name), stores.store(name), &envelopes);
         }
         let source = StoreSource {
-            stores: stores.pairs,
+            stores: stores
+                .pairs
+                .into_iter()
+                .map(|(id, store)| (id, Some(store)))
+                .collect(),
+            requests: std::cell::RefCell::default(),
             executor: tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime"),
         };
 
         // The newest rows of every account, in the unified order.
-        let first = source.page(&[], 4).expect("page");
+        let first = source.page(None, 4).expect("page");
+        let mut continuation = first.continuation;
+        let first = first.rows;
         assert_eq!(
             named(&first),
             ["acct_b/z9", "acct_a/a1", "acct_c/c1", "acct_b/b1"]
@@ -936,7 +943,12 @@ mod tests {
         // the unified order.
         let mut loaded = first;
         loop {
-            let rows = source.page(&loaded, 4).expect("page");
+            let Some(cursor) = continuation.as_ref() else {
+                break;
+            };
+            let page = source.page(Some(cursor), 4).expect("page");
+            continuation = page.continuation;
+            let rows = page.rows;
             if rows.is_empty() {
                 break;
             }
@@ -965,12 +977,18 @@ mod tests {
             seed(stores.account(name), stores.store(name), &envelopes);
         }
         let source = StoreSource {
-            stores: stores.pairs,
+            stores: stores
+                .pairs
+                .into_iter()
+                .map(|(id, store)| (id, Some(store)))
+                .collect(),
+            requests: std::cell::RefCell::default(),
             executor: tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime"),
         };
-        let rows = source.page(&[], 10).expect("page");
+        let page = source.page(None, 10).expect("page");
+        let rows = page.rows;
         assert_eq!(named(&rows), ["acct_a/m1", "acct_a/m2", "acct_b/m1"]);
     }
 
@@ -987,15 +1005,20 @@ mod tests {
             &envelopes,
         );
         let source = StoreSource {
-            stores: stores.pairs,
+            stores: stores
+                .pairs
+                .into_iter()
+                .map(|(id, store)| (id, Some(store)))
+                .collect(),
+            requests: std::cell::RefCell::default(),
             executor: tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime"),
         };
-        let rows = source.page(&[], 10).expect("page");
+        let page = source.page(None, 10).expect("page");
+        let rows = page.rows;
         assert_eq!(named(&rows), ["acct_full/f1", "acct_full/f2"]);
-        let rows = source.page(&rows, 10).expect("page");
-        assert!(rows.is_empty(), "paging past the end stops");
+        assert!(page.continuation.is_none(), "exact end has no continuation");
     }
 
     #[test]
@@ -1010,19 +1033,26 @@ mod tests {
             );
         }
         let source = StoreSource {
-            stores: stores.pairs,
+            stores: stores
+                .pairs
+                .into_iter()
+                .map(|(id, store)| (id, Some(store)))
+                .collect(),
+            requests: std::cell::RefCell::default(),
             executor: tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime"),
         };
         let mut loaded = Vec::new();
+        let mut continuation = None;
         // A finite loop also fails if a cursor repeats a page indefinitely.
         for _ in 0..6 {
-            let page = source.page(&loaded, 1).expect("page");
-            assert_eq!(page.len(), 1);
-            loaded.extend(page);
+            let page = source.page(continuation.as_ref(), 1).expect("page");
+            assert_eq!(page.rows.len(), 1);
+            continuation = page.continuation;
+            loaded.extend(page.rows);
         }
-        assert!(source.page(&loaded, 1).expect("end").is_empty());
+        assert!(continuation.is_none(), "exact end");
         assert_eq!(
             named(&loaded),
             [
@@ -1034,8 +1064,8 @@ mod tests {
                 "acct_c/m2"
             ]
         );
-        assert!(source.page(&[], 0).is_err());
-        assert!(source.page(&[], 10_001).is_err());
+        assert!(source.page(None, 0).is_err());
+        assert!(source.page(None, 10_001).is_err());
     }
 
     #[test]
@@ -1058,7 +1088,12 @@ mod tests {
             .expect("seed body");
         }
         let source = StoreSource {
-            stores: stores.pairs,
+            stores: stores
+                .pairs
+                .into_iter()
+                .map(|(id, store)| (id, Some(store)))
+                .collect(),
+            requests: std::cell::RefCell::default(),
             executor: tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime"),
@@ -1086,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_read_fails_the_page() {
+    fn a_failed_read_is_account_local_unavailability() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -1108,12 +1143,163 @@ mod tests {
         // account guard refuses every read. That stands in for any local
         // read failure: the page fails instead of silently missing rows.
         let source = StoreSource {
-            stores: vec![(account_a, store_b)],
+            stores: vec![(account_a, Some(store_b))],
+            requests: std::cell::RefCell::default(),
             executor: tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime"),
         };
-        assert!(source.page(&[], 10).is_err());
+        let page = source.page(None, 10).expect("safe unavailable page");
+        assert!(page.rows.is_empty());
+        assert_eq!(page.unavailable_accounts.len(), 1);
+        assert_eq!(
+            page.unavailable_accounts[0].state,
+            tersa_application::unified_mailbox::UnavailableAccountState::StoreUnavailable
+        );
+    }
+
+    #[test]
+    fn bounded_reload_seeks_past_the_trait_fallback_ceiling_in_real_sqlcipher() {
+        let stores = Stores::open(&["acct_a"]);
+        let envelopes: Vec<_> = (0..10_205)
+            .map(|index| envelope(&format!("m{index:05}"), 20))
+            .collect();
+        for chunk in envelopes.chunks(10_000) {
+            seed(stores.account("acct_a"), stores.store("acct_a"), chunk);
+        }
+        let source = StoreSource {
+            stores: stores
+                .pairs
+                .into_iter()
+                .map(|(id, store)| (id, Some(store)))
+                .collect(),
+            executor: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime"),
+            requests: std::cell::RefCell::default(),
+        };
+        let page = crate::tui::read_rows(&source, 10_205).expect("bounded reload");
+        assert_eq!(page.rows.len(), 10_205);
+        assert_eq!(
+            page.rows.last().expect("last").id.as_str(),
+            "m10204",
+            "real keyset override, beyond the trait fallback's newest 10,000"
+        );
+        assert!(page.continuation.is_none());
+        let requests = source.requests.borrow();
+        assert_eq!(requests.len(), 52);
+        assert!(requests[..51].iter().all(|size| *size == 200));
+        assert_eq!(requests[51], 5);
+    }
+
+    #[test]
+    fn cli_limits_accumulate_at_most_three_bounded_pages_with_exact_account_routes() {
+        let stores = Stores::open(&["acct_b", "acct_a"]);
+        for name in ["acct_a", "acct_b"] {
+            let rows: Vec<_> = (0..251)
+                .map(|index| envelope(&format!("same{index:03}"), 20))
+                .collect();
+            seed(stores.account(name), stores.store(name), &rows);
+        }
+        let mut source = StoreSource {
+            stores: stores
+                .pairs
+                .into_iter()
+                .map(|(id, store)| (id, Some(store)))
+                .collect(),
+            executor: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime"),
+            requests: std::cell::RefCell::default(),
+        };
+        for (limit, expected_requests) in [
+            (1, vec![1]),
+            (200, vec![200]),
+            (201, vec![200, 1]),
+            (500, vec![200, 200, 100]),
+        ] {
+            source.requests.borrow_mut().clear();
+            let document = source.inbox_document(limit).expect("CLI page");
+            assert_eq!(document.rows.len(), usize::from(limit));
+            assert_eq!(*source.requests.borrow(), expected_requests);
+            for (index, row) in document.rows.iter().enumerate() {
+                assert_eq!(
+                    row.account_id.as_str(),
+                    if index < 251 { "acct_a" } else { "acct_b" }
+                );
+                assert_eq!(
+                    row.envelope.message_id().as_str(),
+                    format!("same{:03}", index % 251)
+                );
+            }
+        }
+        source.requests.borrow_mut().clear();
+        assert!(source.inbox_document(0).is_err());
+        assert!(source.inbox_document(501).is_err());
+        assert!(
+            source.requests.borrow().is_empty(),
+            "invalid CLI limits dispatch no query"
+        );
+        source
+            .stores
+            .retain(|(account, _)| account.as_str() == "acct_b");
+        let explicit_account = source.inbox_document(500).expect("explicit account");
+        assert_eq!(explicit_account.rows.len(), 251);
+        assert!(
+            explicit_account
+                .rows
+                .iter()
+                .all(|row| row.account_id.as_str() == "acct_b")
+        );
+    }
+
+    #[test]
+    fn failed_opens_keep_explicit_dispositions_across_variable_pages_without_oauth() {
+        let stores = Stores::open(&["acct_cached"]);
+        seed(
+            stores.account("acct_cached"),
+            stores.store("acct_cached"),
+            &[envelope("a", 30), envelope("b", 20), envelope("c", 10)],
+        );
+        let mut pairs = stores.pairs.into_iter();
+        let source = StoreSource::open(
+            vec![
+                AccountId::new("acct_missing").expect("account"),
+                AccountId::new("acct_cached").expect("account"),
+            ],
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime"),
+            |account| {
+                if account.as_str() == "acct_cached" {
+                    Ok(pairs.next().expect("cached").1)
+                } else {
+                    Err(())
+                }
+            },
+        );
+        let first = source.page(None, 1).expect("offline cache");
+        assert_eq!(first.rows.len(), 1);
+        assert_eq!(first.rows[0].account.as_str(), "acct_cached");
+        assert_eq!(
+            first.unavailable_accounts[0].account_id.as_str(),
+            "acct_missing"
+        );
+        assert_eq!(
+            first.unavailable_accounts[0].state,
+            tersa_application::unified_mailbox::UnavailableAccountState::StoreUnavailable
+        );
+        let second = source
+            .page(first.continuation.as_ref(), 2)
+            .expect("same original dispositions");
+        assert_eq!(second.rows.len(), 2);
+        assert_eq!(second.unavailable_accounts, first.unavailable_accounts);
+        assert!(second.continuation.is_none());
+        // No Remote or authorization source is needed to reopen cached mail.
+        let app = crate::tui::initial_app(&source).expect("offline UI");
+        assert_eq!(app.rows.len(), 3);
+        assert_eq!(app.accounts.len(), 2);
+        assert_eq!(app.unavailable_accounts.len(), 1);
     }
 
     #[test]

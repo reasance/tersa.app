@@ -6,6 +6,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tersa_application::mailbox::{AccountId, MessageEnvelope, MessageId};
+use tersa_application::unified_mailbox::{UnavailableAccount, UnifiedMailboxContinuation};
 use tersa_presentation::html::decode_entities;
 use tersa_presentation::message::{BodyFormat, BodyPreference, RenderedMessage, render_message};
 use tersa_presentation::terminal::SafeText;
@@ -120,6 +121,31 @@ pub fn account_tag(label: &str) -> &str {
     }
 }
 
+/// Adds source ordinals when shortened account tags would otherwise collide.
+/// Every tag then has a distinct prefix, even if addresses share a local part
+/// or opaque identifiers share their first twelve display columns.
+pub fn account_tag_label(accounts: &[(AccountId, SafeText)], account: &AccountId) -> String {
+    let tags: Vec<_> = accounts
+        .iter()
+        .map(|(_, label)| super::wrap::truncate(account_tag(label.as_str()), 12))
+        .collect();
+    let collision = tags
+        .iter()
+        .enumerate()
+        .any(|(index, tag)| tags[..index].contains(tag));
+    let Some(index) = accounts.iter().position(|(known, _)| known == account) else {
+        return account.as_str().to_owned();
+    };
+    if collision {
+        super::wrap::truncate(
+            &format!("#{} {}", index + 1, account_tag(accounts[index].1.as_str())),
+            12,
+        )
+    } else {
+        tags[index].clone()
+    }
+}
+
 /// The display name from a `Name <address>` header, or the address.
 ///
 /// A display name that itself contains `@`, or a character that looks like
@@ -215,10 +241,10 @@ pub struct App {
     /// Every account the source reads, in registry order, each with its
     /// stored Gmail address or its id.
     pub accounts: Vec<(AccountId, SafeText)>,
-    /// Stores that failed to open and remain excluded for this session.
-    /// Kept separately from transient status text so a key or sync cannot
-    /// make a partial inbox appear complete.
-    pub unavailable_accounts: usize,
+    /// Explicit query availability, retained independently of transient status.
+    pub unavailable_accounts: Vec<UnavailableAccount>,
+    /// Opaque application progress; never reconstructed from display rows.
+    pub continuation: Option<UnifiedMailboxContinuation>,
     /// Every loaded row, newest first.
     pub rows: Vec<Row>,
     /// Indexes into `rows` of the rows the list shows, in order.
@@ -267,7 +293,8 @@ impl App {
         let shown = (0..rows.len()).collect();
         Self {
             accounts,
-            unavailable_accounts: 0,
+            unavailable_accounts: Vec::new(),
+            continuation: None,
             rows,
             shown,
             selected: 0,
@@ -395,6 +422,7 @@ impl App {
     /// Stops loading rows after a failed read.
     pub fn rows_failed(&mut self) {
         self.more_rows = false;
+        self.continuation = None;
         self.rows_unreadable = true;
         self.count_matches();
     }

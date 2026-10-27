@@ -82,7 +82,7 @@ fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
     } else {
         count
     };
-    let count = match app.unavailable_accounts {
+    let count = match app.unavailable_accounts.len() {
         0 => count,
         1 => format!("{count} (1 account unavailable)"),
         unavailable => format!("{count} ({unavailable} accounts unavailable)"),
@@ -174,6 +174,14 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
                 Line::styled("  No messages match.", bold()),
                 Line::styled("  Esc shows every message.", dim()),
             ]
+        } else if !app.unavailable_accounts.is_empty() {
+            vec![
+                Line::raw(""),
+                Line::styled(
+                    "  Some accounts are unavailable; their mail is not shown.",
+                    bold(),
+                ),
+            ]
         } else if app.sync == SyncState::Running {
             vec![
                 Line::raw(""),
@@ -196,8 +204,14 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
         .take(usize::from(area.height))
         .filter_map(|position| Some((position, app.shown_row(position)?)))
         .map(|(position, row)| {
-            let tag = tagged.then(|| app.account_label(&row.account));
-            inbox_line(row, position == app.selected, total, now_millis, tag)
+            let tag = tagged.then(|| super::account_tag_label(&app.accounts, &row.account));
+            inbox_line(
+                row,
+                position == app.selected,
+                total,
+                now_millis,
+                tag.as_deref(),
+            )
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
@@ -650,9 +664,34 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_short_account_tags_are_distinct_and_open_the_correct_header() {
+        let labels = vec![
+            (account("acct_a"), SafeText::single_line("same@example.org")),
+            (account("acct_b"), SafeText::single_line("same@example.net")),
+        ];
+        let mut app = App::new(
+            labels,
+            vec![
+                Row::sample("acct_a", "same", "Ann", "Subject a", false),
+                Row::sample("acct_b", "same", "Bob", "Subject b", false),
+            ],
+        );
+        let lines = screen(&mut app, 100, 8);
+        assert!(lines[1].contains("#1 same"), "{lines:?}");
+        assert!(lines[2].contains("#2 same"), "{lines:?}");
+        app.show_message(key("acct_b", "same"), Ok(None));
+        let lines = screen(&mut app, 100, 10).join("\n");
+        assert!(lines.contains("Subject b"));
+        assert!(lines.contains("Account: same@example.net"));
+    }
+
+    #[test]
     fn unavailable_accounts_remain_visible_after_keys_and_reload() {
         let mut app = App::new(labeled(&["acct"]), vec![row("Ann", "Lunch", true)]);
-        app.unavailable_accounts = 1;
+        app.unavailable_accounts = vec![tersa_application::unified_mailbox::UnavailableAccount {
+            account_id: account("acct_missing"),
+            state: tersa_application::unified_mailbox::UnavailableAccountState::StoreUnavailable,
+        }];
         app.status = Some("1 account could not be read; its mail is not shown".to_owned());
         app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert!(app.status.is_none(), "the transient notice was dismissed");
@@ -660,7 +699,8 @@ mod tests {
         app.reload(vec![row("Ann", "Lunch", true)], false);
         app.sync = SyncState::Synced(1_761_000_000_000);
         assert!(screen(&mut app, 100, 5)[0].contains("1 account unavailable"));
-        app.unavailable_accounts = 2;
+        app.unavailable_accounts
+            .push(app.unavailable_accounts[0].clone());
         assert!(screen(&mut app, 100, 5)[0].contains("2 accounts unavailable"));
     }
 

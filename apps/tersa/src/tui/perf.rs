@@ -6,7 +6,8 @@
 //! store holding 10,000 envelopes (the most a cache can keep; the default
 //! sync policy keeps 100) and 25 bodies. A second case reads five accounts'
 //! caches of 2,000 envelopes each, whose timestamps interleave, as one
-//! merged list.
+//! merged list. First frames request 100 global rows (per-account probes 101);
+//! later pages and reloads request at most 200 (per-account probes at most 201).
 //!
 //! These tests are ignored by default and kept out of CI, which is for
 //! correctness. Run them on a release build:
@@ -39,11 +40,9 @@ use tersa_application::mailbox::{
     AccountEmail, AccountId, HeaderText, MailboxReader, MailboxStore, Message, MessageContent,
     MessageEnvelope, MessageId, StoreLimit, ThreadId, UnixTimestampMillis,
 };
-use tersa_presentation::terminal::SafeText;
 use tersa_store_sqlcipher::{DatabaseKey, IntegrityScan, SqlCipherMailboxStore};
 
-use super::app::App;
-use super::{FIRST_PAGE, PAGE, load_page, read_page, view};
+use super::{PAGE, load_page, view};
 use crate::commands::StoreSource;
 
 /// ADR 0031 budgets.
@@ -141,7 +140,8 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 fn source(store: SqlCipherMailboxStore) -> StoreSource {
     StoreSource {
-        stores: vec![(account(), store)],
+        stores: vec![(account(), Some(store))],
+        requests: std::cell::RefCell::default(),
         executor: tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap(),
@@ -212,8 +212,9 @@ impl AccountsFixture {
     fn source(&self) -> StoreSource {
         StoreSource {
             stores: (0..ACCOUNTS)
-                .map(|number| (multi_account(number), self.open_store(number)))
+                .map(|number| (multi_account(number), Some(self.open_store(number))))
                 .collect(),
+            requests: std::cell::RefCell::default(),
             executor: tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap(),
@@ -293,9 +294,7 @@ fn perf_full_cache_budgets() {
     let warm = source(store);
     let (first_frame, first_frame_slowest, mut app) = timed(5, || {
         let fresh = source(open(&fixture.path, IntegrityScan::Skip));
-        let (rows, more) = read_page(&fresh, &[], FIRST_PAGE).unwrap();
-        let mut app = App::new(vec![(account(), SafeText::single_line("acct_perf"))], rows);
-        app.more_rows = more;
+        let mut app = super::initial_app(&fresh).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
             .draw(|frame| view::draw(frame, &mut app, 1_761_000_000_000))
@@ -303,7 +302,7 @@ fn perf_full_cache_budgets() {
         app
     });
     report_budget(
-        "first frame (open, first page, draw)",
+        "first frame (open, global 100, per-account probe 101, draw)",
         first_frame,
         first_frame_slowest,
         FIRST_FRAME,
@@ -320,9 +319,10 @@ fn perf_full_cache_budgets() {
     report("load the other 9,900 rows", loading.elapsed());
     report(&format!("slowest page of {PAGE}"), slowest_page);
 
-    let loaded = u16::try_from(MESSAGES).unwrap();
-    let (reload, _, (rows, _more)) = timed(3, || read_page(&warm, &[], loaded).unwrap());
-    assert_eq!(rows.len(), MESSAGES);
+    let (reload, _, reloaded) = timed(3, || super::read_rows(&warm, MESSAGES).unwrap());
+    assert_eq!(reloaded.rows.len(), MESSAGES);
+    assert!(warm.requests.borrow().iter().all(|size| *size <= 200));
+    println!("global pages <=200; per-account query probes <=201; reload uses bounded pages");
     report("reload all rows after a sync", reload);
 
     let (search, _, ()) = timed(5, || {
@@ -343,7 +343,7 @@ fn perf_full_cache_budgets() {
     });
     report("type a 9-character search over 10,000 rows", search);
 
-    drop(rows);
+    drop(reloaded);
 
     // The fixture and the timings above allocated a lot in this process, so
     // the resident size is measured in a fresh one that does only what the
@@ -380,10 +380,7 @@ fn perf_five_account_budgets() {
     // and draws, against the same budget as one account.
     let (first_frame, first_frame_slowest, mut app) = timed(5, || {
         let fresh = fixture.source();
-        let accounts = crate::tui::MailSource::account_labels(&fresh);
-        let (rows, more) = read_page(&fresh, &[], FIRST_PAGE).unwrap();
-        let mut app = App::new(accounts, rows);
-        app.more_rows = more;
+        let mut app = super::initial_app(&fresh).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
             .draw(|frame| view::draw(frame, &mut app, 1_761_000_000_000))
@@ -391,7 +388,9 @@ fn perf_five_account_budgets() {
         app
     });
     report_budget(
-        &format!("first frame, {ACCOUNTS} accounts (open, first page, draw)"),
+        &format!(
+            "first frame, {ACCOUNTS} accounts (open, global 100, per-account probe 101, draw)"
+        ),
         first_frame,
         first_frame_slowest,
         FIRST_FRAME,
@@ -405,6 +404,15 @@ fn perf_five_account_budgets() {
         slowest_page = slowest_page.max(start.elapsed());
     }
     assert_eq!(app.rows.len(), ACCOUNTS * ACCOUNT_MESSAGES);
+    assert!(warm.requests.borrow().iter().all(|size| *size <= 200));
+    let (reload, _, reloaded) = timed(3, || {
+        super::read_rows(&warm, ACCOUNTS * ACCOUNT_MESSAGES).unwrap()
+    });
+    assert_eq!(reloaded.rows.len(), ACCOUNTS * ACCOUNT_MESSAGES);
+    report(
+        "reload five-account total 10,000 rows in global pages <=200 (probes <=201)",
+        reload,
+    );
     report(
         &format!("slowest page of {PAGE} across {ACCOUNTS} accounts"),
         slowest_page,
@@ -422,9 +430,7 @@ fn perf_idle_rss_child() {
         return;
     };
     let source = source(open(std::path::Path::new(&path), IntegrityScan::Skip));
-    let (rows, more) = read_page(&source, &[], FIRST_PAGE).unwrap();
-    let mut app = App::new(vec![(account(), SafeText::single_line("acct_perf"))], rows);
-    app.more_rows = more;
+    let mut app = super::initial_app(&source).unwrap();
     while app.more_rows {
         load_page(&mut app, &source);
     }
