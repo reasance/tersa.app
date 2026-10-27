@@ -17,5 +17,7 @@ pub mod oauth;
 pub mod sync;
 /// Portable token exchange and refresh lifecycle over a transport port.
 pub mod token;
+/// Bounded, account-scoped unified mailbox reads and continuations.
+pub mod unified_mailbox;
 
 // Rust guideline compliant 1.0.
