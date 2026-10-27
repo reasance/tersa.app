@@ -133,6 +133,7 @@ pub fn run(
     let (rows, more) = read_page(source, &[], FIRST_PAGE)
         .map_err(|()| "could not read the local mailbox".to_owned())?;
     let mut app = App::new(accounts, rows);
+    app.unavailable_accounts = unreadable;
     app.more_rows = more;
     app.status = unreadable_status(unreadable);
     let mut worker = remote.map(Worker::start);
@@ -873,6 +874,45 @@ mod tests {
             worker.done.recv_timeout(Duration::from_secs(5)),
             Ok(Done::Fetched(key, Ok(_))) if key.1.as_str() == "slow"
         ));
+    }
+
+    #[test]
+    fn opening_the_same_id_in_another_account_cancels_the_old_download() {
+        let (log, entries) = mpsc::channel();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut worker = Worker::start(Box::new(Gated {
+            log,
+            gate: Arc::clone(&gate),
+        }));
+        let old = key("acct_a", "slow");
+        let current = key("acct_b", "slow");
+        worker.set_open(Some(&old));
+        assert!(worker.fetch(&old));
+        assert_eq!(
+            entries.recv_timeout(Duration::from_secs(5)).expect("start"),
+            "start slow"
+        );
+        worker.set_open(Some(&current));
+        assert!(worker.fetch(&current));
+        assert_eq!(
+            entries.recv_timeout(Duration::from_secs(5)).expect("start"),
+            "start slow"
+        );
+        assert!(matches!(
+            worker.done.recv_timeout(Duration::from_secs(5)),
+            Ok(Done::Skipped(key)) if key == old
+        ));
+        gate.add_permits(1);
+        assert!(matches!(
+            worker.done.recv_timeout(Duration::from_secs(5)),
+            Ok(Done::Fetched(key, Ok(_))) if key == current
+        ));
+        assert_eq!(
+            entries
+                .recv_timeout(Duration::from_secs(5))
+                .expect("finish"),
+            "fetch slow"
+        );
     }
 
     /// A worker fetch is named by the account and the identifier: the same

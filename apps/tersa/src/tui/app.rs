@@ -215,6 +215,10 @@ pub struct App {
     /// Every account the source reads, in registry order, each with its
     /// stored Gmail address or its id.
     pub accounts: Vec<(AccountId, SafeText)>,
+    /// Stores that failed to open and remain excluded for this session.
+    /// Kept separately from transient status text so a key or sync cannot
+    /// make a partial inbox appear complete.
+    pub unavailable_accounts: usize,
     /// Every loaded row, newest first.
     pub rows: Vec<Row>,
     /// Indexes into `rows` of the rows the list shows, in order.
@@ -263,6 +267,7 @@ impl App {
         let shown = (0..rows.len()).collect();
         Self {
             accounts,
+            unavailable_accounts: 0,
             rows,
             shown,
             selected: 0,

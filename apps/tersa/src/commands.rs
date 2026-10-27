@@ -713,8 +713,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tersa_application::mailbox::{
-        AccountId, HeaderText, MailboxStore, MessageEnvelope, MessageId, ThreadId,
-        UnixTimestampMillis,
+        AccountId, HeaderText, MailboxStore, Message, MessageContent, MessageEnvelope, MessageId,
+        ThreadId, UnixTimestampMillis,
     };
     use tersa_store_sqlcipher::{DatabaseKey, SqlCipherMailboxStore};
     use tersa_sync_runtime::InstallationLock;
@@ -996,6 +996,93 @@ mod tests {
         assert_eq!(named(&rows), ["acct_full/f1", "acct_full/f2"]);
         let rows = source.page(&rows, 10).expect("page");
         assert!(rows.is_empty(), "paging past the end stops");
+    }
+
+    #[test]
+    fn one_row_pages_keep_equal_timestamps_and_duplicate_ids_account_scoped() {
+        // Registry order deliberately differs from the merge's account order.
+        let stores = Stores::open(&["acct_c", "acct_b", "acct_a"]);
+        for name in ["acct_a", "acct_b", "acct_c"] {
+            seed(
+                stores.account(name),
+                stores.store(name),
+                &[envelope("m1", 100), envelope("m2", 100)],
+            );
+        }
+        let source = StoreSource {
+            stores: stores.pairs,
+            executor: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime"),
+        };
+        let mut loaded = Vec::new();
+        // A finite loop also fails if a cursor repeats a page indefinitely.
+        for _ in 0..6 {
+            let page = source.page(&loaded, 1).expect("page");
+            assert_eq!(page.len(), 1);
+            loaded.extend(page);
+        }
+        assert!(source.page(&loaded, 1).expect("end").is_empty());
+        assert_eq!(
+            named(&loaded),
+            [
+                "acct_a/m1",
+                "acct_a/m2",
+                "acct_b/m1",
+                "acct_b/m2",
+                "acct_c/m1",
+                "acct_c/m2"
+            ]
+        );
+        assert!(source.page(&[], 0).is_err());
+        assert!(source.page(&[], 10_001).is_err());
+    }
+
+    #[test]
+    fn cached_duplicate_ids_route_to_the_exact_account_without_fallback() {
+        let stores = Stores::open(&["acct_a", "acct_b", "acct_empty"]);
+        let message_id = MessageId::new("same").expect("id");
+        for (name, raw) in [
+            ("acct_a", b"Subject: a\r\n\r\nbody a".as_slice()),
+            ("acct_b", b"Subject: b\r\n\r\nbody b".as_slice()),
+        ] {
+            let message = Message::new(
+                envelope("same", 100),
+                MessageContent::new(raw.to_vec()).expect("content"),
+            );
+            block_on(
+                stores
+                    .store(name)
+                    .put_message(stores.account(name), &message),
+            )
+            .expect("seed body");
+        }
+        let source = StoreSource {
+            stores: stores.pairs,
+            executor: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime"),
+        };
+        for (name, expected) in [
+            ("acct_a", b"Subject: a\r\n\r\nbody a".as_slice()),
+            ("acct_b", b"Subject: b\r\n\r\nbody b".as_slice()),
+        ] {
+            assert_eq!(
+                source.message(&AccountId::new(name).expect("account"), &message_id),
+                Ok(Some(expected.to_vec()))
+            );
+        }
+        assert_eq!(
+            source.message(&AccountId::new("acct_empty").expect("account"), &message_id),
+            Ok(None)
+        );
+        assert_eq!(
+            source.message(
+                &AccountId::new("acct_unknown").expect("account"),
+                &message_id
+            ),
+            Err(())
+        );
     }
 
     #[test]

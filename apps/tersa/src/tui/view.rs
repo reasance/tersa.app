@@ -82,6 +82,11 @@ fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
     } else {
         count
     };
+    let count = match app.unavailable_accounts {
+        0 => count,
+        1 => format!("{count} (1 account unavailable)"),
+        unavailable => format!("{count} ({unavailable} accounts unavailable)"),
+    };
     let sync = match &app.sync {
         SyncState::Idle => String::new(),
         SyncState::Running => "syncing… ".to_owned(),
@@ -642,6 +647,21 @@ mod tests {
             lines.join("\n").contains("Account: ann@example.com"),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn unavailable_accounts_remain_visible_after_keys_and_reload() {
+        let mut app = App::new(labeled(&["acct"]), vec![row("Ann", "Lunch", true)]);
+        app.unavailable_accounts = 1;
+        app.status = Some("1 account could not be read; its mail is not shown".to_owned());
+        app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(app.status.is_none(), "the transient notice was dismissed");
+        assert!(screen(&mut app, 100, 5)[0].contains("1 account unavailable"));
+        app.reload(vec![row("Ann", "Lunch", true)], false);
+        app.sync = SyncState::Synced(1_761_000_000_000);
+        assert!(screen(&mut app, 100, 5)[0].contains("1 account unavailable"));
+        app.unavailable_accounts = 2;
+        assert!(screen(&mut app, 100, 5)[0].contains("2 accounts unavailable"));
     }
 
     #[test]
