@@ -638,7 +638,7 @@ mod tests {
             parse_preflight_class("policy-xtask"),
             Some(PreflightClass::Policy)
         );
-        assert_eq!(parse_preflight_class("swift-ui"), None);
+        assert_eq!(parse_preflight_class("unsupported-class"), None);
     }
 
     #[test]

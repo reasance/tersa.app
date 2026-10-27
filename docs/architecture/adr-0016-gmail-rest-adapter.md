@@ -1,17 +1,17 @@
 # ADR 0016: Gmail REST mailbox adapter
 
 - Status: Accepted
-- Amended by: [ADR 0031](adr-0031-tui-only-pivot.md): `tersa-gmail-rest-macos` is now the portable `tersa-gmail-rest` (macOS and Linux); macOS-only target gates no longer apply
+- Amended by: [ADR 0031](adr-0031-tui-only-pivot.md): portable adapter for macOS and Linux
 - Date: 2026-07-16
 
 ## Context
 
-The application mailbox port needs a macOS production adapter without making
+The application mailbox port needs a portable production adapter without making
 the application or domain depend on a networking runtime or Gmail DTOs.
 
 ## Decision
 
-`tersa-gmail-rest-macos` implements the existing `RemoteMailbox` port. It is
+`tersa-gmail-rest` implements the existing `RemoteMailbox` port. It is
 read-only and uses only authenticated `GET` requests below the fixed production
 base `https://gmail.googleapis.com/gmail/v1/users/me`. It lists message IDs,
 then hydrates them sequentially with metadata requests, preserving the provider
@@ -26,7 +26,7 @@ normalize those reserved values and would target the wrong resource.
 
 Each adapter instance is bound to one opaque local `AccountId` before any I/O.
 A different account returns `AuthorizationRequired`; Gmail's `users/me` result
-cannot therefore be attributed to another local account. The macOS constructor
+cannot therefore be attributed to another local account. The constructor
 immediately wraps a short-lived access token in `Zeroizing` before validation.
 Rotation is performed by replacing the adapter. The mailbox adapter itself
 performs no token exchange, refresh, persistence, Keychain access, retries,
@@ -55,7 +55,7 @@ base64url raw data, and return only decoded RFC 5322 bytes as `MessageContent`.
 Label changes are tolerated. All DTO strings, JSON bodies, encoded raw input,
 and decoded data are bounded. Errors are deliberately provider-data-free.
 
-The reqwest client is macOS-only, HTTPS-only, has redirects and proxies
+The reqwest client is HTTPS-only, has redirects and proxies
 disabled, uses bounded timeouts, and does not compile cookie, decompression, or
 multipart features. Response data is checked while it is accumulated; a
 content-length is only an early rejection hint. Only bounded 403 error JSON is
@@ -63,9 +63,9 @@ read; bodies for statuses whose mapping is body-independent are discarded.
 
 ## Consequences
 
-`reqwest` 0.13.4 is an exact, target-scoped dependency exclusive to this
-adapter. Shared layers remain std-only at the mailbox boundary. The adapter is
-not an iPhone or iPad product claim.
+`reqwest` is exact-pinned in the manifests and owned by this adapter. Shared
+layers remain runtime-free at the mailbox boundary. Platform TLS and crypto
+choices are defined by ADR 0031.
 
 ## References
 

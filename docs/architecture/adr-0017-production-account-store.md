@@ -4,10 +4,10 @@ v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain
 one at https://mozilla.org/MPL/2.0/.
 -->
 
-# ADR 0017: Production macOS account store
+# ADR 0017: Production account store
 
 - Status: Accepted
-- Amended by: [ADR 0031](adr-0031-tui-only-pivot.md): `tersa-store-sqlcipher-macos` is now the portable `tersa-store-sqlcipher` (macOS and Linux); macOS-only target gates no longer apply
+- Amended by: [ADR 0031](adr-0031-tui-only-pivot.md): portable store for macOS and Linux
 - Date: 2026-07-16
 
 ## Context
@@ -18,7 +18,7 @@ bound to one local account, and reject unknown schema ownership.
 
 ## Decision
 
-`tersa-store-sqlcipher-macos` implements `MailboxStore` for exactly one
+`tersa-store-sqlcipher` implements `MailboxStore` for exactly one
 `AccountId` and one caller-selected SQLCipher file. It accepts a zeroizing
 32-byte database key, applies it through SQLCipher's raw-key FFI before schema
 access, and uses WAL, foreign keys, in-memory temporary storage, secure
@@ -55,7 +55,7 @@ account, bounded-decode, and pre/post pathname-identity checks inside a live
 read transaction. It disables and verifies checkpoint-on-close and exposes no
 creation, claim, migration, repair, checkpoint, or journal-mode operation. It
 does not use `immutable=1` or a private copy. `MessageEnvelope` still contains
-the existing body-derived preview; the later CLI projection excludes it.
+the existing body-derived preview; callers must treat that preview as sensitive content.
 
 Every validated writer sets and reads back `SQLITE_FCNTL_PERSIST_WAL = 1` only
 after ownership is established. The reader independently sets and reads back
@@ -86,13 +86,10 @@ Schema inspection likewise reads at most the canonical object count plus one
 and bounds every schema field before allocation. Only SQLite's literal
 `sqlite_` internal-object prefix is excluded from the canonical comparison.
 
-Blob and attachment encryption are intentionally deferred. This adapter does
-not use AEAD or HMAC until a real blob/attachment port and a cross-file commit
-protocol are accepted; a future product blob format remains a separate decision
-and is not claimed by the retired M0 blob diagnostic. Historical note:
-ADR 0011's host diagnostic engine-crash evidence remains historical record only
-after PR3; production store crash and integrity behavior is owned by this
-adapter and its tests.
+Blob and attachment encryption are deferred to the planned production protocol
+in [ADR 0030](adr-0030-encrypted-blobs-storage-budget-and-app-lock.md).
+Production store crash and integrity behavior is owned by this adapter and its
+tests; no removed feasibility program supplies production evidence.
 
 Deterministic adapter tests cover exact schema convergence and no-op reopen,
 wrong-key and foreign/future/noncanonical schema rejection, orphan-sidecar and
@@ -118,7 +115,8 @@ before the post-read identity check fails closed.
 
 ## Consequences
 
-The adapter is macOS-only and has no keychain, global database, search,
-mobile, retry, pool, or sync-orchestration behavior. Its path, key, account,
+The account-store adapter supports macOS and Linux and has no keyring,
+cross-account mailbox, retry, pool, or sync-orchestration behavior. The separate
+encrypted registry component is described in ADR 0026. Its path, key, account,
 headers, identifiers, and message bodies are never included in errors or debug
 output.
