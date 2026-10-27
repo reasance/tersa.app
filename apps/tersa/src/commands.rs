@@ -447,32 +447,31 @@ pub fn tui(context: &Context) -> Result<(), String> {
     });
     // Network work needs the OAuth client; without it the interface still
     // reads the cache.
-    let remote = runtime(context, Arc::clone(&locked.installation))
-        .ok()
-        .map(|runtime| {
-            Box::new(Network {
-                runtime,
-                accounts: source
-                    .stores
-                    .iter()
-                    .filter(|(_, store)| store.is_some())
-                    .map(|(account, _)| account.clone())
-                    .collect(),
-            }) as Box<dyn crate::tui::Remote>
-        });
-    crate::tui::run(&source, remote)
+    let remotes = match runtime(context, Arc::clone(&locked.installation)) {
+        Ok(runtime) => {
+            let runtime = Arc::new(runtime);
+            source
+                .stores
+                .iter()
+                .filter(|(_, store)| store.is_some())
+                .map(|(account, _)| {
+                    (
+                        account.clone(),
+                        Box::new(Network {
+                            runtime: Arc::clone(&runtime),
+                        }) as Box<dyn crate::tui::Remote>,
+                    )
+                })
+                .collect()
+        }
+        Err(_) => Vec::new(), // Offline cache reads remain available.
+    };
+    crate::tui::run(&source, remotes)
 }
 
-/// The message when some accounts' syncs fail: how many, and the first
-/// failure's reason.
-fn sync_failure(failed: usize, total: usize, first: &str) -> String {
-    format!("{failed} of {total} accounts failed to sync: {first}")
-}
-
-/// Downloads and syncs for the interface, through the identity gate.
+/// Account-specific downloads and syncs through the existing identity gate.
 struct Network {
-    runtime: Runtime,
-    accounts: Vec<AccountId>,
+    runtime: Arc<Runtime>,
 }
 
 impl crate::tui::Remote for Network {
@@ -489,25 +488,16 @@ impl crate::tui::Remote for Network {
         })
     }
 
-    fn sync(&self) -> crate::tui::Pending<'_, ()> {
+    fn sync<'a>(&'a self, account: &'a AccountId) -> crate::tui::Pending<'a, ()> {
         Box::pin(async move {
-            let mut failed = 0_usize;
-            let mut first: Option<String> = None;
-            for account in &self.accounts {
-                if let Err(error) = self.runtime.sync_account(account).await {
-                    failed += 1;
-                    // The status line already says the sync failed; one
-                    // account's short reason stands for the first failure.
-                    first.get_or_insert(match error {
-                        FlowError::Sync(error) => error.reason().to_owned(),
-                        other => other.to_string(),
-                    });
-                }
-            }
-            match first {
-                Some(first) => Err(sync_failure(failed, self.accounts.len(), &first)),
-                None => Ok(()),
-            }
+            self.runtime
+                .sync_account(account)
+                .await
+                .map(|_report| ())
+                .map_err(|error| match error {
+                    FlowError::Sync(error) => error.reason().to_owned(),
+                    other => other.to_string(),
+                })
         })
     }
 }
@@ -716,7 +706,7 @@ mod tests {
 
     use super::{
         Context, Create, NO_ACCOUNTS, StoreSource, UnlockPlan, account_list, account_remove, inbox,
-        plan_unlock, sync, sync_failure,
+        plan_unlock, sync,
     };
     use crate::config::{Config, Paths};
     use crate::tui::MailSource as _;
@@ -1300,17 +1290,5 @@ mod tests {
         assert_eq!(app.rows.len(), 3);
         assert_eq!(app.accounts.len(), 2);
         assert_eq!(app.unavailable_accounts.len(), 1);
-    }
-
-    #[test]
-    fn the_sync_failure_names_the_count_and_the_first_reason() {
-        assert_eq!(
-            sync_failure(2, 5, "offline"),
-            "2 of 5 accounts failed to sync: offline"
-        );
-        assert_eq!(
-            sync_failure(1, 1, "no network"),
-            "1 of 1 accounts failed to sync: no network"
-        );
     }
 }

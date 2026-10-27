@@ -12,16 +12,14 @@ mod app;
 #[cfg(test)]
 mod perf;
 mod view;
+mod worker;
 mod wrap;
 
-use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::os::fd::AsFd;
-use std::pin::{Pin, pin};
-use std::rc::Rc;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::task::Poll;
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::DefaultTerminal;
@@ -34,8 +32,9 @@ use tersa_application::unified_mailbox::{
 };
 use tersa_presentation::terminal::SafeText;
 
-use app::{App, Request, SyncState};
+use app::{App, Request};
 pub use app::{MessageKey, Row, account_tag_label};
+use worker::{Done, Worker, Workers};
 
 /// Where the interface reads cached mail from.
 pub trait MailSource {
@@ -135,9 +134,8 @@ pub trait Remote: Send + 'static {
     /// fails with a short reason for the reader.
     fn fetch<'a>(&'a self, account: &'a AccountId, id: &'a MessageId) -> Pending<'a, Vec<u8>>;
 
-    /// Syncs recent mail of every account into the cache; fails with a
-    /// short reason for the reader.
-    fn sync(&self) -> Pending<'_, ()>;
+    /// Syncs only this account through its identity gate.
+    fn sync<'a>(&'a self, account: &'a AccountId) -> Pending<'a, ()>;
 }
 
 /// How often the loop checks for finished work while idle.
@@ -150,7 +148,7 @@ const FIRST_PAGE: u16 = 100;
 const PAGE: u16 = MAX_PAGE_SIZE;
 
 /// How often the account syncs on its own.
-const SYNC_EVERY: Duration = Duration::from_secs(5 * 60);
+pub(super) const SYNC_EVERY: Duration = Duration::from_secs(5 * 60);
 
 /// How often an idle screen is redrawn anyway, so relative dates stay true.
 const REDRAW_EVERY: Duration = Duration::from_secs(30);
@@ -190,11 +188,14 @@ fn unreadable_status(unreadable: usize) -> Option<String> {
 ///
 /// Returns a message when standard input or output is not a terminal, the
 /// cache cannot be read, or the terminal fails.
-pub fn run(source: &dyn MailSource, remote: Option<Box<dyn Remote>>) -> Result<(), String> {
+pub fn run(
+    source: &dyn MailSource,
+    remotes: Vec<(AccountId, Box<dyn Remote>)>,
+) -> Result<(), String> {
     require_terminal()?;
     let mut app =
         initial_app(source).map_err(|()| "could not read the local mailbox".to_owned())?;
-    let mut worker = remote.map(Worker::start);
+    let mut worker = Workers::start(remotes)?;
     // Installs a panic hook that restores the terminal before reporting.
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
@@ -218,216 +219,14 @@ pub fn run(source: &dyn MailSource, remote: Option<Box<dyn Remote>>) -> Result<(
     result
 }
 
-/// One piece of network work.
-enum Job {
-    Fetch(MessageKey),
-    Sync,
-}
-
-/// A finished piece of network work.
-enum Done {
-    Fetched(MessageKey, Result<Vec<u8>, String>),
-    /// The message was no longer open when its turn came, so it was not
-    /// downloaded.
-    Skipped(MessageKey),
-    Synced(Result<(), String>),
-}
-
-/// The network thread's channels. Each job runs as its own task on one
-/// single-threaded runtime, so a download never waits for a sync. Dropping
-/// this ends the thread, cancels unfinished jobs, and waits for the thread
-/// to stop.
-struct Worker {
-    jobs: tokio::sync::mpsc::UnboundedSender<Job>,
-    done: Receiver<Done>,
-    fetching: HashSet<MessageKey>,
-    /// The open message. Opening another one stops the download of the
-    /// previous one, queued or running, so at most one download runs and
-    /// one large message is held in memory at a time.
-    open: tokio::sync::watch::Sender<Option<MessageKey>>,
-    syncing: bool,
-    /// When the last sync started, on both clocks: the monotonic clock stops
-    /// while the machine sleeps, the wall clock does not.
-    last_sync: Option<(Instant, SystemTime)>,
-    /// Disconnects when the network thread has stopped.
-    stopped: Receiver<()>,
-}
-
-/// The longest quitting waits for the network thread to stop: a last resort
-/// against a store call that never returns. The longest store call is the
-/// integrity scan of the first open: 62 ms in the performance harness, more
-/// with large cached bodies.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
-
-impl Drop for Worker {
-    /// Stops the network thread and waits for it, so the process does not run
-    /// its exit handlers while that thread is still inside the store or the
-    /// TLS library. A pending network wait is cancelled at once and blocking
-    /// lookups such as DNS are left behind; a store call already running
-    /// finishes first. Past [`SHUTDOWN_WAIT`] the process exits regardless.
-    fn drop(&mut self) {
-        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
-        drop(std::mem::replace(&mut self.jobs, closed));
-        let _ = self.stopped.recv_timeout(SHUTDOWN_WAIT);
-    }
-}
-
-/// Downloads `key` unless another message is opened first: then it stops,
-/// whether it is still queued or already running. Going back to the list
-/// does not stop it, so the message is cached when the reader returns.
-async fn download(
-    remote: &dyn Remote,
-    mut open: tokio::sync::watch::Receiver<Option<MessageKey>>,
-    key: MessageKey,
-) -> Done {
-    let other_opened = async {
-        loop {
-            if open
-                .borrow_and_update()
-                .as_ref()
-                .is_some_and(|open| open != &key)
-            {
-                break;
-            }
-            // A dropped sender means the interface is gone; stop too.
-            if open.changed().await.is_err() {
-                break;
-            }
-        }
-    };
-    // Checked first, so a download queued for a message the reader already
-    // left never starts.
-    match first(other_opened, remote.fetch(&key.0, &key.1)).await {
-        First::Left(()) => Done::Skipped(key),
-        First::Right(result) => Done::Fetched(key, result),
-    }
-}
-
-/// Which of two futures finished first.
-enum First<A, B> {
-    Left(A),
-    Right(B),
-}
-
-/// Runs both futures and returns the first output, dropping the other. On a
-/// tie the left one wins.
-async fn first<A: Future, B: Future>(left: A, right: B) -> First<A::Output, B::Output> {
-    let mut left = pin!(left);
-    let mut right = pin!(right);
-    std::future::poll_fn(|context| {
-        if let Poll::Ready(output) = left.as_mut().poll(context) {
-            return Poll::Ready(First::Left(output));
-        }
-        if let Poll::Ready(output) = right.as_mut().poll(context) {
-            return Poll::Ready(First::Right(output));
-        }
-        Poll::Pending
-    })
-    .await
-}
-
-impl Worker {
-    fn start(remote: Box<dyn Remote>) -> Self {
-        let (jobs, incoming) = tokio::sync::mpsc::unbounded_channel::<Job>();
-        let (outgoing, done) = mpsc::channel();
-        let (open, wanted) = tokio::sync::watch::channel(None::<MessageKey>);
-        let (alive, stopped) = mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            // Dropped last, once the runtime, its tasks and the remote (with
-            // its store connections) are gone, on every path out. Captures
-            // are dropped after locals, so they are moved into locals first.
-            let _alive = alive;
-            let (remote, mut incoming, outgoing, wanted) = (remote, incoming, outgoing, wanted);
-            let Ok(executor) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                // Ending the thread disconnects the channels; the interface
-                // then fails the queued work.
-                return;
-            };
-            let remote: Rc<dyn Remote> = Rc::from(remote);
-            let tasks = tokio::task::LocalSet::new();
-            tasks.block_on(&executor, async move {
-                while let Some(job) = incoming.recv().await {
-                    let remote = Rc::clone(&remote);
-                    let outgoing = outgoing.clone();
-                    let wanted = wanted.clone();
-                    tokio::task::spawn_local(async move {
-                        let finished = match job {
-                            Job::Fetch(id) => download(&*remote, wanted, id).await,
-                            Job::Sync => Done::Synced(remote.sync().await),
-                        };
-                        let _ = outgoing.send(finished);
-                    });
-                }
-            });
-            // Drops the jobs still pending, then stops without waiting for
-            // blocking lookups such as DNS, which hold no store state.
-            drop(tasks);
-            executor.shutdown_background();
-        });
-        Self {
-            jobs,
-            done,
-            fetching: HashSet::new(),
-            open,
-            syncing: false,
-            last_sync: None,
-            stopped,
-        }
-    }
-
-    /// Records which message is open, so downloads of others stop.
-    fn set_open(&self, key: Option<&MessageKey>) {
-        self.open.send_if_modified(|open| {
-            let changed = open.as_ref() != key;
-            if changed {
-                *open = key.cloned();
-            }
-            changed
-        });
-    }
-
-    /// Asks for the message `key`; returns false when the thread is gone.
-    fn fetch(&mut self, key: &MessageKey) -> bool {
-        if self.fetching.contains(key) {
-            return true;
-        }
-        let sent = self.jobs.send(Job::Fetch(key.clone())).is_ok();
-        if sent {
-            self.fetching.insert(key.clone());
-        }
-        sent
-    }
-
-    /// Asks for a sync unless one is running; returns false when the thread
-    /// is gone.
-    fn sync(&mut self) -> bool {
-        self.last_sync = Some((Instant::now(), SystemTime::now()));
-        if self.syncing {
-            return true;
-        }
-        self.syncing = self.jobs.send(Job::Sync).is_ok();
-        self.syncing
-    }
-
-    fn sync_due(&self) -> bool {
-        !self.syncing
-            && self.last_sync.is_none_or(|(monotonic, wall)| {
-                monotonic.elapsed() >= SYNC_EVERY
-                    || wall.elapsed().is_ok_and(|elapsed| elapsed >= SYNC_EVERY)
-            })
-    }
-}
-
 const WORKER_GONE: &str = "the network worker stopped";
+const FETCH_NOT_QUEUED: &str = "the download could not be queued";
 
 fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     source: &dyn MailSource,
-    worker: &mut Option<Worker>,
+    worker: &mut Workers,
 ) -> Result<(), String> {
     let mut dirty = true;
     let mut drawn = Instant::now();
@@ -436,14 +235,12 @@ fn event_loop(
             return Err("tersa stopped after an internal error".to_owned());
         }
         let now = now_millis();
-        if let Some(worker) = worker.as_mut() {
-            dirty |= finish_work(worker, app, source, now);
-            if worker.sync_due() {
-                start_sync(worker, app, now);
-                dirty = true;
-            }
-            worker.set_open(app.open_key());
+        dirty |= finish_work(worker, app, source, now);
+        if worker.accounts.iter().any(|worker| worker.dead) {
+            return Err(WORKER_GONE.to_owned());
         }
+        dirty |= start_sync(worker, app, now, true);
+        worker.set_open(app.open_key());
         if dirty || drawn.elapsed() >= REDRAW_EVERY {
             if std::mem::take(&mut app.repaint) {
                 // Repaint every cell when the screen changes, so any drift
@@ -484,14 +281,12 @@ fn event_loop(
                 let raw = source.message(&key.0, &key.1);
                 let missing = matches!(raw, Ok(None));
                 app.show_message(key.clone(), raw);
-                if let Some(worker) = worker.as_mut()
-                    && missing
-                {
+                if missing && !worker.is_empty() {
                     worker.set_open(Some(&key));
                     if worker.fetch(&key) {
                         app.downloading(&key);
                     } else {
-                        app.downloaded(key, Err(WORKER_GONE.to_owned()));
+                        app.downloaded(key, Err(FETCH_NOT_QUEUED.to_owned()));
                     }
                 }
             }
@@ -499,84 +294,86 @@ fn event_loop(
                 Ok(Some(raw)) => app.reformat(&key, &raw, preference),
                 _ => app.status = Some("The message could not be read again.".to_owned()),
             },
-            Some(Request::Sync) => match worker.as_mut() {
-                Some(worker) => start_sync(worker, app, now),
-                None => {
-                    app.status = Some(
-                        "Syncing needs the Google OAuth client; see `tersa doctor`.".to_owned(),
-                    );
+            Some(Request::Sync) => {
+                if worker.is_empty() {
+                    app.status = Some("Syncing needs a readable account and the Google OAuth client; see `tersa doctor`.".to_owned());
+                } else {
+                    start_sync(worker, app, now, false);
                 }
-            },
+            }
             None => {}
         }
     }
 }
 
-fn start_sync(worker: &mut Worker, app: &mut App, now: i64) {
-    if worker.sync() {
-        app.sync = SyncState::Running;
-    } else {
-        app.synced(Err(WORKER_GONE.to_owned()), now);
+/// Schedules each ready account independently, coalescing an active cycle.
+fn start_sync(workers: &mut Workers, app: &mut App, now: i64, due_only: bool) -> bool {
+    let monotonic = Instant::now();
+    let wall = SystemTime::now();
+    let mut changed = false;
+    for worker in &mut workers.accounts {
+        if due_only && !worker.sync_due_at(monotonic, wall) {
+            continue;
+        }
+        if worker.sync_at(monotonic, wall) {
+            changed |= app.sync_started(&worker.account, worker.next_sync_millis());
+        } else {
+            changed |= fail_pending(worker, app, now);
+        }
     }
+    changed
 }
 
-/// Applies finished downloads and syncs; returns whether anything changed.
-fn finish_work(worker: &mut Worker, app: &mut App, source: &dyn MailSource, now: i64) -> bool {
+/// Applies account-keyed completions and reloads the unified query once per
+/// batch, starting fresh even after a failed sync may have stored metadata.
+fn finish_work(workers: &mut Workers, app: &mut App, source: &dyn MailSource, now: i64) -> bool {
     let mut changed = false;
-    loop {
-        let done = match worker.done.try_recv() {
-            Ok(done) => done,
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                // The network thread is gone: fail what it will never finish.
-                changed |= fail_pending(worker, app, now);
-                break;
-            }
-        };
-        changed = true;
-        match done {
-            Done::Fetched(key, result) => {
-                worker.fetching.remove(&key);
-                app.downloaded(key, result);
-            }
-            Done::Skipped(key) => {
-                worker.fetching.remove(&key);
-                // Reopened while its skipped job was finishing: ask again.
-                if app.open_key() == Some(&key) && !worker.fetch(&key) {
-                    app.downloaded(key, Err(WORKER_GONE.to_owned()));
+    let mut reload = false;
+    for worker in &mut workers.accounts {
+        loop {
+            let done = match worker.done.try_recv() {
+                Ok(done) => done,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    reload |= worker.syncing;
+                    changed |= fail_pending(worker, app, now);
+                    break;
                 }
-            }
-            Done::Synced(result) => {
-                worker.syncing = false;
-                // The labels follow the stores after every finished sync,
-                // success or failure: the start-up sync is when a
-                // first-session store gains the account's Gmail address, and
-                // an identity mismatch clears it, so even a failed sync must
-                // drop the bar back to the id instead of keeping a previous
-                // identity's address.
-                app.set_accounts(source.account_labels());
-                // Read again as many rows as were loaded, so the selection
-                // and the list stay where they were; later pages follow. A
-                // failed sync may have stored envelopes before failing, so
-                // the list is read again either way.
-                let loaded = app.rows.len().max(usize::from(FIRST_PAGE));
-                if let Ok(page) = read_rows(source, loaded) {
-                    set_progress(app, &page);
-                    app.reload(page.rows, app.more_rows);
-                    // Bring back a selection the reload pushed past the rows
-                    // read, before the next frame shows another row.
-                    while app.selection_pending() && app.more_rows {
-                        load_page(app, source);
+            };
+            changed = true;
+            match done {
+                Done::Fetched(key, result) if key.0 == worker.account => {
+                    worker.fetching.remove(&key);
+                    app.downloaded(key, result);
+                }
+                Done::Skipped(key) if key.0 == worker.account => {
+                    worker.fetching.remove(&key);
+                    if app.open_key() == Some(&key) && !worker.fetch(&key) {
+                        app.downloaded(key, Err(FETCH_NOT_QUEUED.to_owned()));
                     }
-                    app.synced(result, now);
-                } else {
-                    // Paging on after rows read before the sync could list
-                    // mail it removed.
-                    app.rows_failed();
-                    let read = Err("could not read the local mailbox".to_owned());
-                    app.synced(result.and(read), now);
                 }
+                Done::Synced(account, result) if account == worker.account => {
+                    worker.syncing = false;
+                    app.synced(&account, result, now, worker.next_sync_millis());
+                    reload = true;
+                }
+                _ => {} // A completion from any other account is never applied.
             }
+        }
+    }
+    if reload {
+        app.set_accounts(source.account_labels());
+        let loaded = app.rows.len().max(usize::from(FIRST_PAGE));
+        if let Ok(page) = read_rows(source, loaded) {
+            set_progress(app, &page);
+            app.reload(page.rows, app.more_rows);
+            while app.selection_pending() && app.more_rows {
+                load_page(app, source);
+            }
+        } else {
+            // Query availability and network sync results are separate states.
+            app.rows_failed();
+            app.status = Some("The local mailbox could not be read again.".to_owned());
         }
     }
     changed
@@ -639,16 +436,16 @@ pub(crate) fn read_rows(source: &dyn MailSource, limit: usize) -> Result<MailPag
 /// Fails the sync and downloads a stopped worker still owed; returns whether
 /// there were any.
 fn fail_pending(worker: &mut Worker, app: &mut App, now: i64) -> bool {
-    let mut changed = false;
-    if std::mem::take(&mut worker.syncing) {
-        app.synced(Err(WORKER_GONE.to_owned()), now);
-        changed = true;
+    if worker.dead {
+        return false;
     }
+    worker.dead = true;
+    worker.syncing = false;
+    app.synced(&worker.account, Err(WORKER_GONE.to_owned()), now, None);
     for key in std::mem::take(&mut worker.fetching) {
         app.downloaded(key, Err(WORKER_GONE.to_owned()));
-        changed = true;
     }
-    changed
+    true
 }
 
 /// What the terminal has for the event loop.
@@ -731,50 +528,21 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::mpsc::{self, Sender};
-    use std::sync::{Arc, Mutex};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant, SystemTime};
 
     use tersa_application::mailbox::{AccountId, MessageId};
     use tersa_application::unified_mailbox::UnavailableAccount;
     use tersa_presentation::terminal::SafeText;
 
-    use super::app::{Body, Screen};
+    use super::app::{Body, Screen, SyncState};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        App, Done, FIRST_PAGE, MailPage, MailSource, MessageKey, Pending, Remote, Row, SYNC_EVERY,
-        SyncState, UnifiedMailboxContinuation, WORKER_GONE, Worker, finish_work, initial_app,
-        load_page, read_page, read_rows, set_progress, terminal_open, unreadable_status, view,
+        App, Done, FIRST_PAGE, MailPage, MailSource, MessageKey, Row, UnifiedMailboxContinuation,
+        WORKER_GONE, Worker, Workers, finish_work, initial_app, load_page, read_page, read_rows,
+        set_progress, terminal_open, unreadable_status, view,
     };
-
-    /// Records the order work finishes in; syncs wait for the test.
-    struct Recorder {
-        log: Sender<String>,
-        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
-    }
-
-    impl Remote for Recorder {
-        fn fetch<'a>(&'a self, account: &'a AccountId, id: &'a MessageId) -> Pending<'a, Vec<u8>> {
-            Box::pin(async move {
-                let _ = self
-                    .log
-                    .send(format!("fetch {} {}", account.as_str(), id.as_str()));
-                Ok(Vec::new())
-            })
-        }
-
-        fn sync(&self) -> Pending<'_, ()> {
-            let release = self.release.lock().expect("lock").take();
-            Box::pin(async move {
-                if let Some(release) = release {
-                    let _ = release.await;
-                }
-                let _ = self.log.send("sync".to_owned());
-                Err("offline".to_owned())
-            })
-        }
-    }
 
     fn id(text: &str) -> MessageId {
         MessageId::new(text).expect("id")
@@ -794,254 +562,6 @@ mod tests {
             .iter()
             .map(|label| (account(label), SafeText::single_line(label)))
             .collect()
-    }
-
-    #[test]
-    fn downloads_finish_while_a_sync_is_still_running() {
-        let (log, entries) = mpsc::channel();
-        let (release, released) = tokio::sync::oneshot::channel();
-        let mut worker = Worker::start(Box::new(Recorder {
-            log,
-            release: Mutex::new(Some(released)),
-        }));
-        let next = || {
-            entries
-                .recv_timeout(Duration::from_secs(5))
-                .expect("work finishes")
-        };
-        assert!(worker.sync());
-        assert!(worker.sync(), "a second request joins the running sync");
-        worker.set_open(Some(&key("acct_a", "a")));
-        assert!(worker.fetch(&key("acct_a", "a")));
-        assert!(worker.fetch(&key("acct_a", "a")), "a repeat is merged");
-        assert_eq!(next(), "fetch acct_a a");
-        worker.set_open(Some(&key("acct_a", "b")));
-        assert!(worker.fetch(&key("acct_a", "b")));
-        assert_eq!(next(), "fetch acct_a b");
-        release.send(()).expect("release");
-        assert_eq!(next(), "sync");
-        let mut fetched = 0;
-        let mut synced = 0;
-        for _ in 0..3 {
-            match worker.done.recv_timeout(Duration::from_secs(5)) {
-                Ok(Done::Fetched(_, Ok(_))) => fetched += 1,
-                Ok(Done::Synced(Err(error))) if error == "offline" => synced += 1,
-                _ => panic!("unexpected result"),
-            }
-        }
-        assert_eq!((fetched, synced), (2, 1));
-        assert!(
-            entries.recv_timeout(Duration::from_millis(100)).is_err(),
-            "nothing ran twice"
-        );
-        // The sync finished; the five-minute clock now decides.
-        worker.syncing = false;
-        assert!(!worker.sync_due(), "a sync was just asked for");
-        worker.last_sync = worker
-            .last_sync
-            .map(|(monotonic, wall)| (monotonic, wall - SYNC_EVERY));
-        assert!(worker.sync_due(), "five minutes later another one is due");
-    }
-
-    #[test]
-    fn downloads_for_messages_no_longer_open_are_skipped() {
-        let (log, entries) = mpsc::channel();
-        let mut worker = Worker::start(Box::new(Recorder {
-            log,
-            release: Mutex::new(None),
-        }));
-        worker.set_open(Some(&key("acct_a", "now")));
-        for stale in ["s1", "s2", "s3", "s4", "s5", "s6"] {
-            assert!(worker.fetch(&key("acct_a", stale)));
-        }
-        assert!(worker.fetch(&key("acct_a", "now")));
-        assert_eq!(
-            entries
-                .recv_timeout(Duration::from_secs(5))
-                .expect("work finishes"),
-            "fetch acct_a now"
-        );
-        let mut skipped = 0;
-        for _ in 0..7 {
-            match worker.done.recv_timeout(Duration::from_secs(5)) {
-                Ok(Done::Skipped(_)) => skipped += 1,
-                Ok(Done::Fetched(key, Ok(_))) => assert_eq!(key.1.as_str(), "now"),
-                _ => panic!("unexpected result"),
-            }
-        }
-        assert_eq!(skipped, 6);
-        assert!(
-            entries.recv_timeout(Duration::from_millis(100)).is_err(),
-            "stale messages were never downloaded"
-        );
-    }
-
-    /// Downloads of ids starting with "slow" wait until the test opens the
-    /// gate.
-    struct Gated {
-        log: Sender<String>,
-        gate: Arc<tokio::sync::Semaphore>,
-    }
-
-    impl Remote for Gated {
-        fn fetch<'a>(&'a self, _account: &'a AccountId, id: &'a MessageId) -> Pending<'a, Vec<u8>> {
-            Box::pin(async move {
-                let _ = self.log.send(format!("start {}", id.as_str()));
-                if id.as_str().starts_with("slow") {
-                    let _ = self.gate.acquire().await;
-                }
-                let _ = self.log.send(format!("fetch {}", id.as_str()));
-                Ok(Vec::new())
-            })
-        }
-
-        fn sync(&self) -> Pending<'_, ()> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    #[test]
-    fn opening_another_message_stops_a_running_download() {
-        let (log, entries) = mpsc::channel();
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let mut worker = Worker::start(Box::new(Gated {
-            log,
-            gate: Arc::clone(&gate),
-        }));
-        let next = || {
-            entries
-                .recv_timeout(Duration::from_secs(5))
-                .expect("work starts")
-        };
-        worker.set_open(Some(&key("acct_a", "slow")));
-        assert!(worker.fetch(&key("acct_a", "slow")));
-        assert_eq!(next(), "start slow");
-        worker.set_open(Some(&key("acct_a", "now")));
-        assert!(worker.fetch(&key("acct_a", "now")));
-        assert_eq!(next(), "start now");
-        assert_eq!(next(), "fetch now", "it did not wait for the slow one");
-        let mut results = Vec::new();
-        for _ in 0..2 {
-            match worker.done.recv_timeout(Duration::from_secs(5)) {
-                Ok(Done::Skipped(key)) => results.push(format!("skipped {}", key.1.as_str())),
-                Ok(Done::Fetched(key, Ok(_))) => {
-                    results.push(format!("fetched {}", key.1.as_str()));
-                }
-                _ => panic!("unexpected result"),
-            }
-        }
-        results.sort();
-        assert_eq!(results, ["fetched now", "skipped slow"]);
-        gate.add_permits(1);
-        assert!(
-            entries.recv_timeout(Duration::from_millis(100)).is_err(),
-            "the stopped download never finished"
-        );
-    }
-
-    #[test]
-    fn going_back_to_the_list_keeps_a_download_running() {
-        let (log, entries) = mpsc::channel();
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let mut worker = Worker::start(Box::new(Gated {
-            log,
-            gate: Arc::clone(&gate),
-        }));
-        worker.set_open(Some(&key("acct_a", "slow")));
-        assert!(worker.fetch(&key("acct_a", "slow")));
-        assert_eq!(
-            entries.recv_timeout(Duration::from_secs(5)).expect("start"),
-            "start slow"
-        );
-        worker.set_open(None);
-        gate.add_permits(1);
-        assert!(matches!(
-            worker.done.recv_timeout(Duration::from_secs(5)),
-            Ok(Done::Fetched(key, Ok(_))) if key.1.as_str() == "slow"
-        ));
-    }
-
-    #[test]
-    fn opening_the_same_id_in_another_account_cancels_the_old_download() {
-        let (log, entries) = mpsc::channel();
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let mut worker = Worker::start(Box::new(Gated {
-            log,
-            gate: Arc::clone(&gate),
-        }));
-        let old = key("acct_a", "slow");
-        let current = key("acct_b", "slow");
-        worker.set_open(Some(&old));
-        assert!(worker.fetch(&old));
-        assert_eq!(
-            entries.recv_timeout(Duration::from_secs(5)).expect("start"),
-            "start slow"
-        );
-        worker.set_open(Some(&current));
-        assert!(worker.fetch(&current));
-        assert_eq!(
-            entries.recv_timeout(Duration::from_secs(5)).expect("start"),
-            "start slow"
-        );
-        assert!(matches!(
-            worker.done.recv_timeout(Duration::from_secs(5)),
-            Ok(Done::Skipped(key)) if key == old
-        ));
-        gate.add_permits(1);
-        assert!(matches!(
-            worker.done.recv_timeout(Duration::from_secs(5)),
-            Ok(Done::Fetched(key, Ok(_))) if key == current
-        ));
-        assert_eq!(
-            entries
-                .recv_timeout(Duration::from_secs(5))
-                .expect("finish"),
-            "fetch slow"
-        );
-    }
-
-    /// A worker fetch is named by the account and the identifier: the same
-    /// identifier in another account is another message and runs its own
-    /// download.
-    #[test]
-    fn downloads_of_the_same_id_in_two_accounts_run_separately() {
-        let (log, entries) = mpsc::channel();
-        let mut worker = Worker::start(Box::new(Recorder {
-            log,
-            release: Mutex::new(None),
-        }));
-        // No message is open, so neither download is superseded by another.
-        assert!(worker.fetch(&key("acct_a", "m")));
-        assert!(
-            worker.fetch(&key("acct_b", "m")),
-            "the other account's same id is not merged into the running one"
-        );
-        let mut fetched = Vec::new();
-        for _ in 0..2 {
-            match worker.done.recv_timeout(Duration::from_secs(5)) {
-                Ok(Done::Fetched(key, Ok(_))) => {
-                    fetched.push(format!("{} {}", key.0.as_str(), key.1.as_str()));
-                }
-                _ => panic!("unexpected result"),
-            }
-        }
-        fetched.sort();
-        assert_eq!(
-            fetched,
-            ["acct_a m", "acct_b m"],
-            "each download asks its own account"
-        );
-        // The remote itself was asked through each account's store.
-        let mut asked = Vec::new();
-        for _ in 0..2 {
-            asked.push(
-                entries
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("work finishes"),
-            );
-        }
-        asked.sort();
-        assert_eq!(asked, ["fetch acct_a m", "fetch acct_b m"]);
     }
 
     struct Empty;
@@ -1386,23 +906,19 @@ mod tests {
             "rows loaded before the sync are no cursor for after it"
         );
         assert!(app.rows_unreadable);
-        assert!(matches!(app.sync, SyncState::Failed(_)));
+        assert!(matches!(app.sync[0].state, SyncState::Synced(_)));
     }
 
     fn finished_sync(app: &mut App, source: &dyn MailSource, result: Result<(), String>) {
-        let (jobs, _) = tokio::sync::mpsc::unbounded_channel();
         let (done_sender, done) = mpsc::channel();
-        let mut worker = Worker {
-            jobs,
-            done,
-            fetching: HashSet::new(),
-            open: tokio::sync::watch::channel(None).0,
-            syncing: true,
-            last_sync: Some((Instant::now(), SystemTime::now())),
-            stopped: mpsc::channel().1,
+        let account = app.accounts[0].0.clone();
+        let mut workers = Workers {
+            accounts: vec![Worker::fixture(account.clone(), done, true, HashSet::new())],
         };
-        done_sender.send(Done::Synced(result)).expect("send");
-        assert!(finish_work(&mut worker, app, source, 0));
+        done_sender
+            .send(Done::Synced(account, result))
+            .expect("send");
+        assert!(finish_work(&mut workers, app, source, 0));
     }
 
     /// The screen as text lines, so a test can read what was drawn.
@@ -1458,7 +974,7 @@ mod tests {
         finished_sync(&mut app, &source, Err("bodies failed".to_owned()));
         assert_eq!(app.rows.len(), 51);
         assert_eq!(app.rows[0].id.as_str(), "new00000");
-        assert!(matches!(app.sync, SyncState::Failed(_)));
+        assert!(matches!(app.sync[0].state, SyncState::Failed(_)));
     }
 
     /// A cache whose stored Gmail address appears and disappears between
@@ -1777,118 +1293,6 @@ mod tests {
         assert!(source.requests.borrow().iter().all(|size| *size <= 200));
     }
 
-    /// How a stalled sync holds the network thread.
-    #[derive(Clone, Copy)]
-    enum Stall {
-        /// Blocks the thread, like a store call.
-        StoreCall,
-        /// Waits forever, like a network request.
-        Network,
-        /// Waits on tokio's blocking pool, like a DNS lookup.
-        BlockingPool,
-    }
-
-    /// A sync that reports its start, then stalls; a store call records
-    /// when it ends.
-    struct Stalled {
-        started: Sender<()>,
-        stall: Stall,
-        ended: Arc<Mutex<Option<Instant>>>,
-    }
-
-    impl Remote for Stalled {
-        fn fetch<'a>(
-            &'a self,
-            _account: &'a AccountId,
-            _id: &'a MessageId,
-        ) -> Pending<'a, Vec<u8>> {
-            Box::pin(async { Ok(Vec::new()) })
-        }
-
-        fn sync(&self) -> Pending<'_, ()> {
-            Box::pin(async move {
-                match self.stall {
-                    Stall::StoreCall => {
-                        let _ = self.started.send(());
-                        std::thread::sleep(Duration::from_secs(1));
-                        *self.ended.lock().expect("lock") = Some(Instant::now());
-                        Ok(())
-                    }
-                    Stall::Network => {
-                        let _ = self.started.send(());
-                        std::future::pending().await
-                    }
-                    Stall::BlockingPool => {
-                        // Reports from the pool thread, so the lookup is
-                        // running, not just queued, when the quit begins.
-                        let started = self.started.clone();
-                        let lookup = tokio::task::spawn_blocking(move || {
-                            let _ = started.send(());
-                            std::thread::sleep(Duration::from_secs(10));
-                        });
-                        let _ = lookup.await;
-                        Ok(())
-                    }
-                }
-            })
-        }
-    }
-
-    fn stalled_sync(stall: Stall) -> (Worker, Arc<Mutex<Option<Instant>>>) {
-        let (started, start) = mpsc::channel();
-        let ended = Arc::new(Mutex::new(None));
-        let mut worker = Worker::start(Box::new(Stalled {
-            started,
-            stall,
-            ended: Arc::clone(&ended),
-        }));
-        assert!(worker.sync());
-        start
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the sync starts");
-        (worker, ended)
-    }
-
-    /// How long quitting takes while the sync stalls this way.
-    fn quit_time(stall: Stall) -> Duration {
-        let (worker, _) = stalled_sync(stall);
-        let quitting = Instant::now();
-        drop(worker);
-        quitting.elapsed()
-    }
-
-    #[test]
-    fn quitting_waits_for_a_store_call_the_network_thread_is_in() {
-        // A run counts only if the store call was still running when the
-        // quit began; on a stalled machine it may already have ended.
-        for _ in 0..5 {
-            let (worker, ended) = stalled_sync(Stall::StoreCall);
-            let quitting = Instant::now();
-            drop(worker);
-            let returned = Instant::now();
-            // Not ended yet, or ended after the quit returned: it did not wait.
-            let ended = (*ended.lock().expect("lock"))
-                .filter(|&ended| ended <= returned)
-                .expect("the quit returned before the store call ended");
-            if ended > quitting {
-                return;
-            }
-        }
-        panic!("the store call always ended before the quit began");
-    }
-
-    #[test]
-    fn quitting_cancels_a_network_wait_at_once() {
-        let took = quit_time(Stall::Network);
-        assert!(took < Duration::from_secs(5), "took {took:?}");
-    }
-
-    #[test]
-    fn quitting_leaves_a_blocking_lookup_behind() {
-        let took = quit_time(Stall::BlockingPool);
-        assert!(took < Duration::from_secs(5), "took {took:?}");
-    }
-
     /// A pseudo-terminal: the side tersa reads, and the side the terminal
     /// emulator holds.
     fn pty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
@@ -1908,6 +1312,160 @@ mod tests {
         (input, emulator)
     }
 
+    struct PendingRemote {
+        account: AccountId,
+        started: mpsc::Sender<AccountId>,
+        dropped: mpsc::Sender<AccountId>,
+    }
+    impl Drop for PendingRemote {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(self.account.clone());
+        }
+    }
+    impl super::Remote for PendingRemote {
+        fn fetch<'a>(&'a self, _: &'a AccountId, _: &'a MessageId) -> super::Pending<'a, Vec<u8>> {
+            Box::pin(std::future::pending())
+        }
+        fn sync<'a>(&'a self, account: &'a AccountId) -> super::Pending<'a, ()> {
+            Box::pin(async move {
+                assert_eq!(account, &self.account);
+                let _ = self.started.send(account.clone());
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[test]
+    fn terminal_loss_drops_and_joins_every_account_worker() {
+        let (input, emulator) = pty();
+        let (started, starts) = mpsc::channel();
+        let (dropped, drops) = mpsc::channel();
+        {
+            let remotes = ["acct_a", "acct_b"]
+                .iter()
+                .map(|name| {
+                    (
+                        account(name),
+                        Box::new(PendingRemote {
+                            account: account(name),
+                            started: started.clone(),
+                            dropped: dropped.clone(),
+                        }) as Box<dyn super::Remote>,
+                    )
+                })
+                .collect();
+            let mut workers = Workers::start(remotes).expect("workers");
+            for worker in &mut workers.accounts {
+                assert!(worker.sync_at(Instant::now(), SystemTime::now()));
+                assert_eq!(
+                    starts
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("sync started"),
+                    worker.account
+                );
+            }
+            drop(emulator);
+            assert!(!terminal_open(&input, Duration::from_secs(5)).expect("terminal loss"));
+            // event_loop returns on Input::Closed; the same owned group drop
+            // cancels and joins before the enclosing session can return.
+        }
+        let owners: HashSet<_> = drops.try_iter().collect();
+        assert_eq!(
+            owners,
+            HashSet::from([account("acct_a"), account("acct_b")])
+        );
+    }
+
+    #[test]
+    fn a_worker_failure_joins_the_other_owned_workers_on_session_exit() {
+        let (started, starts) = mpsc::channel();
+        let (dropped, drops) = mpsc::channel();
+        let mut workers = Workers::start(vec![(
+            account("acct_b"),
+            Box::new(PendingRemote {
+                account: account("acct_b"),
+                started,
+                dropped,
+            }),
+        )])
+        .expect("worker");
+        assert!(workers.accounts[0].sync_at(Instant::now(), SystemTime::now()));
+        assert_eq!(
+            starts
+                .recv_timeout(Duration::from_secs(5))
+                .expect("sync started"),
+            account("acct_b")
+        );
+        let (_, done) = mpsc::channel();
+        workers.accounts.insert(
+            0,
+            Worker::fixture(account("acct_a"), done, true, HashSet::new()),
+        );
+        let mut app = App::new(labeled(&["acct_a", "acct_b"]), Vec::new());
+        assert!(finish_work(&mut workers, &mut app, &Empty, 0));
+        assert!(
+            workers.accounts.iter().any(|worker| worker.dead),
+            "event_loop takes the fatal worker-exit path"
+        );
+        drop(workers);
+        assert_eq!(
+            drops
+                .try_recv()
+                .expect("other owner dropped before session exit"),
+            account("acct_b")
+        );
+    }
+
+    #[test]
+    fn sync_errors_are_account_local_and_completions_restart_one_fresh_query() {
+        let source = Relabeled(
+            vec![
+                Row::sample("acct_a", "same", "Ann", "Cached A", false),
+                Row::sample("acct_b", "same", "Bob", "Cached B", false),
+            ],
+            std::cell::RefCell::new(labeled(&["acct_a", "acct_b"])),
+        );
+        let mut app = initial_app(&source).expect("cached inbox");
+        let (a, a_done) = mpsc::channel();
+        let (b, b_done) = mpsc::channel();
+        let mut workers = Workers {
+            accounts: vec![
+                Worker::fixture(account("acct_a"), a_done, true, HashSet::new()),
+                Worker::fixture(account("acct_b"), b_done, true, HashSet::new()),
+            ],
+        };
+        // A mismatched event cannot update B through A's worker.
+        a.send(Done::Synced(
+            account("acct_b"),
+            Err("wrong route".to_owned()),
+        ))
+        .expect("send");
+        assert!(finish_work(&mut workers, &mut app, &source, 41));
+        assert!(workers.accounts[0].syncing);
+        assert_eq!(app.sync[1].state, SyncState::Idle);
+        b.send(Done::Synced(account("acct_b"), Ok(())))
+            .expect("B success");
+        a.send(Done::Synced(
+            account("acct_a"),
+            Err("authorization required".to_owned()),
+        ))
+        .expect("A failure");
+        assert!(finish_work(&mut workers, &mut app, &source, 42));
+        assert!(matches!(app.sync[0].state, SyncState::Failed(_)));
+        assert_eq!(app.sync[1].state, SyncState::Synced(42));
+        assert_eq!(app.sync[1].last_success, Some(42));
+        assert_eq!(
+            app.rows.len(),
+            2,
+            "remote auth failure does not suppress local cache"
+        );
+        assert!(app.unavailable_accounts.is_empty());
+        assert!(
+            !app.sync_started(&account("acct_unknown"), None),
+            "no first-account fallback"
+        );
+    }
+
     #[test]
     fn a_closed_terminal_is_seen_at_once() {
         let (input, emulator) = pty();
@@ -1924,47 +1482,36 @@ mod tests {
 
     #[test]
     fn a_stopped_worker_fails_the_work_it_owed() {
-        let (jobs, _) = tokio::sync::mpsc::unbounded_channel();
         let (_, done) = mpsc::channel();
-        let mut worker = Worker {
-            jobs,
-            done,
-            fetching: HashSet::from([key("acct_a", "a")]),
-            open: tokio::sync::watch::channel(Some(key("acct_a", "a"))).0,
-            syncing: true,
-            last_sync: Some((Instant::now(), SystemTime::now())),
-            stopped: mpsc::channel().1,
+        let mut worker = Workers {
+            accounts: vec![Worker::fixture(
+                account("acct_a"),
+                done,
+                true,
+                HashSet::from([key("acct_a", "a")]),
+            )],
         };
         let mut app = App::new(labeled(&["acct_a"]), Vec::new());
         app.show_message(key("acct_a", "a"), Ok(None));
         app.downloading(&key("acct_a", "a"));
         assert!(finish_work(&mut worker, &mut app, &Empty, 0));
-        assert!(matches!(&app.sync, SyncState::Failed(error) if error == WORKER_GONE));
+        assert!(
+            matches!(&app.sync[0].state, SyncState::Failed(error) if error.as_str() == WORKER_GONE)
+        );
         assert!(
             matches!(&app.screen, Screen::Message(view)
                 if matches!(&view.body, Body::DownloadFailed(error) if error == WORKER_GONE)),
             "the open message says why it will not arrive"
         );
-        assert!(!worker.syncing && worker.fetching.is_empty());
+        assert!(!worker.accounts[0].syncing && worker.accounts[0].fetching.is_empty());
         assert!(
             !finish_work(&mut worker, &mut app, &Empty, 0),
             "reported once"
         );
-        assert!(!worker.sync(), "a new sync reports the stopped worker");
-    }
-
-    #[test]
-    fn a_sync_is_due_after_a_sleep_the_monotonic_clock_missed() {
-        let (log, _entries) = mpsc::channel();
-        let mut worker = Worker::start(Box::new(Recorder {
-            log,
-            release: Mutex::new(None),
-        }));
-        let before_sleep = SystemTime::now() - SYNC_EVERY - Duration::from_secs(1);
-        worker.last_sync = Some((Instant::now(), before_sleep));
-        assert!(worker.sync_due());
-        worker.last_sync = Some((Instant::now(), SystemTime::now()));
-        assert!(!worker.sync_due());
+        assert!(
+            !worker.accounts[0].sync_at(Instant::now(), SystemTime::now()),
+            "a stopped worker is not retried"
+        );
     }
 
     #[test]

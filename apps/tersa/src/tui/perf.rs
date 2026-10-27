@@ -19,12 +19,13 @@
 //! What they measure, and what they leave out:
 //!
 //! - The first frame is timed five times in process, from opening the
-//!   store to a draw into ratatui's test backend. Process start, the keyring
+//!   store and starting account workers to a draw into ratatui's test backend. Process start, the keyring
 //!   read and writing to a real terminal come on top of it. The budgets
 //!   are checked against the slowest run, the first frame's and the
 //!   top-50 query's alike.
 //! - The idle resident size is that of this test binary in a fresh process
-//!   that does what the interface does. The test binary links the test
+//!   that loads the cache and starts one or five production workers with
+//!   controlled pending futures. No live network is included. It links the test
 //!   harness as well, so the product binary is no larger.
 //! - The budget on the stripped release binary is not checked here: it is
 //!   the size of `target/release/tersa`, which the release profile strips.
@@ -228,11 +229,89 @@ impl Drop for AccountsFixture {
     }
 }
 
+/// Starts the production worker machinery with controlled, pending network
+/// futures. No provider, credentials, DNS or real socket is involved.
+fn idle_workers(app: &mut super::app::App, wait_for_start: bool) -> super::worker::Workers {
+    struct Idle(std::sync::mpsc::Sender<()>);
+    impl super::Remote for Idle {
+        fn fetch<'a>(&'a self, _: &'a AccountId, _: &'a MessageId) -> super::Pending<'a, Vec<u8>> {
+            Box::pin(std::future::pending())
+        }
+        fn sync<'a>(&'a self, _: &'a AccountId) -> super::Pending<'a, ()> {
+            Box::pin(async move {
+                let _ = self.0.send(());
+                std::future::pending().await
+            })
+        }
+    }
+    let (started, starts) = std::sync::mpsc::channel();
+    let remotes = app
+        .accounts
+        .iter()
+        .map(|(account, _)| {
+            (
+                account.clone(),
+                Box::new(Idle(started.clone())) as Box<dyn super::Remote>,
+            )
+        })
+        .collect();
+    let mut workers = super::worker::Workers::start(remotes).unwrap();
+    super::start_sync(&mut workers, app, 1_761_000_000_000, false);
+    if wait_for_start {
+        for _ in &app.accounts {
+            starts.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+    }
+    workers
+}
+
+fn idle_rss(path: &std::path::Path, multi: bool) -> f64 {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child.args([
+        "--exact",
+        "tui::perf::perf_idle_rss_child",
+        "--ignored",
+        "--nocapture",
+    ]);
+    child.env_remove(if multi {
+        CHILD_DATABASE
+    } else {
+        CHILD_ACCOUNTS
+    });
+    child.env(
+        if multi {
+            CHILD_ACCOUNTS
+        } else {
+            CHILD_DATABASE
+        },
+        path,
+    );
+    let output = child.output().unwrap();
+    assert!(
+        output.status.success(),
+        "RSS child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed = String::from_utf8_lossy(&output.stdout);
+    printed
+        .lines()
+        .find_map(|line| line.strip_prefix("RSS_MIB="))
+        .unwrap_or_else(|| panic!("child printed no RSS: {printed}"))
+        .parse()
+        .unwrap()
+}
+
 fn rss_mib() -> f64 {
     let output = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
         .unwrap();
+    assert!(
+        output.status.success(),
+        "ps failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let kib: f64 = String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()
@@ -292,17 +371,18 @@ fn perf_full_cache_budgets() {
     report_budget("top-50 query", top_50, top_50_slowest, TOP_50);
 
     let warm = source(store);
-    let (first_frame, first_frame_slowest, mut app) = timed(5, || {
+    let (first_frame, first_frame_slowest, (mut app, _workers)) = timed(5, || {
         let fresh = source(open(&fixture.path, IntegrityScan::Skip));
         let mut app = super::initial_app(&fresh).unwrap();
+        let workers = idle_workers(&mut app, false);
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
             .draw(|frame| view::draw(frame, &mut app, 1_761_000_000_000))
             .unwrap();
-        app
+        (app, workers)
     });
     report_budget(
-        "first frame (open, global 100, per-account probe 101, draw)",
+        "first frame (open, worker start, global 100, per-account probe 101, draw)",
         first_frame,
         first_frame_slowest,
         FIRST_FRAME,
@@ -348,24 +428,10 @@ fn perf_full_cache_budgets() {
     // The fixture and the timings above allocated a lot in this process, so
     // the resident size is measured in a fresh one that does only what the
     // interface does: open the store, load every row, draw.
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "tui::perf::perf_idle_rss_child",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env(CHILD_DATABASE, &fixture.path)
-        .output()
-        .unwrap();
-    let printed = String::from_utf8_lossy(&output.stdout);
-    let rss: f64 = printed
-        .lines()
-        .find_map(|line| line.strip_prefix("RSS_MIB="))
-        .unwrap_or_else(|| panic!("the child printed no RSS: {printed}"))
-        .parse()
-        .unwrap();
-    println!("idle RSS with 10,000 rows loaded: {rss:.1} MiB (budget {IDLE_RSS_MIB} MiB)");
+    let rss = idle_rss(&fixture.path, false);
+    println!(
+        "idle RSS with one worker and 10,000 rows loaded: {rss:.1} MiB (budget {IDLE_RSS_MIB} MiB)"
+    );
     if !cfg!(debug_assertions) {
         assert!(rss < IDLE_RSS_MIB, "RSS {rss:.1} MiB");
     }
@@ -378,18 +444,19 @@ fn perf_five_account_budgets() {
 
     // The merged first frame opens every store, reads one page from each,
     // and draws, against the same budget as one account.
-    let (first_frame, first_frame_slowest, mut app) = timed(5, || {
+    let (first_frame, first_frame_slowest, (mut app, _workers)) = timed(5, || {
         let fresh = fixture.source();
         let mut app = super::initial_app(&fresh).unwrap();
+        let workers = idle_workers(&mut app, false);
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
             .draw(|frame| view::draw(frame, &mut app, 1_761_000_000_000))
             .unwrap();
-        app
+        (app, workers)
     });
     report_budget(
         &format!(
-            "first frame, {ACCOUNTS} accounts (open, global 100, per-account probe 101, draw)"
+            "first frame, {ACCOUNTS} accounts (open, worker start, global 100, per-account probe 101, draw)"
         ),
         first_frame,
         first_frame_slowest,
@@ -417,20 +484,55 @@ fn perf_five_account_budgets() {
         &format!("slowest page of {PAGE} across {ACCOUNTS} accounts"),
         slowest_page,
     );
+    let rss = idle_rss(&fixture.directory, true);
+    println!(
+        "idle RSS with five workers and total 10,000 rows: {rss:.1} MiB (budget {IDLE_RSS_MIB} MiB)"
+    );
+    if !cfg!(debug_assertions) {
+        assert!(rss < IDLE_RSS_MIB, "five-worker RSS {rss:.1} MiB");
+    }
 }
 
 /// Where [`perf_full_cache_budgets`] tells its child process the fixture is.
 const CHILD_DATABASE: &str = "TERSA_PERF_DATABASE";
+/// Five-account fixture path, opened without taking ownership of its cleanup.
+const CHILD_ACCOUNTS: &str = "TERSA_PERF_ACCOUNTS";
 
 #[test]
 #[ignore = "performance: started by perf_full_cache_budgets"]
 fn perf_idle_rss_child() {
-    let Some(path) = std::env::var_os(CHILD_DATABASE) else {
-        println!("perf_idle_rss_child measures only when perf_full_cache_budgets starts it");
+    let source = if let Some(directory) = std::env::var_os(CHILD_ACCOUNTS) {
+        let directory = PathBuf::from(directory);
+        StoreSource {
+            stores: (0..ACCOUNTS)
+                .map(|number| {
+                    (
+                        multi_account(number),
+                        Some(
+                            SqlCipherMailboxStore::open_with_scan(
+                                multi_account(number),
+                                directory.join(format!("mail{number}.sqlite3")),
+                                DatabaseKey::new([7; 32]),
+                                IntegrityScan::Skip,
+                            )
+                            .unwrap(),
+                        ),
+                    )
+                })
+                .collect(),
+            requests: std::cell::RefCell::default(),
+            executor: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
+        }
+    } else if let Some(path) = std::env::var_os(CHILD_DATABASE) {
+        source(open(std::path::Path::new(&path), IntegrityScan::Skip))
+    } else {
+        println!("perf_idle_rss_child measures only when a parent starts it");
         return;
     };
-    let source = source(open(std::path::Path::new(&path), IntegrityScan::Skip));
     let mut app = super::initial_app(&source).unwrap();
+    let _workers = idle_workers(&mut app, true);
     while app.more_rows {
         load_page(&mut app, &source);
     }

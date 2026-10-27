@@ -39,14 +39,21 @@ fn bold() -> Style {
 
 /// Draws the whole interface.
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, now_millis: i64) {
-    let [top, main, bottom] = Layout::vertical([
+    let failure_count = app
+        .sync
+        .iter()
+        .filter(|sync| matches!(sync.state, SyncState::Failed(_)))
+        .count();
+    let [top, failures, main, bottom] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(u16::try_from(failure_count).unwrap_or(u16::MAX)),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
     .areas(frame.area());
     app.page = usize::from(main.height).max(1);
     draw_top(frame, top, app, now_millis);
+    draw_failures(frame, failures, app, now_millis);
     // The open message's account is named on its header when several
     // accounts share the interface; read before the view borrows the screen.
     let account = match (&app.screen, app.accounts.len() > 1) {
@@ -87,13 +94,40 @@ fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
         1 => format!("{count} (1 account unavailable)"),
         unavailable => format!("{count} ({unavailable} accounts unavailable)"),
     };
-    let sync = match &app.sync {
-        SyncState::Idle => String::new(),
-        SyncState::Running => "syncing… ".to_owned(),
-        SyncState::Synced(at) => format!("synced {} ", dates::short(*at, now_millis)),
-        SyncState::Failed(error) => {
-            format!("sync failed: {} ", SafeText::single_line(error).as_str())
+    let sync = if app.sync.len() == 1 {
+        match &app.sync[0].state {
+            SyncState::Idle => String::new(),
+            SyncState::Running => "syncing… ".to_owned(),
+            SyncState::Synced(at) => format!("synced {} ", dates::short(*at, now_millis)),
+            SyncState::Failed(_) => "sync failed ".to_owned(),
         }
+    } else {
+        let running = app
+            .sync
+            .iter()
+            .filter(|sync| sync.state == SyncState::Running)
+            .count();
+        let succeeded = app
+            .sync
+            .iter()
+            .filter(|sync| matches!(sync.state, SyncState::Synced(_)))
+            .count();
+        let failed = app
+            .sync
+            .iter()
+            .filter(|sync| matches!(sync.state, SyncState::Failed(_)))
+            .count();
+        let mut parts = Vec::new();
+        if running > 0 {
+            parts.push(format!("{running} syncing"));
+        }
+        if succeeded > 0 {
+            parts.push(format!("{succeeded} synced"));
+        }
+        if failed > 0 {
+            parts.push(format!("{failed} failed"));
+        }
+        parts.join(" · ")
     };
     // The sync state sits at the right edge; the account name gives way.
     let total = usize::from(area.width);
@@ -113,6 +147,35 @@ fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(sync_width)]).areas(area);
     frame.render_widget(Paragraph::new(left), left_area);
     frame.render_widget(Paragraph::new(Line::styled(sync, dim())), sync_area);
+}
+
+/// Errors stay account-specific and visible after transient notices clear.
+fn draw_failures(frame: &mut Frame<'_>, area: Rect, app: &App, now: i64) {
+    let lines: Vec<_> = app
+        .sync
+        .iter()
+        .filter_map(|sync| {
+            let SyncState::Failed(error) = &sync.state else {
+                return None;
+            };
+            let label = SafeText::single_line(app.account_label(&sync.account));
+            let retry = sync.next_sync.map_or_else(String::new, |next| {
+                format!("; retry in {}s", next.saturating_sub(now).max(0) / 1000)
+            });
+            Some(Line::styled(
+                truncate(
+                    &format!(
+                        " Sync failed · {}: {}{retry}",
+                        label.as_str(),
+                        error.as_str()
+                    ),
+                    usize::from(area.width),
+                ),
+                dim(),
+            ))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_bottom(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -182,7 +245,7 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
                     bold(),
                 ),
             ]
-        } else if app.sync == SyncState::Running {
+        } else if app.syncing() {
             vec![
                 Line::raw(""),
                 Line::styled("  Downloading recent mail…", bold()),
@@ -538,7 +601,7 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::draw;
-    use crate::tui::app::{App, MessageKey, Row, SyncState};
+    use crate::tui::app::{App, MessageKey, Row};
 
     fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -697,7 +760,7 @@ mod tests {
         assert!(app.status.is_none(), "the transient notice was dismissed");
         assert!(screen(&mut app, 100, 5)[0].contains("1 account unavailable"));
         app.reload(vec![row("Ann", "Lunch", true)], false);
-        app.sync = SyncState::Synced(1_761_000_000_000);
+        app.synced(&account("acct"), Ok(()), 1_761_000_000_000, None);
         assert!(screen(&mut app, 100, 5)[0].contains("1 account unavailable"));
         app.unavailable_accounts
             .push(app.unavailable_accounts[0].clone());
@@ -782,7 +845,7 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
             labeled(&["acct"]),
             vec![row("Ann", "Lunch", true), row("Bob", "Report", false)],
         );
-        app.sync = SyncState::Running;
+        app.sync_started(&account("acct"), None);
         let top = &screen(&mut app, 70, 4)[0];
         assert!(top.contains("acct  ·  2 messages"));
         assert!(top.ends_with("syncing… "), "{top:?}");
@@ -801,13 +864,59 @@ Content-Type: text/html\r\n\r\n<p>See <a href=\"https://example.com/x\">this</a>
         assert!(lines[3].starts_with(" /rep "));
         app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(screen(&mut app, 70, 4)[2].contains("No messages match."));
-        app.sync = SyncState::Failed("\u{1b}]52;c;eA==\u{7}offline".to_owned());
-        let lines = screen(&mut app, 70, 4);
-        assert!(
-            lines[0].contains("sync failed: ]52;c;eA==offline"),
-            "{lines:?}"
+        app.synced(
+            &account("acct"),
+            Err("\u{1b}]52;c;eA==\u{7}offline".to_owned()),
+            0,
+            None,
         );
+        let lines = screen(&mut app, 70, 4);
+        assert!(lines[1].contains("acct: ]52;c;eA==offline"), "{lines:?}");
         assert!(!lines[0].contains('\u{1b}'));
+    }
+
+    #[test]
+    fn account_failures_are_persistent_sanitized_and_do_not_overwrite_peer_success() {
+        let labels = vec![
+            (
+                account("acct_a"),
+                SafeText::single_line("ann@example.com\u{1b}\u{202e}"),
+            ),
+            (account("acct_b"), SafeText::single_line("bob@example.com")),
+        ];
+        let mut app = App::new(
+            labels,
+            vec![
+                Row::sample("acct_a", "same", "Ann", "Cached A", false),
+                Row::sample("acct_b", "same", "Bob", "Cached B", false),
+            ],
+        );
+        app.synced(
+            &account("acct_b"),
+            Ok(()),
+            1_761_000_000_000,
+            Some(1_761_000_300_000),
+        );
+        app.synced(
+            &account("acct_a"),
+            Err("\u{1b}]52;c;eA==\u{7}\u{202e}authorization required".to_owned()),
+            1_761_000_000_000,
+            Some(1_761_000_300_000),
+        );
+        app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        let lines = screen(&mut app, 120, 8);
+        assert!(lines[0].contains("1 synced"), "{lines:?}");
+        assert!(lines[0].contains("1 failed"), "{lines:?}");
+        assert!(lines[1].contains("ann@example.com"));
+        assert!(lines[1].contains("authorization required"));
+        assert!(
+            lines.iter().any(|line| line.contains("Cached A")),
+            "readable cache survives remote auth failure"
+        );
+        assert!(lines.iter().any(|line| line.contains("Cached B")));
+        assert_no_controls(&lines);
+        assert_eq!(app.sync[1].last_success, Some(1_761_000_000_000));
+        assert!(app.unavailable_accounts.is_empty());
     }
 
     #[test]
