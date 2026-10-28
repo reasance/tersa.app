@@ -128,6 +128,43 @@ mod store {
         Corrupted,
     }
 
+    /// Content-free failures from existing-only cache reset operations.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum CacheResetError {
+        /// The store or required live-account metadata is absent or ineligible.
+        Ineligible,
+        /// The key, owner, format or persisted metadata is invalid.
+        Corrupted,
+        /// A local operation failed; no backend text or private values escape.
+        Storage,
+    }
+
+    impl fmt::Display for CacheResetError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(match self {
+                Self::Ineligible => "the local cache is not eligible for reset",
+                Self::Corrupted => "the local cache reset store is corrupted",
+                Self::Storage => "local cache reset storage failed",
+            })
+        }
+    }
+    impl std::error::Error for CacheResetError {}
+
+    impl From<MailboxStoreError> for CacheResetError {
+        fn from(error: MailboxStoreError) -> Self {
+            match error {
+                MailboxStoreError::Corrupted => Self::Corrupted,
+                _ => Self::Storage,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum OpenMode {
+        Bootstrap,
+        CacheReset,
+    }
+
     /// Reads envelope rows, but no complete message bodies, from one account database.
     ///
     /// This type intentionally implements `MailboxReader`, not `MailboxStore`:
@@ -331,6 +368,88 @@ mod store {
             }
         }
 
+        /// Opens only an existing, claimed account database for cache reset.
+        ///
+        /// Never creates a missing file or claims an empty schema. Uses the
+        /// current supported open checks and the existing v1 email upgrade.
+        /// Opening does not authorize a clear: eligibility is rechecked in
+        /// [`Self::clear_cached_mail`]'s immediate transaction.
+        ///
+        /// The caller must hold the installation lock through opening/clearing
+        /// and drop this connection before a later identity-gated resync.
+        ///
+        /// # Errors
+        ///
+        /// Returns `Ineligible` for a missing path, `Corrupted` for unclaimed,
+        /// unsupported, wrong-key or wrong-owner stores, and `Storage` for
+        /// operational failures or a path that disappears during opening.
+        pub fn open_existing_for_cache_reset<P: AsRef<Path>>(
+            account: AccountId,
+            path: P,
+            key: DatabaseKey,
+        ) -> Result<Self, CacheResetError> {
+            match path.as_ref().try_exists() {
+                Ok(false) => return Err(CacheResetError::Ineligible),
+                Err(_error) => return Err(CacheResetError::Storage),
+                Ok(true) => {}
+            }
+            Self::open_inner_with_mode(
+                account,
+                path.as_ref(),
+                key,
+                IntegrityScan::Full,
+                &mut |_point, _path| Ok(()),
+                OpenMode::CacheReset,
+            )
+            .map_err(Into::into)
+        }
+
+        /// Atomically clears only messages/bodies and successful-sync freshness.
+        ///
+        /// Keeps identity, binding, subject, token, email and recovery state.
+        /// Requires an existing current identity and required account metadata,
+        /// without pending disconnect recovery. This is not account purge.
+        /// Callers hold the installation lock; no network work belongs here.
+        ///
+        /// # Errors
+        ///
+        /// Returns `Ineligible` for a wrong requested account, absent required
+        /// identity/subject/token or pending disconnect; invalid rows return
+        /// `Corrupted`. Backend failures return `Storage`. All failures roll
+        /// back before returning, including faults after the delete.
+        pub fn clear_cached_mail(&self, account: &AccountId) -> Result<(), CacheResetError> {
+            if &self.account != account {
+                return Err(CacheResetError::Ineligible);
+            }
+            let mut connection = self
+                .connection
+                .lock()
+                .map_err(|_poison| CacheResetError::Storage)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(store_error)?;
+            validate_cache_reset_account(&transaction, account)?;
+            transaction
+                .execute("DELETE FROM messages", [])
+                .map_err(store_error)?;
+            #[cfg(test)]
+            if self.take_failpoint()? {
+                return Err(CacheResetError::Storage);
+            }
+            let changed = transaction.execute(
+                "UPDATE account_lifecycle SET last_successful_sync_unix_millis = NULL WHERE singleton = 1", [],
+            ).map_err(store_error)?;
+            if changed != 1 {
+                return Err(CacheResetError::Corrupted);
+            }
+            #[cfg(test)]
+            if self.take_failpoint()? {
+                return Err(CacheResetError::Storage);
+            }
+            transaction.commit().map_err(store_error)?;
+            Ok(())
+        }
+
         #[cfg(test)]
         fn open_inner(
             account: AccountId,
@@ -396,18 +515,28 @@ mod store {
         fn open_inner_impl(
             account: AccountId,
             path: &Path,
-            mut key: DatabaseKey,
+            key: DatabaseKey,
             scan: IntegrityScan,
             hook: &mut dyn FnMut(WriterHook, &Path) -> Result<(), OpenFailure>,
         ) -> Result<Self, MailboxStoreError> {
-            let canonical_path = canonical_database_path(path).map_err(|kind| match kind {
-                OpenFailure::Corrupted => MailboxStoreError::Corrupted,
-                OpenFailure::Storage => MailboxStoreError::Storage,
-            })?;
-            let mut leaf = LeafGuard::open(&canonical_path).map_err(|kind| match kind {
-                OpenFailure::Corrupted => MailboxStoreError::Corrupted,
-                OpenFailure::Storage => MailboxStoreError::Storage,
-            })?;
+            Self::open_inner_with_mode(account, path, key, scan, hook, OpenMode::Bootstrap)
+        }
+
+        fn open_inner_with_mode(
+            account: AccountId,
+            path: &Path,
+            mut key: DatabaseKey,
+            scan: IntegrityScan,
+            hook: &mut dyn FnMut(WriterHook, &Path) -> Result<(), OpenFailure>,
+            mode: OpenMode,
+        ) -> Result<Self, MailboxStoreError> {
+            let canonical_path = canonical_database_path(path).map_err(mailbox_open_error)?;
+            let mut leaf = LeafGuard::open(&canonical_path).map_err(mailbox_open_error)?;
+            if mode == OpenMode::CacheReset && leaf.snapshot.main.is_none() {
+                // The existing-only path has no authority to claim a fresh
+                // leaf, including a disappearance after the presence check.
+                return Err(MailboxStoreError::Storage);
+            }
             let existing_preflight = if leaf.snapshot.main.is_some() {
                 let preflight =
                     match preflight_existing(&canonical_path, &account, &key.0, &leaf, scan) {
@@ -425,6 +554,13 @@ mod store {
             } else {
                 None
             };
+            if mode == OpenMode::CacheReset
+                && existing_preflight.is_some_and(ExistingPreflight::is_unclaimed)
+            {
+                // Read-only preflight identified an unclaimed logical store.
+                // Reject BEFORE a write-open, WAL setup or migrate_fresh.
+                return Err(MailboxStoreError::Corrupted);
+            }
             if let Err(kind) = hook(WriterHook::AfterSnapshot, &canonical_path) {
                 leaf.cleanup_fresh_candidates(hook, &canonical_path);
                 key.0.zeroize();
@@ -462,7 +598,7 @@ mod store {
                 }
                 opened_file_has_moved(&connection)?;
                 leaf.require_main_identity()?;
-                let fresh = configure_storage(&connection, &account, &key.0)?;
+                let fresh = configure_storage(&connection, &account, &key.0, mode)?;
                 if fresh {
                     materialize_fresh_wal(&connection)?;
                 }
@@ -1118,35 +1254,7 @@ mod store {
 
         fn read_lifecycle_metadata(&self) -> Result<AccountLifecycleMetadata, MailboxStoreError> {
             self.with_connection(|connection| {
-                let row = connection.query_row(
-                    "SELECT typeof(disconnect_recovery), CASE WHEN typeof(disconnect_recovery) = 'integer' THEN disconnect_recovery ELSE 0 END, typeof(last_successful_sync_unix_millis), CASE WHEN typeof(last_successful_sync_unix_millis) = 'integer' THEN last_successful_sync_unix_millis ELSE 0 END FROM account_lifecycle WHERE singleton = 1",
-                    [],
-                    |row| {
-                        let recovery_type: String = row.get(0)?;
-                        let recovery_value: i64 = row.get(1)?;
-                        let freshness_type: String = row.get(2)?;
-                        let freshness_value: i64 = row.get(3)?;
-                        Ok((recovery_type, recovery_value, freshness_type, freshness_value))
-                    },
-                );
-                let (recovery_type, recovery_value, freshness_type, freshness_value) = match row {
-                    Ok(values) => values,
-                    Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(AccountLifecycleMetadata::default()),
-                    Err(error) => return Err(store_error(error)),
-                };
-                let recovery = match (recovery_type.as_str(), recovery_value) {
-                    ("null", _) => None,
-                    ("integer", 1) => Some(DisconnectRecoveryState::IncompleteTeardown),
-                    ("integer", 2) => Some(DisconnectRecoveryState::RevokeUnconfirmed),
-                    _ => return Err(MailboxStoreError::Corrupted),
-                };
-                let freshness = match (freshness_type.as_str(), freshness_value) {
-                    ("null", _) => None,
-                    ("integer", value) if value >= 0 => Some(value),
-                    _ => return Err(MailboxStoreError::Corrupted),
-                };
-                AccountLifecycleMetadata::new(recovery, freshness)
-                    .ok_or(MailboxStoreError::Corrupted)
+                read_lifecycle_row(connection).map(Option::unwrap_or_default)
             })
         }
 
@@ -1496,7 +1604,8 @@ mod store {
                     ExistingPreflight::Stable | ExistingPreflight::FreshWal => {
                         actual.wal == self.snapshot.wal && actual.shm == self.snapshot.shm
                     }
-                    ExistingPreflight::MainWithoutSidecars => {
+                    ExistingPreflight::MainWithoutSidecars
+                    | ExistingPreflight::FreshMainWithoutSidecars => {
                         actual.wal.is_some() && actual.shm.is_some()
                     }
                     ExistingPreflight::WalWithoutShm | ExistingPreflight::FreshWalWithoutShm => {
@@ -1640,16 +1749,27 @@ mod store {
     enum ExistingPreflight {
         Stable,
         MainWithoutSidecars,
+        FreshMainWithoutSidecars,
         WalWithoutShm,
         FreshWal,
         FreshWalWithoutShm,
     }
 
     impl ExistingPreflight {
+        const fn is_unclaimed(self) -> bool {
+            matches!(
+                self,
+                Self::FreshMainWithoutSidecars | Self::FreshWal | Self::FreshWalWithoutShm
+            )
+        }
+
         const fn permits_new_sidecars(self) -> bool {
             matches!(
                 self,
-                Self::MainWithoutSidecars | Self::WalWithoutShm | Self::FreshWalWithoutShm
+                Self::MainWithoutSidecars
+                    | Self::FreshMainWithoutSidecars
+                    | Self::WalWithoutShm
+                    | Self::FreshWalWithoutShm
             )
         }
     }
@@ -2383,9 +2503,13 @@ mod store {
         let main_connection = Connection::open_with_flags(PathBuf::from(uri), flags)
             .map_err(|_error| OpenFailure::Storage)?;
         apply_key(&main_connection, key).map_err(classify_key)?;
-        let _main_is_fresh = validate_identity(&main_connection, account)?;
+        let main_is_fresh = validate_identity(&main_connection, account)?;
         let Some(_wal) = snapshot.wal else {
-            return Ok(ExistingPreflight::MainWithoutSidecars);
+            return Ok(if main_is_fresh {
+                ExistingPreflight::FreshMainWithoutSidecars
+            } else {
+                ExistingPreflight::MainWithoutSidecars
+            });
         };
 
         // `immutable=1` deliberately ignores WAL. When an otherwise fresh main
@@ -2852,6 +2976,78 @@ mod store {
         }
     }
 
+    /// Optional only for ordinary bootstrap; reset requires the lifecycle row.
+    fn read_lifecycle_row(
+        connection: &Connection,
+    ) -> Result<Option<AccountLifecycleMetadata>, MailboxStoreError> {
+        let row = connection.query_row(
+                    "SELECT typeof(disconnect_recovery), CASE WHEN typeof(disconnect_recovery) = 'integer' THEN disconnect_recovery ELSE 0 END, typeof(last_successful_sync_unix_millis), CASE WHEN typeof(last_successful_sync_unix_millis) = 'integer' THEN last_successful_sync_unix_millis ELSE 0 END FROM account_lifecycle WHERE singleton = 1",
+                    [],
+                    |row| {
+                        let recovery_type: String = row.get(0)?;
+                        let recovery_value: i64 = row.get(1)?;
+                        let freshness_type: String = row.get(2)?;
+                        let freshness_value: i64 = row.get(3)?;
+                        Ok((recovery_type, recovery_value, freshness_type, freshness_value))
+                    },
+                );
+        let (recovery_type, recovery_value, freshness_type, freshness_value) = match row {
+            Ok(values) => values,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(error) => return Err(store_error(error)),
+        };
+        let recovery = match (recovery_type.as_str(), recovery_value) {
+            ("null", _) => None,
+            ("integer", 1) => Some(DisconnectRecoveryState::IncompleteTeardown),
+            ("integer", 2) => Some(DisconnectRecoveryState::RevokeUnconfirmed),
+            _ => return Err(MailboxStoreError::Corrupted),
+        };
+        let freshness = match (freshness_type.as_str(), freshness_value) {
+            ("null", _) => None,
+            ("integer", value) if value >= 0 => Some(value),
+            _ => return Err(MailboxStoreError::Corrupted),
+        };
+        AccountLifecycleMetadata::new(recovery, freshness)
+            .map(Some)
+            .ok_or(MailboxStoreError::Corrupted)
+    }
+
+    fn validate_cache_reset_account(
+        transaction: &Transaction<'_>,
+        account: &AccountId,
+    ) -> Result<(), CacheResetError> {
+        if validate_identity(transaction, account)
+            .map_err(|kind| CacheResetError::from(mailbox_open_error(kind)))?
+        {
+            return Err(CacheResetError::Ineligible);
+        }
+        let binding = transaction.query_row(
+            "SELECT CASE WHEN typeof(account_id) = 'text' AND length(CAST(account_id AS BLOB)) <= 256 THEN account_id END, typeof(broker_subject), CASE WHEN typeof(broker_subject) = 'text' AND length(CAST(broker_subject AS BLOB)) BETWEEN 1 AND 255 THEN broker_subject END, typeof(refresh_token), CASE WHEN typeof(refresh_token) = 'text' AND length(CAST(refresh_token AS BLOB)) BETWEEN 1 AND 4096 THEN refresh_token END FROM account_binding WHERE singleton = 1", [],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?.map(Zeroizing::new), row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?.map(Zeroizing::new))),
+        ).map_err(|error| CacheResetError::from(mailbox_open_error(classify_open(error))))?;
+        if binding.0.as_deref() != Some(account.as_str()) {
+            return Err(CacheResetError::Corrupted);
+        }
+        if read_recorded_identity(transaction, account)?.is_none() {
+            return Err(CacheResetError::Ineligible);
+        }
+        match (binding.1.as_str(), binding.2.as_deref()) {
+            ("null", _) => return Err(CacheResetError::Ineligible),
+            ("text", Some(subject)) if is_valid_broker_subject(subject) => {}
+            _ => return Err(CacheResetError::Corrupted),
+        }
+        match (binding.3.as_str(), binding.4.as_deref()) {
+            ("null", _) => return Err(CacheResetError::Ineligible),
+            ("text", Some(token)) if is_valid_refresh_token(token) => {}
+            _ => return Err(CacheResetError::Corrupted),
+        }
+        let lifecycle = read_lifecycle_row(transaction)?.ok_or(CacheResetError::Corrupted)?;
+        if lifecycle.recovery().is_some() {
+            return Err(CacheResetError::Ineligible);
+        }
+        Ok(())
+    }
+
     /// Reads the recorded identity hash for `account` inside an open transaction —
     /// the single fail-closed reader shared by the fence and the compare-and-set
     /// gate precondition.
@@ -2936,6 +3132,7 @@ mod store {
         connection: &Connection,
         account: &AccountId,
         key: &[u8; 32],
+        mode: OpenMode,
     ) -> Result<bool, OpenFailure> {
         apply_key(connection, key).map_err(classify_key)?;
         connection
@@ -2949,6 +3146,9 @@ mod store {
             )
             .map_err(classify_open)?;
         let fresh = validate_identity(connection, account)?;
+        if fresh && mode == OpenMode::CacheReset {
+            return Err(OpenFailure::Corrupted);
+        }
         configure_owned_storage(connection)?;
         upgrade_schema_v1(connection)?;
         Ok(fresh)
@@ -7501,6 +7701,488 @@ mod store {
             );
         }
 
+        fn reset_fixture(name: &str, owner: &AccountId) -> (TestDatabase, SqlCipherMailboxStore) {
+            let database = TestDatabase::new(name);
+            let store =
+                SqlCipherMailboxStore::open(owner.clone(), database.path(), key(7)).unwrap();
+            run(store.reconcile_identity(owner, &fence(), IdentityReconcile::RecordOnly, None))
+                .unwrap();
+            store
+                .store_broker_subject(owner, "reset-private-subject")
+                .unwrap();
+            store
+                .store_refresh_token(owner, "reset-private-refresh-token")
+                .unwrap();
+            store
+                .store_email_address(owner, &AccountEmail::new("reset@example.test").unwrap())
+                .unwrap();
+            run(store.record_successful_sync(owner, 12_345)).unwrap();
+            run(store.put_message(
+                owner,
+                &Message::new(
+                    envelope("body", "t", 20),
+                    MessageContent::new(b"private cached body".to_vec()).unwrap(),
+                ),
+            ))
+            .unwrap();
+            run(store.upsert_envelopes(owner, &[envelope("envelope", "t", 10)])).unwrap();
+            (database, store)
+        }
+
+        type ResetSnapshot = Vec<Vec<Vec<rusqlite::types::Value>>>;
+        fn reset_snapshot(store: &SqlCipherMailboxStore, include_cache: bool) -> ResetSnapshot {
+            let connection = store.connection.lock().unwrap();
+            let mut queries = vec![
+                "SELECT * FROM account_binding ORDER BY singleton",
+                "SELECT * FROM account_identity ORDER BY account_id",
+                "SELECT singleton, disconnect_recovery FROM account_lifecycle ORDER BY singleton",
+            ];
+            if include_cache {
+                queries.extend([
+                "SELECT * FROM messages ORDER BY message_id",
+                "SELECT last_successful_sync_unix_millis FROM account_lifecycle ORDER BY singleton",
+            ]);
+            }
+            queries
+                .into_iter()
+                .map(|sql| {
+                    let mut statement = connection.prepare(sql).unwrap();
+                    let count = statement.column_count();
+                    statement
+                        .query_map([], |row| {
+                            (0..count)
+                                .map(|index| row.get(index))
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        #[test]
+        fn cache_reset_clears_only_mail_and_freshness_preserves_every_protected_field_and_repeats()
+        {
+            let (database, store) = reset_fixture("cache-reset-success", &account());
+            let protected = reset_snapshot(&store, false);
+            assert!(
+                run(store.get_message(&account(), &MessageId::new("body").unwrap()))
+                    .unwrap()
+                    .is_some()
+            );
+            drop(store);
+            let reset = SqlCipherMailboxStore::open_existing_for_cache_reset(
+                account(),
+                database.path(),
+                key(7),
+            )
+            .unwrap();
+            assert_eq!(reset.clear_cached_mail(&account()), Ok(()));
+            assert!(
+                run(reset.list_envelopes(&account(), StoreLimit::new(10).unwrap()))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                run(reset.get_message(&account(), &MessageId::new("body").unwrap()))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(reset_snapshot(&reset, false), protected);
+            assert_eq!(
+                run(reset.lifecycle_metadata(&account()))
+                    .unwrap()
+                    .last_successful_sync_unix_millis(),
+                None
+            );
+            assert_eq!(
+                reset.clear_cached_mail(&account()),
+                Ok(()),
+                "empty cache is safe to reset again"
+            );
+            drop(reset);
+            let reopened = SqlCipherMailboxStore::open_existing_for_cache_reset(
+                account(),
+                database.path(),
+                key(7),
+            )
+            .unwrap();
+            assert_eq!(reset_snapshot(&reopened, false), protected);
+        }
+
+        #[test]
+        fn cache_reset_is_account_local_and_rejects_a_wrong_method_account_without_mutation() {
+            let (_a, store_a) = reset_fixture("cache-reset-a", &account());
+            let b = AccountId::new("account-b").unwrap();
+            let (_b, store_b) = reset_fixture("cache-reset-b", &b);
+            let before_a = reset_snapshot(&store_a, true);
+            let before_b = reset_snapshot(&store_b, true);
+            let changes = store_a.connection.lock().unwrap().total_changes();
+            assert_eq!(
+                store_a.clear_cached_mail(&b),
+                Err(CacheResetError::Ineligible)
+            );
+            assert_eq!(store_a.connection.lock().unwrap().total_changes(), changes);
+            assert_eq!(reset_snapshot(&store_a, true), before_a);
+            assert_eq!(store_a.clear_cached_mail(&account()), Ok(()));
+            assert_eq!(reset_snapshot(&store_b, true), before_b);
+        }
+
+        #[test]
+        fn cache_reset_refuses_missing_paths_without_creating_files_or_parents() {
+            let database = TestDatabase::new("cache-reset-missing");
+            for path in [
+                database.path().to_path_buf(),
+                database
+                    .directory
+                    .join("absent-parent")
+                    .join("mail.sqlite3"),
+            ] {
+                assert!(matches!(
+                    SqlCipherMailboxStore::open_existing_for_cache_reset(account(), &path, key(7)),
+                    Err(CacheResetError::Ineligible)
+                ));
+                assert!(!path.exists());
+            }
+            assert!(fs::read_dir(&database.directory).unwrap().next().is_none());
+        }
+
+        #[test]
+        fn cache_reset_never_claims_an_empty_or_uninitialized_encrypted_file() {
+            for encrypted in [false, true] {
+                let database = TestDatabase::new("cache-reset-unclaimed");
+                if encrypted {
+                    let connection = raw_connection(&database);
+                    apply_key(&connection, &key(7).0).unwrap();
+                    connection
+                        .execute_batch("PRAGMA user_version = 0;")
+                        .unwrap();
+                } else {
+                    write_restrictive(database.path(), b"");
+                }
+                let before = fs::read(database.path()).unwrap();
+                let files = database.files();
+                assert!(matches!(
+                    SqlCipherMailboxStore::open_existing_for_cache_reset(
+                        account(),
+                        database.path(),
+                        key(7)
+                    ),
+                    Err(CacheResetError::Corrupted)
+                ));
+                assert_eq!(fs::read(database.path()).unwrap(), before);
+                assert_eq!(
+                    database.files(),
+                    files,
+                    "no write-open sidecars or format claim"
+                );
+                let normal =
+                    SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+                assert_eq!(
+                    schema_state(&normal).1,
+                    VERSION,
+                    "ordinary bootstrap is unchanged"
+                );
+            }
+        }
+
+        #[test]
+        fn cache_reset_refuses_unclaimed_wal_before_write_or_migration() {
+            for missing_shm in [false, true] {
+                let database = TestDatabase::new("cache-reset-unclaimed-wal");
+                let anchor = raw_connection(&database);
+                assert!(
+                    configure_storage(&anchor, &account(), &key(7).0, OpenMode::Bootstrap).unwrap()
+                );
+                materialize_fresh_wal(&anchor).unwrap();
+                set_and_verify_persistent_wal(&anchor).unwrap();
+                for path in [wal_path(&database), shm_path(&database)] {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                if missing_shm {
+                    fs::remove_file(shm_path(&database)).unwrap();
+                }
+                let main = fs::read(database.path()).unwrap();
+                let wal = fs::read(wal_path(&database)).unwrap();
+                let files = database.files();
+                assert!(matches!(
+                    SqlCipherMailboxStore::open_existing_for_cache_reset(
+                        account(),
+                        database.path(),
+                        key(7)
+                    ),
+                    Err(CacheResetError::Corrupted)
+                ));
+                assert_eq!(fs::read(database.path()).unwrap(), main);
+                assert_eq!(fs::read(wal_path(&database)).unwrap(), wal);
+                assert_eq!(
+                    database.files(),
+                    files,
+                    "reset never claims or creates original coordination leaves"
+                );
+                assert!(
+                    recovery_stage_paths(&database)
+                        .iter()
+                        .all(|path| !path.exists())
+                );
+                assert!(schema(&anchor).unwrap().is_empty());
+                assert_eq!(
+                    anchor
+                        .query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(
+                    anchor
+                        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+
+        #[test]
+        fn cache_reset_open_rejects_wrong_keys_owners_and_unsupported_formats_without_deleting() {
+            let (database, store) = reset_fixture("cache-reset-open-rejection", &account());
+            let before = reset_snapshot(&store, true);
+            assert!(matches!(
+                SqlCipherMailboxStore::open_existing_for_cache_reset(
+                    account(),
+                    database.path(),
+                    key(8)
+                ),
+                Err(CacheResetError::Corrupted)
+            ));
+            assert!(matches!(
+                SqlCipherMailboxStore::open_existing_for_cache_reset(
+                    AccountId::new("account-b").unwrap(),
+                    database.path(),
+                    key(7)
+                ),
+                Err(CacheResetError::Corrupted)
+            ));
+            assert_eq!(reset_snapshot(&store, true), before);
+            for (pragma, value) in [("user_version", VERSION + 1), ("application_id", 1)] {
+                let prior: i64 = store
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))
+                    .unwrap();
+                store
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .pragma_update(None, pragma, value)
+                    .unwrap();
+                assert!(matches!(
+                    SqlCipherMailboxStore::open_existing_for_cache_reset(
+                        account(),
+                        database.path(),
+                        key(7)
+                    ),
+                    Err(CacheResetError::Corrupted)
+                ));
+                assert_eq!(
+                    store.clear_cached_mail(&account()),
+                    Err(CacheResetError::Corrupted),
+                    "live handle rechecks format in its transaction"
+                );
+                assert_eq!(reset_snapshot(&store, true), before);
+                store
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .pragma_update(None, pragma, prior)
+                    .unwrap();
+            }
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch("CREATE TABLE future_protected_intent (value TEXT)")
+                .unwrap();
+            assert!(matches!(
+                SqlCipherMailboxStore::open_existing_for_cache_reset(
+                    account(),
+                    database.path(),
+                    key(7)
+                ),
+                Err(CacheResetError::Corrupted)
+            ));
+            assert_eq!(
+                store.clear_cached_mail(&account()),
+                Err(CacheResetError::Corrupted)
+            );
+            assert_eq!(reset_snapshot(&store, true), before);
+        }
+
+        #[test]
+        fn cache_reset_rejects_pending_disconnect_and_absent_or_invalid_metadata() {
+            for state in [
+                DisconnectRecoveryState::IncompleteTeardown,
+                DisconnectRecoveryState::RevokeUnconfirmed,
+            ] {
+                let (_database, store) = reset_fixture("cache-reset-pending", &account());
+                store.update_recovery(Some(state)).unwrap();
+                let before = reset_snapshot(&store, true);
+                assert_eq!(
+                    store.clear_cached_mail(&account()),
+                    Err(CacheResetError::Ineligible)
+                );
+                assert_eq!(reset_snapshot(&store, true), before);
+            }
+            for (sql, expected) in [
+                ("DELETE FROM account_identity", CacheResetError::Ineligible),
+                (
+                    "UPDATE account_identity SET algo_version = 1",
+                    CacheResetError::Corrupted,
+                ),
+                (
+                    "UPDATE account_identity SET identity_hash = X'00'",
+                    CacheResetError::Corrupted,
+                ),
+                (
+                    "UPDATE account_binding SET broker_subject = NULL",
+                    CacheResetError::Ineligible,
+                ),
+                (
+                    "UPDATE account_binding SET refresh_token = NULL",
+                    CacheResetError::Ineligible,
+                ),
+                (
+                    "UPDATE account_binding SET broker_subject = 'invalid subject'",
+                    CacheResetError::Corrupted,
+                ),
+                (
+                    "UPDATE account_binding SET refresh_token = X'00'",
+                    CacheResetError::Corrupted,
+                ),
+                (
+                    "UPDATE account_binding SET account_id = 'another-account'",
+                    CacheResetError::Corrupted,
+                ),
+                ("DELETE FROM account_binding", CacheResetError::Corrupted),
+                ("DELETE FROM account_lifecycle", CacheResetError::Corrupted),
+                (
+                    "PRAGMA ignore_check_constraints = ON; UPDATE account_lifecycle SET disconnect_recovery = 99; PRAGMA ignore_check_constraints = OFF;",
+                    CacheResetError::Corrupted,
+                ),
+                (
+                    "PRAGMA ignore_check_constraints = ON; UPDATE account_lifecycle SET last_successful_sync_unix_millis = -1; PRAGMA ignore_check_constraints = OFF;",
+                    CacheResetError::Corrupted,
+                ),
+            ] {
+                let (_database, store) = reset_fixture("cache-reset-metadata", &account());
+                store.connection.lock().unwrap().execute_batch(sql).unwrap();
+                let before = reset_snapshot(&store, true);
+                assert_eq!(store.clear_cached_mail(&account()), Err(expected), "{sql}");
+                assert_eq!(reset_snapshot(&store, true), before, "{sql}");
+            }
+        }
+
+        #[test]
+        fn cache_reset_rolls_back_after_delete_after_freshness_and_on_zero_lifecycle_updates() {
+            let (_database, store) = reset_fixture("cache-reset-rollback", &account());
+            let before = reset_snapshot(&store, true);
+            for checkpoint in [1, 2] {
+                store.fail_mutation_at(checkpoint);
+                assert_eq!(
+                    store.clear_cached_mail(&account()),
+                    Err(CacheResetError::Storage)
+                );
+                assert_eq!(reset_snapshot(&store, true), before);
+            }
+            store.connection.lock().unwrap().execute_batch("CREATE TEMP TRIGGER ignore_freshness BEFORE UPDATE ON account_lifecycle BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+            assert_eq!(
+                store.clear_cached_mail(&account()),
+                Err(CacheResetError::Corrupted)
+            );
+            assert_eq!(reset_snapshot(&store, true), before);
+        }
+
+        #[test]
+        fn cache_reset_uses_only_the_existing_version_one_upgrade() {
+            let (database, anchor) = version_1_store("cache-reset-v1");
+            anchor
+                .execute(
+                    "INSERT INTO account_identity VALUES (?1, ?2, ?3)",
+                    params![
+                        account().as_str(),
+                        [9_u8; 32].as_slice(),
+                        IDENTITY_ALGO_VERSION
+                    ],
+                )
+                .unwrap();
+            anchor
+                .execute(
+                    "UPDATE account_binding SET broker_subject = ?1, refresh_token = ?2",
+                    params!["reset-private-subject", "reset-private-refresh-token"],
+                )
+                .unwrap();
+            anchor
+                .execute("INSERT INTO account_lifecycle VALUES (1, NULL, 12345)", [])
+                .unwrap();
+            let reset = SqlCipherMailboxStore::open_existing_for_cache_reset(
+                account(),
+                database.path(),
+                key(7),
+            )
+            .unwrap();
+            assert_eq!(
+                schema_state(&reset),
+                (APPLICATION_ID, VERSION, canonical_schema())
+            );
+            assert_eq!(
+                row_count(&reset, "messages"),
+                2,
+                "approved upgrade itself keeps the cache"
+            );
+            let protected = reset_snapshot(&reset, false);
+            assert_eq!(reset.clear_cached_mail(&account()), Ok(()));
+            assert_eq!(row_count(&reset, "messages"), 0);
+            assert_eq!(reset_snapshot(&reset, false), protected);
+            assert_eq!(
+                reset
+                    .load_broker_subject(&account())
+                    .unwrap()
+                    .as_deref()
+                    .map(String::as_str),
+                Some("reset-private-subject")
+            );
+            assert_eq!(
+                reset
+                    .load_refresh_token(&account())
+                    .unwrap()
+                    .as_deref()
+                    .map(String::as_str),
+                Some("reset-private-refresh-token")
+            );
+        }
+
+        #[test]
+        fn cache_reset_error_and_store_debug_are_content_free() {
+            let (_database, store) = reset_fixture("cache-reset-redaction", &account());
+            let text = format!(
+                "{store:?} {:?} {} {:?} {} {:?} {}",
+                CacheResetError::Ineligible,
+                CacheResetError::Ineligible,
+                CacheResetError::Corrupted,
+                CacheResetError::Corrupted,
+                CacheResetError::Storage,
+                CacheResetError::Storage
+            );
+            for secret in [
+                "reset-private-subject",
+                "reset-private-refresh-token",
+                "reset@example.test",
+                account().as_str(),
+            ] {
+                assert!(!text.contains(secret));
+            }
+        }
+
         fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             haystack
                 .windows(needle.len())
@@ -7512,6 +8194,6 @@ mod store {
 pub mod registry;
 
 pub use store::{
-    DatabaseKey, IntegrityScan, ReadOnlyMailboxOpenFailure, SqlCipherMailboxReader,
-    SqlCipherMailboxStore,
+    CacheResetError, DatabaseKey, IntegrityScan, ReadOnlyMailboxOpenFailure,
+    SqlCipherMailboxReader, SqlCipherMailboxStore,
 };
