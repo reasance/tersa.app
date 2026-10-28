@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cache_reset;
 mod flows;
 mod gate;
 mod installation;
@@ -18,6 +19,7 @@ mod loopback;
 mod session;
 mod session_cache;
 
+pub use cache_reset::{CacheResetOutcome, CacheResetPreconditionError};
 pub use flows::{
     AddedAccount, FlowError, OAuthClient, Revocation, Runtime, SIGN_IN_TIMEOUT, default_sync_policy,
 };
