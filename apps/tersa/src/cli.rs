@@ -17,6 +17,8 @@ Usage:
   tersa account add               Sign in with Google and add an account
   tersa account list              List added accounts
   tersa account remove <account>  Revoke access and delete local data
+  tersa account reset <account> [--yes]
+                                  Clear local mail and download recent mail again
   tersa sync [<account>]          Fetch recent mail (all accounts by default)
   tersa inbox [<account>] [--limit <n>]
                                   Print cached recent mail
@@ -31,6 +33,7 @@ pub enum Command {
     AccountAdd,
     AccountList,
     AccountRemove(String),
+    AccountReset { account: String, yes: bool },
     Sync(Option<String>),
     Inbox { account: Option<String>, limit: u16 },
     Doctor,
@@ -54,12 +57,31 @@ pub fn parse<I: IntoIterator<Item = OsString>>(arguments: I) -> Result<Command, 
         ["account", "add"] => Ok(Command::AccountAdd),
         ["account", "list"] => Ok(Command::AccountList),
         ["account", "remove", account] => Ok(Command::AccountRemove((*account).to_owned())),
+        ["account", "reset", rest @ ..] => parse_reset(rest),
         ["sync"] => Ok(Command::Sync(None)),
         ["sync", account] => Ok(Command::Sync(Some((*account).to_owned()))),
         ["inbox", rest @ ..] => parse_inbox(rest),
         ["doctor"] => Ok(Command::Doctor),
         _ => Err("unrecognized command; run `tersa help`".to_owned()),
     }
+}
+
+fn parse_reset(rest: &[&str]) -> Result<Command, String> {
+    let mut account = None;
+    let mut yes = false;
+    for word in rest {
+        if *word == "--yes" && !yes {
+            yes = true;
+        } else if !word.starts_with('-') && account.is_none() && !word.trim().is_empty() {
+            account = Some((*word).to_owned());
+        } else {
+            return Err("account reset expects one account and optional --yes".to_owned());
+        }
+    }
+    Ok(Command::AccountReset {
+        account: account.ok_or_else(|| "account reset requires an account".to_owned())?,
+        yes,
+    })
 }
 
 fn parse_inbox(rest: &[&str]) -> Result<Command, String> {
@@ -126,6 +148,46 @@ mod tests {
             })
         );
         assert_eq!(run(&["doctor"]), Ok(Command::Doctor));
+    }
+
+    #[test]
+    fn parses_reset_confirmation_flags_and_rejects_empty_or_extra_arguments() {
+        for words in [
+            vec!["account", "reset", "acct_1"],
+            vec!["account", "reset", "person@example.test"],
+        ] {
+            assert_eq!(
+                run(&words),
+                Ok(Command::AccountReset {
+                    account: words[2].to_owned(),
+                    yes: false
+                })
+            );
+        }
+        for words in [
+            vec!["account", "reset", "acct_1", "--yes"],
+            vec!["account", "reset", "--yes", "acct_1"],
+        ] {
+            assert_eq!(
+                run(&words),
+                Ok(Command::AccountReset {
+                    account: "acct_1".to_owned(),
+                    yes: true
+                })
+            );
+        }
+        for words in [
+            vec!["account", "reset"],
+            vec!["account", "reset", "--yes"],
+            vec!["account", "reset", ""],
+            vec!["account", "reset", " \t"],
+            vec!["account", "reset", "a", "b"],
+            vec!["account", "reset", "a", "--yes", "--yes"],
+            vec!["account", "reset", "a", "--force"],
+            vec!["account", "reset", "--yes=true", "a"],
+        ] {
+            assert!(run(&words).is_err(), "{words:?}");
+        }
     }
 
     #[test]
