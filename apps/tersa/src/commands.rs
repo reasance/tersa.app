@@ -535,6 +535,7 @@ impl StoreSource {
     /// readers whose query later fails. Only a fresh query retries that failure.
     fn document(
         &self,
+        scope: &crate::tui::ViewScope,
         continuation: Option<&UnifiedMailboxContinuation>,
         limit: u16,
     ) -> Result<UnifiedMailboxDocument, ()> {
@@ -543,6 +544,7 @@ impl StoreSource {
         let sources: Vec<_> = self
             .stores
             .iter()
+            .filter(|(account, _)| scope.contains(account))
             .map(|(account, store)| match store {
                 // The concrete SQLCipher type overrides list_envelopes_after with
                 // indexed keyset SQL. No trait-default 10,000-row reader is wired.
@@ -572,7 +574,8 @@ impl StoreSource {
         if !(1..=500).contains(&limit) {
             return Err(());
         }
-        let mut document = self.document(None, limit.min(MAX_PAGE_SIZE))?;
+        let mut document =
+            self.document(&crate::tui::ViewScope::All, None, limit.min(MAX_PAGE_SIZE))?;
         let mut pages = 1;
         while document.rows.len() < usize::from(limit)
             && document.continuation.is_some()
@@ -582,7 +585,11 @@ impl StoreSource {
             let size = u16::try_from(usize::from(limit) - document.rows.len())
                 .map_err(|_error| ())?
                 .min(MAX_PAGE_SIZE);
-            let next = self.document(document.continuation.as_ref(), size)?;
+            let next = self.document(
+                &crate::tui::ViewScope::All,
+                document.continuation.as_ref(),
+                size,
+            )?;
             document.rows.extend(next.rows);
             document.continuation = next.continuation;
             document.unavailable_accounts = next.unavailable_accounts;
@@ -600,10 +607,11 @@ impl StoreSource {
 impl crate::tui::MailSource for StoreSource {
     fn page(
         &self,
+        scope: &crate::tui::ViewScope,
         continuation: Option<&UnifiedMailboxContinuation>,
         limit: u16,
     ) -> Result<crate::tui::MailPage, ()> {
-        self.document(continuation, limit).map(Into::into)
+        self.document(scope, continuation, limit).map(Into::into)
     }
 
     fn message(&self, account: &AccountId, id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
@@ -921,7 +929,9 @@ mod tests {
         };
 
         // The newest rows of every account, in the unified order.
-        let first = source.page(None, 4).expect("page");
+        let first = source
+            .page(&crate::tui::ViewScope::All, None, 4)
+            .expect("page");
         let mut continuation = first.continuation;
         let first = first.rows;
         assert_eq!(
@@ -936,7 +946,9 @@ mod tests {
             let Some(cursor) = continuation.as_ref() else {
                 break;
             };
-            let page = source.page(Some(cursor), 4).expect("page");
+            let page = source
+                .page(&crate::tui::ViewScope::All, Some(cursor), 4)
+                .expect("page");
             continuation = page.continuation;
             let rows = page.rows;
             if rows.is_empty() {
@@ -977,7 +989,9 @@ mod tests {
                 .build()
                 .expect("runtime"),
         };
-        let page = source.page(None, 10).expect("page");
+        let page = source
+            .page(&crate::tui::ViewScope::All, None, 10)
+            .expect("page");
         let rows = page.rows;
         assert_eq!(named(&rows), ["acct_a/m1", "acct_a/m2", "acct_b/m1"]);
     }
@@ -1005,7 +1019,9 @@ mod tests {
                 .build()
                 .expect("runtime"),
         };
-        let page = source.page(None, 10).expect("page");
+        let page = source
+            .page(&crate::tui::ViewScope::All, None, 10)
+            .expect("page");
         let rows = page.rows;
         assert_eq!(named(&rows), ["acct_full/f1", "acct_full/f2"]);
         assert!(page.continuation.is_none(), "exact end has no continuation");
@@ -1037,7 +1053,9 @@ mod tests {
         let mut continuation = None;
         // A finite loop also fails if a cursor repeats a page indefinitely.
         for _ in 0..6 {
-            let page = source.page(continuation.as_ref(), 1).expect("page");
+            let page = source
+                .page(&crate::tui::ViewScope::All, continuation.as_ref(), 1)
+                .expect("page");
             assert_eq!(page.rows.len(), 1);
             continuation = page.continuation;
             loaded.extend(page.rows);
@@ -1054,8 +1072,12 @@ mod tests {
                 "acct_c/m2"
             ]
         );
-        assert!(source.page(None, 0).is_err());
-        assert!(source.page(None, 10_001).is_err());
+        assert!(source.page(&crate::tui::ViewScope::All, None, 0).is_err());
+        assert!(
+            source
+                .page(&crate::tui::ViewScope::All, None, 10_001)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1139,7 +1161,9 @@ mod tests {
                 .build()
                 .expect("runtime"),
         };
-        let page = source.page(None, 10).expect("safe unavailable page");
+        let page = source
+            .page(&crate::tui::ViewScope::All, None, 10)
+            .expect("safe unavailable page");
         assert!(page.rows.is_empty());
         assert_eq!(page.unavailable_accounts.len(), 1);
         assert_eq!(
@@ -1268,7 +1292,9 @@ mod tests {
                 }
             },
         );
-        let first = source.page(None, 1).expect("offline cache");
+        let first = source
+            .page(&crate::tui::ViewScope::All, None, 1)
+            .expect("offline cache");
         assert_eq!(first.rows.len(), 1);
         assert_eq!(first.rows[0].account.as_str(), "acct_cached");
         assert_eq!(
@@ -1280,7 +1306,7 @@ mod tests {
             tersa_application::unified_mailbox::UnavailableAccountState::StoreUnavailable
         );
         let second = source
-            .page(first.continuation.as_ref(), 2)
+            .page(&crate::tui::ViewScope::All, first.continuation.as_ref(), 2)
             .expect("same original dispositions");
         assert_eq!(second.rows.len(), 2);
         assert_eq!(second.unavailable_accounts, first.unavailable_accounts);

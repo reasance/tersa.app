@@ -33,7 +33,7 @@ use tersa_application::unified_mailbox::{
 use tersa_presentation::terminal::SafeText;
 
 use app::{App, Request};
-pub use app::{MessageKey, Row, account_tag_label};
+pub use app::{MessageKey, Row, ViewScope, account_tag_label};
 use worker::{Done, Worker, Workers};
 
 /// Where the interface reads cached mail from.
@@ -45,6 +45,7 @@ pub trait MailSource {
     /// Returns `Err(())` for an invalid query contract or a locked result.
     fn page(
         &self,
+        scope: &ViewScope,
         continuation: Option<&UnifiedMailboxContinuation>,
         limit: u16,
     ) -> Result<MailPage, ()>;
@@ -86,7 +87,7 @@ impl From<UnifiedMailboxDocument> for MailPage {
 
 /// Initializes display state without terminal or network I/O.
 pub(crate) fn initial_app(source: &dyn MailSource) -> Result<App, ()> {
-    let page = read_page(source, None, FIRST_PAGE)?;
+    let page = read_page(source, &ViewScope::All, None, FIRST_PAGE)?;
     let mut app = App::new(source.account_labels(), Vec::new());
     set_progress(&mut app, &page);
     app.status = unreadable_status(page.unavailable_accounts.len());
@@ -294,6 +295,11 @@ fn event_loop(
                 Ok(Some(raw)) => app.reformat(&key, &raw, preference),
                 _ => app.status = Some("The message could not be read again.".to_owned()),
             },
+            Some(Request::ChangeScope(scope)) => {
+                if change_view(app, source, worker, scope).is_err() {
+                    app.status = Some("That account view is unavailable.".to_owned());
+                }
+            }
             Some(Request::Sync) => {
                 if worker.is_empty() {
                     app.status = Some("Syncing needs a readable account and the Google OAuth client; see `tersa doctor`.".to_owned());
@@ -306,12 +312,38 @@ fn event_loop(
     }
 }
 
+/// Discards all prior view state before querying the exact new source set.
+fn change_view(
+    app: &mut App,
+    source: &dyn MailSource,
+    workers: &mut Workers,
+    scope: ViewScope,
+) -> Result<bool, ()> {
+    if !app.set_scope(scope)? {
+        return Ok(false);
+    }
+    workers.change_view(app.view_epoch);
+    if let Ok(page) = read_page(source, &app.scope, None, FIRST_PAGE) {
+        set_progress(app, &page);
+        app.append(page.rows);
+    } else {
+        app.rows_failed();
+        app.status = Some("The selected mailbox view could not be read.".to_owned());
+    }
+    Ok(true)
+}
+
 /// Schedules each ready account independently, coalescing an active cycle.
 fn start_sync(workers: &mut Workers, app: &mut App, now: i64, due_only: bool) -> bool {
     let monotonic = Instant::now();
     let wall = SystemTime::now();
     let mut changed = false;
+    let mut eligible = false;
     for worker in &mut workers.accounts {
+        if !due_only && !app.scope.contains(&worker.account) {
+            continue;
+        }
+        eligible = true;
         if due_only && !worker.sync_due_at(monotonic, wall) {
             continue;
         }
@@ -320,6 +352,10 @@ fn start_sync(workers: &mut Workers, app: &mut App, now: i64, due_only: bool) ->
         } else {
             changed |= fail_pending(worker, app, now);
         }
+    }
+    if !due_only && !eligible {
+        app.status = Some("This account is unavailable for syncing.".to_owned());
+        changed = true;
     }
     changed
 }
@@ -335,36 +371,41 @@ fn finish_work(workers: &mut Workers, app: &mut App, source: &dyn MailSource, no
                 Ok(done) => done,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    reload |= worker.syncing;
+                    reload |= worker.syncing && app.scope.contains(&worker.account);
                     changed |= fail_pending(worker, app, now);
                     break;
                 }
             };
             changed = true;
             match done {
-                Done::Fetched(key, result) if key.0 == worker.account => {
-                    worker.fetching.remove(&key);
-                    app.downloaded(key, result);
+                Done::Fetched(key, result, epoch) if key.0 == worker.account => {
+                    if !worker.finish_fetch(&key, epoch) {
+                        continue;
+                    }
+                    if epoch == app.view_epoch {
+                        app.downloaded(key, result);
+                    } else {
+                        resume_open_message(worker, app, source, &key);
+                    }
                 }
-                Done::Skipped(key) if key.0 == worker.account => {
-                    worker.fetching.remove(&key);
-                    if app.open_key() == Some(&key) && !worker.fetch(&key) {
-                        app.downloaded(key, Err(FETCH_NOT_QUEUED.to_owned()));
+                Done::Skipped(key, epoch) if key.0 == worker.account => {
+                    if worker.finish_fetch(&key, epoch) {
+                        resume_open_message(worker, app, source, &key);
                     }
                 }
                 Done::Synced(account, result) if account == worker.account => {
                     worker.syncing = false;
                     app.synced(&account, result, now, worker.next_sync_millis());
-                    reload = true;
+                    app.set_accounts(source.account_labels());
+                    reload |= app.scope.contains(&account);
                 }
                 _ => {} // A completion from any other account is never applied.
             }
         }
     }
     if reload {
-        app.set_accounts(source.account_labels());
         let loaded = app.rows.len().max(usize::from(FIRST_PAGE));
-        if let Ok(page) = read_rows(source, loaded) {
+        if let Ok(page) = read_scoped_rows(source, &app.scope, loaded) {
             set_progress(app, &page);
             app.reload(page.rows, app.more_rows);
             while app.selection_pending() && app.more_rows {
@@ -379,10 +420,29 @@ fn finish_work(workers: &mut Workers, app: &mut App, source: &dyn MailSource, no
     changed
 }
 
+/// A reopened current message may have coalesced with an old-view fetch.
+/// Ignore the old result, then satisfy the CURRENT request via a fresh cache
+/// read or its own generation-tagged download, with exact account routing.
+fn resume_open_message(
+    worker: &mut Worker,
+    app: &mut App,
+    source: &dyn MailSource,
+    key: &MessageKey,
+) {
+    if app.open_key() != Some(key) || !app.scope.contains(&key.0) {
+        return;
+    }
+    match source.message(&key.0, &key.1) {
+        Ok(None) if worker.fetch(key) => app.downloading(key),
+        Ok(None) => app.downloaded(key.clone(), Err(FETCH_NOT_QUEUED.to_owned())),
+        raw => app.show_message(key.clone(), raw),
+    }
+}
+
 /// Reads the page that follows the loaded rows; returns whether it changed
 /// the list.
 fn load_page(app: &mut App, source: &dyn MailSource) -> bool {
-    match read_page(source, app.continuation.as_ref(), PAGE) {
+    match read_page(source, &app.scope, app.continuation.as_ref(), PAGE) {
         Ok(page) => {
             set_progress(app, &page);
             app.append(page.rows);
@@ -396,30 +456,41 @@ fn load_page(app: &mut App, source: &dyn MailSource) -> bool {
 /// Reads exactly one application page; only the application probes for more.
 fn read_page(
     source: &dyn MailSource,
+    scope: &ViewScope,
     continuation: Option<&UnifiedMailboxContinuation>,
     limit: u16,
 ) -> Result<MailPage, ()> {
     if !(1..=MAX_PAGE_SIZE).contains(&limit) {
         return Err(());
     }
-    source.page(continuation, limit)
+    source.page(scope, continuation, limit)
 }
 
 /// Restarts from a fresh query and reads up to a GLOBAL row count in bounded
 /// pages after sync, never passing a loaded row count to an account reader.
+#[cfg(test)]
 pub(crate) fn read_rows(source: &dyn MailSource, limit: usize) -> Result<MailPage, ()> {
+    read_scoped_rows(source, &ViewScope::All, limit)
+}
+
+fn read_scoped_rows(
+    source: &dyn MailSource,
+    scope: &ViewScope,
+    limit: usize,
+) -> Result<MailPage, ()> {
     if limit == 0 {
         return Err(());
     }
     let mut page = read_page(
         source,
+        scope,
         None,
         u16::try_from(limit.min(usize::from(PAGE))).map_err(|_error| ())?,
     )?;
     while page.rows.len() < limit && page.continuation.is_some() {
         let size =
             u16::try_from((limit - page.rows.len()).min(usize::from(PAGE))).map_err(|_error| ())?;
-        let next = read_page(source, page.continuation.as_ref(), size)?;
+        let next = read_page(source, scope, page.continuation.as_ref(), size)?;
         page.rows.extend(next.rows);
         page.continuation = next.continuation;
         page.unavailable_accounts = next.unavailable_accounts;
@@ -442,8 +513,10 @@ fn fail_pending(worker: &mut Worker, app: &mut App, now: i64) -> bool {
     worker.dead = true;
     worker.syncing = false;
     app.synced(&worker.account, Err(WORKER_GONE.to_owned()), now, None);
-    for key in std::mem::take(&mut worker.fetching) {
-        app.downloaded(key, Err(WORKER_GONE.to_owned()));
+    for (key, epoch) in std::mem::take(&mut worker.fetching) {
+        if epoch == app.view_epoch {
+            app.downloaded(key, Err(WORKER_GONE.to_owned()));
+        }
     }
     true
 }
@@ -540,8 +613,9 @@ mod tests {
 
     use super::{
         App, Done, FIRST_PAGE, MailPage, MailSource, MessageKey, Row, UnifiedMailboxContinuation,
-        WORKER_GONE, Worker, Workers, finish_work, initial_app, load_page, read_page, read_rows,
-        set_progress, terminal_open, unreadable_status, view,
+        ViewScope, WORKER_GONE, Worker, Workers, change_view, finish_work, initial_app, load_page,
+        read_page, read_rows, read_scoped_rows, set_progress, start_sync, terminal_open,
+        unreadable_status, view,
     };
 
     fn id(text: &str) -> MessageId {
@@ -569,6 +643,7 @@ mod tests {
     impl MailSource for Empty {
         fn page(
             &self,
+            _scope: &ViewScope,
             _continuation: Option<&UnifiedMailboxContinuation>,
             _limit: u16,
         ) -> Result<MailPage, ()> {
@@ -706,6 +781,7 @@ mod tests {
     impl MailSource for Pages {
         fn page(
             &self,
+            scope: &ViewScope,
             continuation: Option<&UnifiedMailboxContinuation>,
             limit: u16,
         ) -> Result<MailPage, ()> {
@@ -742,6 +818,10 @@ mod tests {
                     reader: &reader,
                 },
             ];
+            let sources: Vec<_> = sources
+                .into_iter()
+                .filter(|source| scope.contains(source.account_id()))
+                .collect();
             let result = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime")
@@ -808,7 +888,7 @@ mod tests {
     #[test]
     fn a_page_that_ends_the_cache_is_not_taken_for_an_unfinished_one() {
         let source = Pages::new(100);
-        let page = read_page(&source, None, FIRST_PAGE).expect("page");
+        let page = read_page(&source, &ViewScope::All, None, FIRST_PAGE).expect("page");
         assert_eq!(page.rows.len(), 100);
         assert!(page.continuation.is_none(), "exactly one first page");
 
@@ -831,13 +911,14 @@ mod tests {
         impl MailSource for OlderFail {
             fn page(
                 &self,
+                scope: &ViewScope,
                 continuation: Option<&UnifiedMailboxContinuation>,
                 limit: u16,
             ) -> Result<MailPage, ()> {
                 if continuation.is_some() {
                     return Err(());
                 }
-                self.0.page(continuation, limit)
+                self.0.page(scope, continuation, limit)
             }
 
             fn message(
@@ -876,13 +957,14 @@ mod tests {
         impl MailSource for FailAfterSync {
             fn page(
                 &self,
+                scope: &ViewScope,
                 continuation: Option<&UnifiedMailboxContinuation>,
                 limit: u16,
             ) -> Result<MailPage, ()> {
                 if self.1.get() {
                     return Err(());
                 }
-                self.0.page(continuation, limit)
+                self.0.page(scope, continuation, limit)
             }
 
             fn message(
@@ -986,10 +1068,11 @@ mod tests {
     impl MailSource for Labeled {
         fn page(
             &self,
+            scope: &ViewScope,
             continuation: Option<&UnifiedMailboxContinuation>,
             limit: u16,
         ) -> Result<MailPage, ()> {
-            self.0.page(continuation, limit)
+            self.0.page(scope, continuation, limit)
         }
 
         fn message(&self, _account: &AccountId, _id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
@@ -1012,11 +1095,17 @@ mod tests {
     impl MailSource for Relabeled {
         fn page(
             &self,
+            scope: &ViewScope,
             _continuation: Option<&UnifiedMailboxContinuation>,
             _limit: u16,
         ) -> Result<MailPage, ()> {
             Ok(MailPage {
-                rows: self.0.clone(),
+                rows: self
+                    .0
+                    .iter()
+                    .filter(|row| scope.contains(&row.account))
+                    .cloned()
+                    .collect(),
                 ..MailPage::default()
             })
         }
@@ -1120,13 +1209,14 @@ mod tests {
         impl MailSource for BecomesUnavailable {
             fn page(
                 &self,
+                scope: &ViewScope,
                 continuation: Option<&UnifiedMailboxContinuation>,
                 limit: u16,
             ) -> Result<MailPage, ()> {
                 if self.1.get() {
                     Ok(MailPage { unavailable_accounts: vec![UnavailableAccount { account_id: account("acct"), state: tersa_application::unified_mailbox::UnavailableAccountState::StoreUnavailable }], ..MailPage::default() })
                 } else {
-                    self.0.page(continuation, limit)
+                    self.0.page(scope, continuation, limit)
                 }
             }
             fn message(&self, account: &AccountId, id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
@@ -1525,5 +1615,464 @@ mod tests {
             unreadable_status(2).as_deref(),
             Some("2 accounts could not be read; their mail is not shown")
         );
+    }
+
+    struct ViewDirectory(std::path::PathBuf);
+    impl Drop for ViewDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    struct ViewFixture {
+        source: crate::commands::StoreSource,
+        _directory: ViewDirectory,
+    }
+    fn view_fixture() -> ViewFixture {
+        use tersa_application::mailbox::{
+            HeaderText, MailboxStore, MessageEnvelope, ThreadId, UnixTimestampMillis,
+        };
+        use tersa_store_sqlcipher::{DatabaseKey, SqlCipherMailboxStore};
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "tersa-view-{}-{serial}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("directory");
+        let directory = ViewDirectory(root);
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let mut stores = Vec::new();
+        for (name, subject) in [("acct_a", "alpha"), ("acct_b", "beta")] {
+            let account = account(name);
+            let store = SqlCipherMailboxStore::open(
+                account.clone(),
+                directory.0.join(format!("{name}.sqlite3")),
+                DatabaseKey::new([9; 32]),
+            )
+            .expect("store");
+            let rows: Vec<_> = (0..225)
+                .map(|index| {
+                    MessageEnvelope::new(
+                        id(&format!("same{index:03}")),
+                        ThreadId::new("t").expect("thread"),
+                        HeaderText::new("Sender").expect("sender"),
+                        HeaderText::new(subject).expect("subject"),
+                        HeaderText::new("preview").expect("preview"),
+                        UnixTimestampMillis::new(10_000 - index).expect("time"),
+                        false,
+                    )
+                })
+                .collect();
+            executor
+                .block_on(store.upsert_envelopes(&account, &rows))
+                .expect("seed");
+            stores.push((account, Some(store)));
+        }
+        stores.push((account("acct_unavailable"), None));
+        ViewFixture {
+            source: crate::commands::StoreSource {
+                stores,
+                executor,
+                requests: std::cell::RefCell::default(),
+            },
+            _directory: directory,
+        }
+    }
+
+    #[test]
+    fn real_scoped_queries_cycle_fresh_continuations_and_clear_old_view_state() {
+        let fixture = view_fixture();
+        let source = &fixture.source;
+        let mut workers = Workers::start(Vec::new()).expect("offline workers");
+        let mut app = initial_app(source).expect("All");
+        let all_cursor = app.continuation.clone();
+        assert_eq!(app.rows.len(), 100);
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "beta".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.show_message(
+            key("acct_b", "same000"),
+            Ok(Some(b"Subject: old\r\n\r\nold body".to_vec())),
+        );
+        assert!(
+            change_view(
+                &mut app,
+                source,
+                &mut workers,
+                ViewScope::Account(account("acct_a"))
+            )
+            .expect("A")
+        );
+        assert_eq!(app.search.query, "");
+        assert_eq!(app.selected, 0);
+        assert!(app.open_key().is_none());
+        assert_eq!(app.rows.len(), 100);
+        assert!(app.rows.iter().all(|row| row.account == account("acct_a")));
+        assert!(
+            source.page(&app.scope, all_cursor.as_ref(), 37).is_err(),
+            "the old account set cannot resume in A"
+        );
+        let next = source
+            .page(&app.scope, app.continuation.as_ref(), 37)
+            .expect("variable A page");
+        assert_eq!(next.rows[0].id.as_str(), "same100");
+        assert_eq!(next.rows.len(), 37);
+        let cursor = app.continuation.clone();
+        let epoch = app.view_epoch;
+        let calls = source.requests.borrow().len();
+        assert!(
+            !change_view(
+                &mut app,
+                source,
+                &mut workers,
+                ViewScope::Account(account("acct_a"))
+            )
+            .expect("no-op")
+        );
+        assert_eq!(source.requests.borrow().len(), calls);
+        assert_eq!(app.continuation, cursor);
+        assert_eq!(app.view_epoch, epoch);
+        assert!(
+            change_view(
+                &mut app,
+                source,
+                &mut workers,
+                ViewScope::Account(account("acct_b"))
+            )
+            .expect("B")
+        );
+        assert_eq!(app.rows[0].message_key(), key("acct_b", "same000"));
+        assert!(app.rows.iter().all(|row| row.account == account("acct_b")));
+        assert!(change_view(&mut app, source, &mut workers, ViewScope::All).expect("All again"));
+        assert_eq!(app.rows[0].message_key(), key("acct_a", "same000"));
+        assert_eq!(app.rows[1].message_key(), key("acct_b", "same000"));
+        assert_eq!(app.rows.len(), 100);
+        assert_eq!(app.view_epoch, 3);
+        assert!(source.requests.borrow().iter().all(|size| *size <= 200));
+    }
+
+    #[test]
+    fn search_and_unavailable_views_are_scoped_and_unknown_accounts_never_fall_back() {
+        let fixture = view_fixture();
+        let source = &fixture.source;
+        let mut workers = Workers::start(Vec::new()).expect("offline");
+        let mut app = initial_app(source).expect("All");
+        change_view(
+            &mut app,
+            source,
+            &mut workers,
+            ViewScope::Account(account("acct_a")),
+        )
+        .expect("A");
+        while app.more_rows {
+            load_page(&mut app, source);
+        }
+        assert_eq!(app.rows.len(), 225);
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for character in "beta".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.shown.is_empty(),
+            "B's cached beta rows are outside A's search"
+        );
+        let all = read_scoped_rows(source, &ViewScope::All, 450).expect("All rows");
+        assert_eq!(
+            all.rows
+                .iter()
+                .filter(|row| row.subject.as_str() == "beta")
+                .count(),
+            225
+        );
+        let unknown = ViewScope::Account(account("acct_unknown"));
+        let before = source.requests.borrow().len();
+        assert_eq!(
+            change_view(&mut app, source, &mut workers, unknown.clone()),
+            Err(())
+        );
+        assert_eq!(source.requests.borrow().len(), before);
+        assert_eq!(app.scope, ViewScope::Account(account("acct_a")));
+        assert!(source.page(&unknown, None, 100).is_err());
+        change_view(
+            &mut app,
+            source,
+            &mut workers,
+            ViewScope::Account(account("acct_unavailable")),
+        )
+        .expect("registered unavailable");
+        assert_eq!(app.search.query, "");
+        assert!(app.rows.is_empty());
+        assert!(app.continuation.is_none());
+        assert_eq!(app.unavailable_accounts.len(), 1);
+        assert_eq!(
+            app.unavailable_accounts[0].account_id,
+            account("acct_unavailable")
+        );
+        assert!(
+            drawn(&mut app)
+                .join("\n")
+                .contains("their mail is not shown")
+        );
+    }
+
+    #[test]
+    fn old_view_completion_cannot_overwrite_the_same_message_reopened_in_a_new_view() {
+        struct Replies(std::sync::atomic::AtomicUsize);
+        impl super::Remote for Replies {
+            fn fetch<'a>(
+                &'a self,
+                _: &'a AccountId,
+                _: &'a MessageId,
+            ) -> super::Pending<'a, Vec<u8>> {
+                Box::pin(async move {
+                    let index = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(if index == 0 {
+                        b"Subject: old\r\n\r\nold body".to_vec()
+                    } else {
+                        b"Subject: new\r\n\r\nnew body".to_vec()
+                    })
+                })
+            }
+            fn sync<'a>(&'a self, _: &'a AccountId) -> super::Pending<'a, ()> {
+                Box::pin(std::future::pending())
+            }
+        }
+        let source = Relabeled(
+            vec![
+                Row::sample("acct_a", "same", "Ann", "A", false),
+                Row::sample("acct_b", "same", "Bob", "B", false),
+            ],
+            std::cell::RefCell::new(labeled(&["acct_a", "acct_b"])),
+        );
+        let mut app = initial_app(&source).expect("All");
+        let mut workers = Workers::start(vec![(
+            account("acct_a"),
+            Box::new(Replies(std::sync::atomic::AtomicUsize::new(0))),
+        )])
+        .expect("worker");
+        let (inject, incoming) = mpsc::channel();
+        let actual = std::mem::replace(&mut workers.accounts[0].done, incoming);
+        let wanted = key("acct_a", "same");
+        app.show_message(wanted.clone(), Ok(None));
+        assert!(workers.fetch(&wanted));
+        app.downloading(&wanted);
+        let old = actual
+            .recv_timeout(Duration::from_secs(5))
+            .expect("old result queued");
+        change_view(
+            &mut app,
+            &source,
+            &mut workers,
+            ViewScope::Account(account("acct_a")),
+        )
+        .expect("new A view");
+        assert!(app.open_key().is_none());
+        app.show_message(wanted.clone(), Ok(None));
+        assert!(workers.fetch(&wanted));
+        app.downloading(&wanted);
+        inject.send(old).expect("late old view result");
+        assert!(finish_work(&mut workers, &mut app, &source, 0));
+        assert!(
+            matches!(&app.screen, Screen::Message(view) if matches!(view.body, Body::Downloading)),
+            "old body must not be shown"
+        );
+        let current = actual
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fresh generation fetch");
+        inject
+            .send(Done::Fetched(
+                wanted.clone(),
+                Ok(b"Subject: stale\r\n\r\nstale".to_vec()),
+                0,
+            ))
+            .expect("stale duplicate");
+        finish_work(&mut workers, &mut app, &source, 0);
+        assert_eq!(
+            workers.accounts[0].fetching.get(&wanted),
+            Some(&app.view_epoch),
+            "old result cannot settle the new request"
+        );
+        inject.send(current).expect("current result");
+        finish_work(&mut workers, &mut app, &source, 0);
+        assert!(
+            matches!(&app.screen, Screen::Message(view) if matches!(&view.body, Body::Rendered(body) if body.body.as_str() == "new body"))
+        );
+    }
+
+    #[test]
+    fn manual_sync_uses_the_view_but_automatic_sync_still_starts_other_accounts() {
+        let (started, starts) = mpsc::channel();
+        let (dropped, _drops) = mpsc::channel();
+        let remotes = ["acct_a", "acct_b"]
+            .iter()
+            .map(|name| {
+                (
+                    account(name),
+                    Box::new(PendingRemote {
+                        account: account(name),
+                        started: started.clone(),
+                        dropped: dropped.clone(),
+                    }) as Box<dyn super::Remote>,
+                )
+            })
+            .collect();
+        let mut workers = Workers::start(remotes).expect("workers");
+        let source = Relabeled(
+            Vec::new(),
+            std::cell::RefCell::new(labeled(&["acct_a", "acct_b", "acct_unavailable"])),
+        );
+        let mut app = initial_app(&source).expect("All");
+        change_view(
+            &mut app,
+            &source,
+            &mut workers,
+            ViewScope::Account(account("acct_a")),
+        )
+        .expect("A");
+        assert!(start_sync(&mut workers, &mut app, 0, false));
+        assert_eq!(
+            starts
+                .recv_timeout(Duration::from_secs(5))
+                .expect("A starts"),
+            account("acct_a")
+        );
+        assert!(!workers.accounts[1].syncing);
+        assert!(start_sync(&mut workers, &mut app, 0, true));
+        assert_eq!(
+            starts
+                .recv_timeout(Duration::from_secs(5))
+                .expect("B auto starts"),
+            account("acct_b")
+        );
+        change_view(
+            &mut app,
+            &source,
+            &mut workers,
+            ViewScope::Account(account("acct_unavailable")),
+        )
+        .expect("unavailable");
+        assert!(
+            !app.syncing(),
+            "peers' running state is not this view's state"
+        );
+        assert!(start_sync(&mut workers, &mut app, 0, false));
+        assert!(
+            app.status
+                .as_deref()
+                .expect("status")
+                .contains("unavailable")
+        );
+        assert!(
+            workers.accounts.iter().all(|worker| worker.syncing),
+            "view changes do not cancel sync"
+        );
+        change_view(&mut app, &source, &mut workers, ViewScope::All).expect("All");
+        assert!(
+            !start_sync(&mut workers, &mut app, 0, false),
+            "manual All coalesces already-running peers"
+        );
+    }
+
+    #[test]
+    fn unrelated_sync_updates_status_without_replacing_selected_rows_body_or_cursor() {
+        use tersa_application::mailbox::{AccountEmail, MailboxStore};
+        let fixture = view_fixture();
+        let source = &fixture.source;
+        let (a, a_done) = mpsc::channel();
+        let (b, b_done) = mpsc::channel();
+        let mut workers = Workers {
+            accounts: vec![
+                Worker::fixture(account("acct_a"), a_done, true, HashSet::new()),
+                Worker::fixture(account("acct_b"), b_done, true, HashSet::new()),
+            ],
+        };
+        let mut app = initial_app(source).expect("All");
+        change_view(
+            &mut app,
+            source,
+            &mut workers,
+            ViewScope::Account(account("acct_a")),
+        )
+        .expect("A");
+        let wanted = key("acct_a", "same000");
+        app.show_message(
+            wanted.clone(),
+            Ok(Some(b"Subject: current\r\n\r\ncurrent body".to_vec())),
+        );
+        drawn(&mut app);
+        let old_layout = match &app.screen {
+            Screen::Message(view) => view.layout.clone(),
+            Screen::Inbox => panic!("message"),
+        };
+        let old_rows: Vec<_> = app.rows.iter().map(Row::message_key).collect();
+        let old_cursor = app.continuation.clone();
+        source.stores[1]
+            .1
+            .as_ref()
+            .expect("B store")
+            .store_email_address(
+                &account("acct_b"),
+                &AccountEmail::new("bob@example.com").expect("address"),
+            )
+            .expect("B profile");
+        source.requests.borrow_mut().clear();
+        b.send(Done::Synced(
+            account("acct_b"),
+            Err("authorization required for B".to_owned()),
+        ))
+        .expect("B completes");
+        assert!(finish_work(&mut workers, &mut app, source, 42));
+        assert!(
+            source.requests.borrow().is_empty(),
+            "no query or cursor from B is used in A"
+        );
+        assert_eq!(
+            app.rows.iter().map(Row::message_key).collect::<Vec<_>>(),
+            old_rows
+        );
+        assert_eq!(app.continuation, old_cursor);
+        assert_eq!(app.open_key(), Some(&wanted));
+        assert!(
+            matches!(&app.screen, Screen::Message(view) if view.layout == old_layout && matches!(&view.body, Body::Rendered(body) if body.body.as_str() == "current body"))
+        );
+        assert_eq!(
+            app.account_label(&account("acct_b")),
+            "bob@example.com",
+            "unrelated label metadata may refresh"
+        );
+        assert!(
+            !drawn(&mut app)
+                .join("\n")
+                .contains("authorization required for B")
+        );
+        source
+            .executor
+            .block_on(
+                source.stores[0]
+                    .1
+                    .as_ref()
+                    .expect("A store")
+                    .upsert_envelopes(&account("acct_a"), &[sql_envelope("fresh", 20_000)]),
+            )
+            .expect("A sync metadata");
+        a.send(Done::Synced(account("acct_a"), Ok(())))
+            .expect("A completes");
+        finish_work(&mut workers, &mut app, source, 43);
+        assert_eq!(*source.requests.borrow(), [100]);
+        assert_eq!(app.rows[0].message_key(), key("acct_a", "fresh"));
+        assert!(app.rows.iter().all(|row| row.account == account("acct_a")));
+        assert_ne!(app.continuation, old_cursor);
+        assert_eq!(app.open_key(), Some(&wanted));
+        assert_eq!(app.sync[0].state, SyncState::Synced(43));
+        assert!(matches!(app.sync[1].state, SyncState::Failed(_)));
     }
 }

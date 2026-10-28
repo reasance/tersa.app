@@ -233,6 +233,23 @@ pub struct Search {
     pub editing: bool,
 }
 
+/// In-memory view scope. Account identity is never inferred from a label.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ViewScope {
+    #[default]
+    All,
+    Account(AccountId),
+}
+
+impl ViewScope {
+    pub fn contains(&self, account: &AccountId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Account(selected) => selected == account,
+        }
+    }
+}
+
 /// Work the interface needs from the outside world.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
@@ -243,6 +260,8 @@ pub enum Request {
     Reformat(MessageKey, BodyPreference),
     /// Sync the accounts now.
     Sync,
+    /// Start a fresh inbox for this explicit view.
+    ChangeScope(ViewScope),
 }
 
 /// The whole interface state.
@@ -252,6 +271,9 @@ pub struct App {
     /// Every account the source reads, in registry order, each with its
     /// stored Gmail address or its id.
     pub accounts: Vec<(AccountId, SafeText)>,
+    pub scope: ViewScope,
+    /// Changes only on a real view change, fencing old download completions.
+    pub view_epoch: u64,
     /// Explicit query availability, retained independently of transient status.
     pub unavailable_accounts: Vec<UnavailableAccount>,
     /// Opaque application progress; never reconstructed from display rows.
@@ -313,6 +335,8 @@ impl App {
             .collect();
         Self {
             accounts,
+            scope: ViewScope::All,
+            view_epoch: 0,
             unavailable_accounts: Vec::new(),
             continuation: None,
             rows,
@@ -356,23 +380,106 @@ impl App {
     /// The account text of the top bar: the one account's label, or how many
     /// accounts the list draws from.
     pub fn account_heading(&self) -> String {
-        match self.accounts.len() {
-            1 => self.accounts[0].1.as_str().to_owned(),
-            count => format!("{count} accounts"),
+        match &self.scope {
+            ViewScope::All if self.accounts.len() == 1 => self.accounts[0].1.as_str().to_owned(),
+            ViewScope::All => format!("All accounts ({})", self.accounts.len()),
+            ViewScope::Account(account) => {
+                let ordinal = self
+                    .accounts
+                    .iter()
+                    .position(|(known, _)| known == account)
+                    .map(|index| index + 1);
+                ordinal.map_or_else(
+                    || format!("Account: {}", self.account_label(account)),
+                    |ordinal| format!("Account #{ordinal}: {}", self.account_label(account)),
+                )
+            }
         }
     }
 
-    /// Replaces the account labels, read again after a finished sync. A
-    /// changed label must reach the open message's header, whose lines are
-    /// cached with the old one, so that cache is dropped; the scroll
-    /// position survives the rebuild.
+    /// Replaces labels without invalidating an unrelated account's open layout.
     pub fn set_accounts(&mut self, accounts: Vec<(AccountId, SafeText)>) {
-        if self.accounts != accounts
-            && let Screen::Message(view) = &mut self.screen
-        {
+        let changed_open = self.open_key().is_some_and(|key| {
+            let next = accounts
+                .iter()
+                .find(|(known, _)| known == &key.0)
+                .map_or(key.0.as_str(), |(_, label)| label.as_str());
+            self.account_label(&key.0) != next || self.accounts.len() != accounts.len()
+        });
+        if changed_open && let Screen::Message(view) = &mut self.screen {
             view.layout = None;
         }
         self.accounts = accounts;
+    }
+
+    /// Changes scope atomically before the caller starts its fresh query.
+    /// Unknown accounts are rejected; the one-account view has no duplicates.
+    pub fn set_scope(&mut self, scope: ViewScope) -> Result<bool, ()> {
+        if let ViewScope::Account(account) = &scope
+            && !self.accounts.iter().any(|(known, _)| known == account)
+        {
+            return Err(());
+        }
+        if self.search.editing {
+            return Ok(false);
+        }
+        if scope == self.scope
+            || (self.accounts.len() == 1 && matches!(scope, ViewScope::Account(_)))
+        {
+            return Ok(false);
+        }
+        let epoch = self.view_epoch.checked_add(1).ok_or(())?;
+        self.scope = scope;
+        self.view_epoch = epoch;
+        self.rows.clear();
+        self.shown.clear();
+        self.continuation = None;
+        self.unavailable_accounts.clear();
+        self.more_rows = false;
+        self.rows_unreadable = false;
+        self.screen = Screen::Inbox;
+        self.search = Search::default();
+        self.selected = 0;
+        self.list_offset = 0;
+        self.pending_selection = None;
+        self.pending_g = false;
+        self.counting_matches = false;
+        self.status = None;
+        self.help = false;
+        self.repaint = true;
+        Ok(true)
+    }
+
+    fn cycle_scope(&self, backwards: bool) -> Option<ViewScope> {
+        if self.accounts.len() <= 1 {
+            return None;
+        }
+        let current = match &self.scope {
+            ViewScope::All => 0,
+            ViewScope::Account(account) => {
+                self.accounts
+                    .iter()
+                    .position(|(known, _)| known == account)?
+                    + 1
+            }
+        };
+        let total = self.accounts.len() + 1;
+        let next = if backwards {
+            (current + total - 1) % total
+        } else {
+            (current + 1) % total
+        };
+        Some(if next == 0 {
+            ViewScope::All
+        } else {
+            ViewScope::Account(self.accounts[next - 1].0.clone())
+        })
+    }
+
+    pub fn visible_sync(&self) -> impl Iterator<Item = &AccountSync> {
+        self.sync
+            .iter()
+            .filter(|sync| self.scope.contains(&sync.account))
     }
 
     fn position_of(&self, key: &MessageKey) -> Option<usize> {
@@ -496,8 +603,24 @@ impl App {
         }
     }
 
+    fn is_view_key(&self, key: KeyEvent) -> bool {
+        !self.help
+            && !self.search.editing
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+    }
+
     /// Handles one key press and returns any work the caller must do.
     pub fn key(&mut self, key: KeyEvent) -> Option<Request> {
+        if self.is_view_key(key) {
+            return self
+                .cycle_scope(
+                    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT),
+                )
+                .map(Request::ChangeScope);
+        }
         self.status = None;
         self.counting_matches = false;
         self.pending_selection = None;
@@ -636,6 +759,9 @@ impl App {
 
     /// Shows the message `key` with its cached raw bytes, if any.
     pub fn show_message(&mut self, key: MessageKey, raw: Result<Option<Vec<u8>>, ()>) {
+        if !self.scope.contains(&key.0) {
+            return;
+        }
         let body = match raw {
             Ok(Some(raw)) => Body::Rendered(Box::new(render_message(&raw, self.preference))),
             Ok(None) => Body::NotCached,
@@ -728,8 +854,7 @@ impl App {
     }
 
     pub fn syncing(&self) -> bool {
-        self.sync
-            .iter()
+        self.visible_sync()
             .any(|sync| sync.state == SyncState::Running)
     }
 
@@ -799,7 +924,8 @@ mod tests {
     use tersa_presentation::terminal::SafeText;
 
     use super::{
-        App, Body, BodyPreference, MessageKey, Request, Row, Screen, SyncState, sender_name,
+        App, Body, BodyPreference, MessageKey, Request, Row, Screen, SyncState, ViewScope,
+        sender_name,
     };
 
     fn id(text: &str) -> MessageId {
@@ -1265,5 +1391,91 @@ Content-Type: text/plain\r\n\r\nplain body\r\n--b\r\nContent-Type: text/html\r\n
             true,
         )]);
         assert!(!app.selection_pending());
+    }
+
+    #[test]
+    fn view_keys_cycle_all_and_accounts_without_changing_search_editing_keys() {
+        let mut app = App::new(labeled(&["acct_a", "acct_b"]), Vec::new());
+        for wanted in [
+            ViewScope::Account(account("acct_a")),
+            ViewScope::Account(account("acct_b")),
+            ViewScope::All,
+        ] {
+            assert_eq!(
+                press(&mut app, KeyCode::Tab),
+                Some(Request::ChangeScope(wanted.clone()))
+            );
+            assert!(app.set_scope(wanted).expect("known view"));
+        }
+        assert_eq!(
+            press(&mut app, KeyCode::BackTab),
+            Some(Request::ChangeScope(ViewScope::Account(account("acct_b"))))
+        );
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)),
+            Some(Request::ChangeScope(ViewScope::Account(account("acct_b"))))
+        );
+        press(&mut app, KeyCode::Char('/'));
+        typed(&mut app, "search text");
+        assert!(app.search.editing);
+        assert_eq!(press(&mut app, KeyCode::Tab), None);
+        assert_eq!(press(&mut app, KeyCode::BackTab), None);
+        assert_eq!(
+            app.set_scope(ViewScope::Account(account("acct_a"))),
+            Ok(false)
+        );
+        assert_eq!(app.scope, ViewScope::All);
+        assert_eq!(app.search.query, "search text");
+    }
+
+    #[test]
+    fn a_real_view_change_resets_view_state_but_an_active_or_unknown_scope_does_not() {
+        let mut app = App::new(
+            labeled(&["acct_a", "acct_b"]),
+            vec![Row::sample("acct_a", "same", "Ann", "Old", false)],
+        );
+        app.search.query = "old".to_owned();
+        app.show_message(
+            key("acct_a", "same"),
+            Ok(Some(b"Subject: old\r\n\r\nold body".to_vec())),
+        );
+        assert_eq!(app.set_scope(ViewScope::All), Ok(false));
+        assert!(app.open_key().is_some());
+        assert_eq!(app.search.query, "old");
+        assert_eq!(
+            app.set_scope(ViewScope::Account(account("unknown"))),
+            Err(())
+        );
+        assert_eq!(app.scope, ViewScope::All);
+        assert_eq!(app.view_epoch, 0);
+        assert!(app.open_key().is_some());
+        assert_eq!(
+            app.set_scope(ViewScope::Account(account("acct_b"))),
+            Ok(true)
+        );
+        assert_eq!(app.view_epoch, 1);
+        assert!(app.open_key().is_none());
+        assert!(app.rows.is_empty() && app.shown.is_empty());
+        assert_eq!(app.search.query, "");
+        assert_eq!((app.selected, app.list_offset), (0, 0));
+        assert!(app.continuation.is_none() && !app.more_rows);
+        assert!(app.repaint);
+    }
+
+    #[test]
+    fn single_account_has_no_duplicate_all_or_account_cycle() {
+        let mut app = app(1);
+        app.search.query = "retained".to_owned();
+        app.show_message(key("acct", "m0"), Ok(None));
+        assert_eq!(press(&mut app, KeyCode::Tab), None);
+        assert_eq!(press(&mut app, KeyCode::BackTab), None);
+        assert_eq!(
+            app.set_scope(ViewScope::Account(account("acct"))),
+            Ok(false)
+        );
+        assert_eq!(app.scope, ViewScope::All);
+        assert_eq!(app.view_epoch, 0);
+        assert_eq!(app.search.query, "retained");
+        assert!(app.open_key().is_some());
     }
 }
