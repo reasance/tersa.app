@@ -151,6 +151,54 @@ impl SqlCipherRegistry {
         })
     }
 
+    /// Authenticates an existing registry without creation or write authority.
+    ///
+    /// Missing, empty and unclaimed databases are refused. Existing ownership,
+    /// owner-only permissions, format and rows are checked without chmod,
+    /// schema initialization, migration or journal repair. A WAL registry must
+    /// already have its coordination files; ordinary shared-memory bookkeeping
+    /// is not a database/schema write. The existing bootstrap opener is separate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Storage` for missing/unusable files, `UnsafeLocation` for
+    /// unsafe ownership/permissions and `Corrupted` for an invalid key/format.
+    pub fn open_existing(path: &Path, key: &Zeroizing<[u8; 32]>) -> Result<Self, RegistryError> {
+        let name = path.file_name().ok_or(RegistryError::Storage)?;
+        let parent = fs::canonicalize(path.parent().ok_or(RegistryError::Storage)?)
+            .map_err(|_error| RegistryError::Storage)?;
+        let path = parent.join(name);
+        let before = existing_registry_files(&path)?;
+        let mut connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|_error| RegistryError::Storage)?;
+        crate::store::disable_and_verify_checkpoint_on_close(&connection)
+            .map_err(|_error| RegistryError::Storage)?;
+        crate::store::opened_file_has_moved(&connection)
+            .map_err(|_error| RegistryError::Storage)?;
+        if before.1.is_some() {
+            crate::store::set_and_verify_persistent_wal(&connection)
+                .map_err(|_error| RegistryError::Storage)?;
+        }
+        crate::store::apply_key(&connection, key).map_err(classify)?;
+        connection.execute_batch("PRAGMA cipher_memory_security = ON; PRAGMA temp_store = MEMORY; PRAGMA query_only = ON;").map_err(classify)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(classify)?;
+        validate_existing_registry(&transaction)?;
+        transaction.commit().map_err(classify)?;
+        if existing_registry_files(&path)? != before {
+            return Err(RegistryError::Storage);
+        }
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
+
     /// Registered accounts in display order.
     ///
     /// # Errors
@@ -260,6 +308,137 @@ impl SqlCipherRegistry {
             .lock()
             .map_err(|_poison| RegistryError::Storage)
     }
+}
+
+// Identity-only snapshots deliberately exclude SHM contents and timestamps:
+// authenticated read-only WAL coordination may update its existing read marks.
+type RegistryFileIdentity = (u64, u64, u32, u32);
+type RegistryFiles = (
+    RegistryFileIdentity,
+    Option<RegistryFileIdentity>,
+    Option<RegistryFileIdentity>,
+    RegistryFileIdentity,
+);
+
+fn existing_registry_file(path: &Path) -> Result<RegistryFileIdentity, RegistryError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_error| RegistryError::Storage)?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(RegistryError::UnsafeLocation);
+    }
+    Ok((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.mode(),
+    ))
+}
+
+fn existing_registry_files(path: &Path) -> Result<RegistryFiles, RegistryError> {
+    let parent = fs::symlink_metadata(path.parent().ok_or(RegistryError::Storage)?)
+        .map_err(|_error| RegistryError::Storage)?;
+    if !parent.is_dir()
+        || parent.uid() != rustix::process::geteuid().as_raw()
+        || parent.mode() & 0o077 != 0
+    {
+        return Err(RegistryError::UnsafeLocation);
+    }
+    let main = existing_registry_file(path)?;
+    if fs::metadata(path)
+        .map_err(|_error| RegistryError::Storage)?
+        .len()
+        == 0
+    {
+        return Err(RegistryError::Corrupted);
+    }
+    let sidecar = |suffix: &str| -> Result<Option<RegistryFileIdentity>, RegistryError> {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let path = Path::new(&name);
+        match fs::symlink_metadata(path) {
+            Ok(_) => existing_registry_file(path).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_error) => Err(RegistryError::Storage),
+        }
+    };
+    // Refuse journal recovery or creation of a missing WAL coordination leaf.
+    if sidecar("-journal")?.is_some() {
+        return Err(RegistryError::Storage);
+    }
+    let wal = sidecar("-wal")?;
+    let shm = sidecar("-shm")?;
+    if wal.is_some() != shm.is_some() {
+        return Err(RegistryError::Storage);
+    }
+    Ok((
+        main,
+        wal,
+        shm,
+        (parent.dev(), parent.ino(), parent.uid(), parent.mode()),
+    ))
+}
+
+fn validate_existing_registry(connection: &Connection) -> Result<(), RegistryError> {
+    let application: i64 = connection
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .map_err(classify)?;
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(classify)?;
+    if application != APPLICATION_ID || version != VERSION {
+        return Err(RegistryError::Corrupted);
+    }
+    // The canonical schema has one short statement. Bound unknown schema/row
+    // materialization before accepting an authenticated but foreign database.
+    let mut statement = connection.prepare("SELECT CASE WHEN typeof(sql) = 'text' AND length(CAST(sql AS BLOB)) <= 16384 THEN sql END FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name LIMIT 2").map_err(classify)?;
+    let objects = statement
+        .query_map([], |row| row.get::<_, Option<String>>(0))
+        .map_err(classify)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(classify)?;
+    if objects.len() != 1
+        || objects[0].as_deref().map(normalize).as_deref() != Some(normalize(SCHEMA).as_str())
+    {
+        return Err(RegistryError::Corrupted);
+    }
+    let mut statement = connection.prepare("SELECT CASE WHEN typeof(account_id) = 'text' AND length(CAST(account_id AS BLOB)) BETWEEN 1 AND 256 THEN account_id END, CASE WHEN typeof(dedup_tag) = 'blob' AND length(dedup_tag) = 32 THEN 1 ELSE 0 END, CASE WHEN typeof(position) = 'integer' AND position >= 0 THEN position END FROM registry_accounts ORDER BY position ASC LIMIT ?1").map_err(classify)?;
+    let rows = statement
+        .query_map(
+            [i64::try_from(MAX_ACCOUNTS + 1).map_err(|_error| RegistryError::Corrupted)?],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .map_err(classify)?;
+    let mut count = 0;
+    for row in rows {
+        let (account, valid_tag, position) = row.map_err(classify)?;
+        let account = account.ok_or(RegistryError::Corrupted)?;
+        if AccountId::new(account).is_err() || valid_tag != 1 || position.is_none() {
+            return Err(RegistryError::Corrupted);
+        }
+        count += 1;
+        if count > MAX_ACCOUNTS {
+            return Err(RegistryError::Corrupted);
+        }
+    }
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(classify)?;
+    let cipher_failure = connection
+        .prepare("PRAGMA cipher_integrity_check")
+        .and_then(|mut statement| statement.query([])?.next().map(|row| row.is_some()))
+        .map_err(classify)?;
+    if integrity != "ok" || cipher_failure {
+        return Err(RegistryError::Corrupted);
+    }
+    Ok(())
 }
 
 fn schema(connection: &Connection) -> Result<Vec<String>, RegistryError> {
@@ -423,5 +602,224 @@ mod tests {
         let dir = TempDir::new("debug");
         let registry = SqlCipherRegistry::open(&dir.database(), &key(1)).expect("open");
         assert_eq!(format!("{registry:?}"), "SqlCipherRegistry([REDACTED])");
+    }
+
+    fn snapshot(dir: &TempDir) -> Vec<(PathBuf, Vec<u8>, u32)> {
+        let mut files: Vec<_> = fs::read_dir(&dir.0)
+            .expect("directory")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.is_file())
+            .map(|path| {
+                let bytes = fs::read(&path).expect("bytes");
+                let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+                (path, bytes, mode)
+            })
+            .collect();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+    fn raw(dir: &TempDir) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open(dir.database()).expect("fixture connection");
+        crate::store::apply_key(&connection, &key(1)).expect("fixture key");
+        connection
+    }
+
+    #[test]
+    fn existing_registry_is_authenticated_readonly_and_preserves_dedup_order() {
+        let dir = TempDir::new("existing-readonly");
+        let writer = SqlCipherRegistry::open(&dir.database(), &key(1)).expect("bootstrap");
+        writer.register(&account(2), &tag(2)).expect("register");
+        writer.register(&account(1), &tag(1)).expect("register");
+        drop(writer);
+        let before = snapshot(&dir);
+        let reader = SqlCipherRegistry::open_existing(&dir.database(), &key(1)).expect("existing");
+        assert_eq!(
+            reader.accounts().expect("accounts"),
+            [account(2), account(1)]
+        );
+        assert_eq!(
+            reader.find_by_tag(&tag(1)).expect("dedup"),
+            Some(account(1))
+        );
+        assert_eq!(reader.find_by_tag(&tag(9)).expect("missing tag"), None);
+        assert!(reader.register(&account(3), &tag(3)).is_err());
+        assert!(reader.remove(&account(2)).is_err());
+        assert_eq!(format!("{reader:?}"), "SqlCipherRegistry([REDACTED])");
+        drop(reader);
+        assert_eq!(snapshot(&dir), before);
+        let writer = SqlCipherRegistry::open(&dir.database(), &key(1)).expect("writer unchanged");
+        writer
+            .register(&account(3), &tag(3))
+            .expect("writer still writes");
+    }
+
+    #[test]
+    fn existing_registry_missing_file_or_parent_creates_nothing() {
+        let dir = TempDir::new("existing-missing");
+        for path in [
+            dir.database(),
+            dir.0.join("missing-parent").join("registry.sqlite3"),
+        ] {
+            assert!(matches!(
+                SqlCipherRegistry::open_existing(&path, &key(1)),
+                Err(RegistryError::Storage)
+            ));
+            assert!(!path.exists());
+        }
+        assert!(fs::read_dir(&dir.0).expect("directory").next().is_none());
+    }
+
+    #[test]
+    fn existing_registry_never_claims_zero_or_encrypted_unclaimed_files() {
+        for encrypted in [false, true] {
+            let dir = TempDir::new("existing-unclaimed");
+            if encrypted {
+                let connection = raw(&dir);
+                connection
+                    .execute_batch("PRAGMA user_version = 0;")
+                    .expect("unclaimed");
+            } else {
+                fs::write(dir.database(), b"").expect("empty file");
+            }
+            fs::set_permissions(dir.database(), fs::Permissions::from_mode(0o600)).expect("mode");
+            let before = snapshot(&dir);
+            assert!(matches!(
+                SqlCipherRegistry::open_existing(&dir.database(), &key(1)),
+                Err(RegistryError::Corrupted)
+            ));
+            assert_eq!(snapshot(&dir), before);
+            let writer = SqlCipherRegistry::open(&dir.database(), &key(1))
+                .expect("ordinary bootstrap unchanged");
+            writer
+                .register(&account(1), &tag(1))
+                .expect("initialized normally");
+        }
+    }
+
+    #[test]
+    fn existing_registry_rejects_key_markers_schema_and_rows_without_writes() {
+        for fault in 0..7 {
+            let dir = TempDir::new("existing-invalid");
+            let writer = SqlCipherRegistry::open(&dir.database(), &key(1)).expect("writer");
+            writer.register(&account(1), &tag(1)).expect("account");
+            drop(writer);
+            if fault > 0 {
+                let connection = raw(&dir);
+                let sql = match fault {
+                    1 => "PRAGMA application_id = 1;",
+                    2 => "PRAGMA user_version = 999;",
+                    3 => "CREATE TABLE future_object (value TEXT);",
+                    4 => "UPDATE registry_accounts SET account_id = 'bad@example.test';",
+                    5 => {
+                        "PRAGMA ignore_check_constraints = ON; UPDATE registry_accounts SET dedup_tag = X'00';"
+                    }
+                    _ => {
+                        "PRAGMA ignore_check_constraints = ON; UPDATE registry_accounts SET position = -1;"
+                    }
+                };
+                connection.execute_batch(sql).expect("fault fixture");
+            }
+            let before = snapshot(&dir);
+            assert!(matches!(
+                SqlCipherRegistry::open_existing(
+                    &dir.database(),
+                    &key(if fault == 0 { 2 } else { 1 })
+                ),
+                Err(RegistryError::Corrupted)
+            ));
+            assert_eq!(snapshot(&dir), before, "fault {fault}");
+        }
+    }
+
+    #[test]
+    fn existing_registry_does_not_repair_permissions_or_follow_a_leaf_symlink() {
+        let dir = TempDir::new("existing-permissions");
+        drop(SqlCipherRegistry::open(&dir.database(), &key(1)).expect("writer"));
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755)).expect("parent mode");
+        let before = snapshot(&dir);
+        assert!(matches!(
+            SqlCipherRegistry::open_existing(&dir.database(), &key(1)),
+            Err(RegistryError::UnsafeLocation)
+        ));
+        assert_eq!(
+            fs::metadata(&dir.0).expect("parent").permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(snapshot(&dir), before);
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o700)).expect("restore parent");
+        fs::set_permissions(dir.database(), fs::Permissions::from_mode(0o644)).expect("file mode");
+        let before = snapshot(&dir);
+        assert!(matches!(
+            SqlCipherRegistry::open_existing(&dir.database(), &key(1)),
+            Err(RegistryError::UnsafeLocation)
+        ));
+        assert_eq!(snapshot(&dir), before);
+        drop(
+            SqlCipherRegistry::open(&dir.database(), &key(1))
+                .expect("ordinary writer can normalize its file"),
+        );
+        assert_eq!(
+            fs::metadata(dir.database())
+                .expect("file")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let link = dir.0.join("linked.sqlite3");
+        std::os::unix::fs::symlink(dir.database(), &link).expect("symlink");
+        assert!(matches!(
+            SqlCipherRegistry::open_existing(&link, &key(1)),
+            Err(RegistryError::UnsafeLocation)
+        ));
+        assert!(
+            fs::symlink_metadata(link)
+                .expect("link remains")
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn existing_registry_reads_committed_wal_without_checkpoint_or_database_changes() {
+        let dir = TempDir::new("existing-wal");
+        drop(SqlCipherRegistry::open(&dir.database(), &key(1)).expect("bootstrap"));
+        let anchor = raw(&dir);
+        anchor
+            .execute_batch("PRAGMA journal_mode = WAL;")
+            .expect("WAL");
+        crate::store::set_and_verify_persistent_wal(&anchor).expect("persistent");
+        anchor
+            .execute(
+                "INSERT INTO registry_accounts VALUES (?1, ?2, 0)",
+                rusqlite::params![account(1).as_str(), &tag(1)[..]],
+            )
+            .expect("WAL commit");
+        let wal = PathBuf::from(format!("{}-wal", dir.database().display()));
+        let shm = PathBuf::from(format!("{}-shm", dir.database().display()));
+        for path in [&wal, &shm] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("mode");
+        }
+        crate::store::disable_and_verify_checkpoint_on_close(&anchor)
+            .expect("fixture keeps committed WAL on close");
+        drop(anchor); // Read-only constructor is now the sole connection.
+        let main_before = fs::read(dir.database()).expect("main");
+        let wal_before = fs::read(&wal).expect("wal");
+        let reader = SqlCipherRegistry::open_existing(&dir.database(), &key(1)).expect("read WAL");
+        assert_eq!(reader.accounts().expect("accounts"), [account(1)]);
+        assert_eq!(
+            reader.find_by_tag(&tag(1)).expect("dedup"),
+            Some(account(1))
+        );
+        drop(reader);
+        assert_eq!(fs::read(dir.database()).expect("main"), main_before);
+        assert_eq!(fs::read(wal).expect("wal"), wal_before);
+        // SHM read marks are allowed bookkeeping; removing it must not cause
+        // this opener to recreate it or claim a different database.
+        fs::remove_file(&shm).expect("missing coordination");
+        assert!(matches!(
+            SqlCipherRegistry::open_existing(&dir.database(), &key(1)),
+            Err(RegistryError::Storage)
+        ));
+        assert!(!shm.exists());
     }
 }
