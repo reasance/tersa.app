@@ -19,6 +19,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::cache_reset::CacheResetPreconditionError;
 use sha2::{Digest, Sha256};
 use tersa_application::identity::{AccountIdentityHasher, HasherError, IdentityHash};
 use tersa_application::mailbox::{AccountEmail, AccountId, MailboxStoreError};
@@ -27,7 +28,7 @@ use tersa_keys::{
     derive_account_key, derive_installation_key, registry_dedup_tag,
 };
 use tersa_store_sqlcipher::registry::{MAX_ACCOUNTS, RegistryError, SqlCipherRegistry};
-use tersa_store_sqlcipher::{DatabaseKey, IntegrityScan, SqlCipherMailboxStore};
+use tersa_store_sqlcipher::{CacheResetError, DatabaseKey, IntegrityScan, SqlCipherMailboxStore};
 use tersa_token_broker_core::{RefreshTokenStore, RefreshTokenStoreError, ValidatedSubject};
 use zeroize::Zeroizing;
 
@@ -248,6 +249,72 @@ impl Installation {
             return Err(InstallationError::UnknownAccount);
         }
         self.open_store_unchecked(account)
+    }
+
+    /// Existing-only maintenance. No ordinary opener, directory provisioning,
+    /// registry mutation or credential clearing is permitted in this phase.
+    pub(crate) fn clear_cache_for_reset(
+        &self,
+        account: &AccountId,
+    ) -> Result<(), CacheResetPreconditionError> {
+        use CacheResetPreconditionError as Failure;
+        if !self
+            .accounts()
+            .map_err(|_error| Failure::Installation)?
+            .contains(account)
+        {
+            return Err(Failure::UnknownAccount);
+        }
+        let directory = self.account_dir(account);
+        for path in [
+            &self.data_dir,
+            &self.data_dir.join(ACCOUNTS_DIR),
+            &directory,
+        ] {
+            let metadata = fs::symlink_metadata(path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Failure::Store(CacheResetError::Ineligible)
+                } else {
+                    Failure::Installation
+                }
+            })?;
+            if !metadata.is_dir()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.mode() & 0o7777 != 0o700
+            {
+                return Err(Failure::Installation);
+            }
+        }
+        let key = derive_account_key(&self.root, account, AccountKeyPurpose::SqlCipherDatabaseV1)
+            .map_err(|_error| Failure::Installation)?;
+        let store = SqlCipherMailboxStore::open_existing_for_cache_reset(
+            account.clone(),
+            directory.join(MAIL_FILE),
+            DatabaseKey::from_zeroizing(key.into_bytes()),
+        )
+        .map_err(Failure::Store)?;
+        let subject = store
+            .load_broker_subject(account)
+            .map_err(|error| Failure::Store(error.into()))?
+            .ok_or(Failure::Store(CacheResetError::Ineligible))?;
+        if self
+            .account_for_subject(subject.as_str())
+            .map_err(|_error| Failure::Installation)?
+            .as_ref()
+            != Some(account)
+        {
+            return Err(Failure::Store(CacheResetError::Corrupted));
+        }
+        drop(subject);
+        store.clear_cached_mail(account).map_err(Failure::Store)?;
+        // This explicit owning drop precedes return to the async sync delegate.
+        drop(store);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_path_for_test(&self, account: &AccountId) -> PathBuf {
+        self.account_dir(account).join(MAIL_FILE)
     }
 
     /// Opens a registered account's store without the integrity scan, for

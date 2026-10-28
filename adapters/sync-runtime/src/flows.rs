@@ -18,6 +18,7 @@ use tersa_gmail_rest::GmailTokenTransport;
 use tersa_token_broker_core::{BrokerCore, BrokerError, BrokerToken, GetRandomEntropy};
 use zeroize::Zeroizing;
 
+use crate::cache_reset::{CacheResetOutcome, CacheResetPreconditionError, reset_cache_using};
 use crate::gate::{GatedFetchError, GatedSyncError, gated_fetch, gated_sync};
 use crate::installation::{
     Installation, InstallationError, InstallationHasher, InstallationTokens,
@@ -265,6 +266,48 @@ impl Runtime {
     pub async fn sync_account(&self, account: &AccountId) -> Result<SyncReport, FlowError> {
         self.with_session(account, |session| self.sync_with_session(account, session))
             .await
+    }
+
+    /// Clears one existing cache, closes its connection, then syncs that account.
+    ///
+    /// Requires a configured runtime, a caller-held installation lock for the
+    /// WHOLE operation, and no concurrent UI/worker/store work for this
+    /// installation, including work through other runtimes or cloned handles.
+    /// The exclusive receiver prevents overlap through this runtime. Cached
+    /// sessions contain HTTP/token state, not account-store connections.
+    ///
+    /// Clear itself preserves credentials/identity/recovery. Resync is exactly
+    /// [`Self::sync_account`], with its existing identity gate and recent-mail
+    /// policy. Normal broker behavior may rotate credentials or delete a revoked
+    /// refresh token; this operation neither revokes nor restores a grant.
+    ///
+    /// Dropping an unpolled future changes nothing. Once clear commits, dropping
+    /// during sync leaves that committed clear (and any normal sync progress)
+    /// in place. No SQL transaction or clear connection spans the network wait.
+    ///
+    /// Exclusive access is checked by Rust, not a new maintenance permit:
+    ///
+    /// ```compile_fail
+    /// use tersa_sync_runtime::Runtime;
+    /// use tersa_application::mailbox::AccountId;
+    /// async fn overlap(runtime: &mut Runtime, account: &AccountId) {
+    ///     let sync = runtime.sync_account(account);
+    ///     let reset = runtime.reset_cache(account);
+    ///     sync.await;
+    ///     reset.await;
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// An error means pre-clear refusal, with no cache deletion. After commit,
+    /// sync errors are returned as `Ok(CacheResetOutcome::ResyncFailed(_))`.
+    /// Configuration errors are rejected by [`Runtime::new`] before this API.
+    pub async fn reset_cache<'a>(
+        &'a mut self,
+        account: &'a AccountId,
+    ) -> Result<CacheResetOutcome, CacheResetPreconditionError> {
+        reset_cache_using(self, account, Self::sync_account).await
     }
 
     /// Runs `work` with the account's session; see [`retry_rejected`].
