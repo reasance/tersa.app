@@ -13,9 +13,16 @@ one at https://mozilla.org/MPL/2.0/.
 ## Implementation status
 
 Accepted design for T3, amended for the terminal architecture by ADR 0031.
-Opaque account IDs, purpose-separated keys, and an encrypted registry exist in
-source. Unified queries, capability upgrade, reset/quarantine, and account-local
-FTS described below remain plans; this ADR does not certify their completion.
+Opaque account IDs, purpose-separated keys, the encrypted registry, and the
+bounded application-layer unified query are implemented. The TUI has an All
+accounts inbox, single-account views, independent account sync/status and
+confirmed cache-only reset. Automated tests cover these source paths.
+
+Two-real-account macOS isolation and offline acceptance remain pending.
+Capability upgrade, account-local FTS, drafts/outbox, app lock, and the
+incompatible-schema/new-ID/quarantine protocol below remain planned. Delivered
+source does not certify completion of T3 or this entire accepted design. The
+remaining sections record the accepted design, including deferred contracts.
 
 ## Context
 
@@ -106,8 +113,40 @@ content-free recovery entry and is not shown as a clean removal. If the removed
 account was selected, the registry selects its next ordered account or no
 account when none remain.
 
-A planned incompatible schema reset requires explicit user confirmation and a
-new opaque account ID/consent flow; it is not an automatic migration. Under the
+The implemented `tersa account reset <account> [--yes]` is cache-only
+maintenance for an existing supported account. It resolves an exact ID,
+unambiguous prefix or stored address, refusing unknown/ambiguous inputs and
+unreadable peers during address matching. Before confirmation it takes
+`InstallationLock::acquire_existing`, unlocks only an existing root, opens
+`Installation::open_existing` with a readonly registry and reads addresses
+through `account_email_existing`. Missing, unclaimed or unsafe state is refused
+without provisioning or permission repair. Only a private coordination lock
+leaf may be created; native bookkeeping in existing SQLite SHM is allowed.
+
+The interactive prompt shows the sanitized stored address when available,
+plus the opaque account ID; v1/null-address prompts show only the ID. It requires
+a completed `yes` line. Non-TTY input requires `--yes`; this skips only
+confirmation. The same lock and `Arc<Installation>` are retained through
+`Runtime::reset_cache`, without a writable-registry reopen, key export or
+second root unlock. This installation is not universally read-only: generic
+store openers remain create-capable and are excluded from preview. The runtime
+must complete its existing-only clear before normal sync opens an account
+writer.
+
+In one account-local transaction, the clear deletes cached envelopes/bodies and
+nulls freshness while preserving identity, subject, refresh token, stored
+address, recovery state, registry and keys. Missing credentials/identity or
+pending disconnect recovery refuse the clear. After commit the clear connection
+is dropped before normal identity-gated recent-mail sync (four pages of 25,
+keep 100 envelopes, cache up to 25 bodies). That sync retains normal token
+rotation and revoked-token deletion. A pre-clear error leaves cached mail
+intact; a post-clear sync failure exits nonzero and reports the committed clear
+and possible partial new cache. No full restoration, secure erasure,
+incompatible-schema repair or continued authorization is guaranteed.
+
+The separate **planned incompatible-schema reset** requires explicit user
+confirmation and a new opaque account ID/consent flow; it is not an automatic
+migration and is not implemented by the cache command. Under the
 owning application lock, inspect old state without a write-open or migration,
 then quarantine the fixed legacy directory using descriptor-relative no-follow
 identity checks and an exclusive no-replace rename. An occupied destination,
@@ -126,11 +165,20 @@ ASC`, and returns bounded per-account continuations for the next page. It never
 issues an `N * 10,000` fan-out payload. Threads, drafts, actions, and settings
 remain account-scoped even when the inbox is unified.
 
+The delivered TUI cycles All/single-account views with Tab / Shift-Tab. A real
+view change clears search, returns to the inbox and starts a fresh scoped query;
+late results from the previous view cannot replace it. Ctrl-R syncs the selected
+view; automatic startup/periodic scheduling continues for all accounts using
+independent account workers and status. Current search filters loaded sanitized
+rows in memory, not an FTS index. Store failures stay unavailable for their
+continuation chain; a fresh query can retry them.
+
 When unlocked, an account-local failure produces
 `UnavailableAccount { account_id, state }`, where `state` is only
 `AuthorizationRequired` or `StoreUnavailable`; it contributes no rows. The
 document may show available-account rows plus these opaque availability states.
-When app lock is active, all stores are closed and `UnifiedMailboxQuery` returns
+App-lock activation and store closure remain planned. Its required behavior is:
+when app lock is active, all stores are closed and `UnifiedMailboxQuery` returns
 only the top-level `Locked` state without account identity: it performs no
 fan-out and displays no partial rows. After unlock, it restarts the query from
 its supplied continuation rather than reusing a locked in-memory result.
@@ -161,7 +209,8 @@ Terminal account intent (opaque AccountId)
 - The broker returns only an access token and validated subject for the selected
   account. Refresh-token persistence remains broker-only.
 - A unified view is a capped, paginated merge of isolated account results. It
-  has no cross-account mailbox transaction, cache, FTS table, or worker.
+  has no shared persistent mailbox cache, cross-account transaction or FTS table;
+  background sync workers remain account-local.
 - Terminal models carry bounded, sanitized data and opaque account routing;
   keys, store handles, tokens, and raw subjects never become display values.
 
@@ -195,30 +244,39 @@ fan-out work and returns no partial durable mutation.
 
 ## Test and evidence gates
 
-- Domain and application tests cover ID generation/validation, five-account cap,
-  private dedup-tag equality, paginated 200-row merge, continuation bounds,
-  unavailable/locked semantics, and no raw subject in preferences/documents.
-- Registry/store/key tests cover registry SQLCipher tag residency,
-  registry-purpose framing, v2 schema and compile-proven FTS isolation,
-  absent-root enumeration, no-write legacy detection, quarantine identity drift
-  preservation, and the later bounded purge contract.
-- Runtime/TUI tests cover private subject handling, opaque routing, sanitized
-  output, account switching, and retained setup/teardown recovery.
-- Candidate-specific manual evidence must exercise add, switch, remove, offline
-  reopen, locked unified inbox, and 200-row continuation with accessibility checks.
-  Local source tests do not establish live consent or release readiness.
+- Delivered automated coverage exercises the five-account cap, registry/key
+  purpose separation, dedup tags, 200-row application queries, deterministic
+  continuation, unavailable/locked query results and exact account/message
+  routing. Query-level locked results do not implement the app-lock feature.
+- Runtime/TUI coverage exercises independent workers, scoped views/manual sync,
+  stale results, sanitized output and owned shutdown. Cache-reset tests cover
+  readonly preview, no-create refusal, transaction boundaries, same-account
+  dispatch and pre-clear versus post-clear failure reporting with isolated
+  stores and local provider seams.
+- Pending T3 manual evidence must exercise two real accounts on macOS: add,
+  All/single-account switch, independent sync, remove, offline reopen and
+  account isolation. Local fixtures, source tests and CI do not establish this
+  acceptance gate, live consent or release readiness.
+- Deferred capability upgrade, FTS, quarantine/bounded purge and app-lock
+  behavior need separate implementation/evidence gates: target-specific FTS5
+  compile options and account-local schema ownership; no-write legacy detection
+  and quarantine identity-drift preservation; bounded purge; locked store
+  closure and unified inbox; accessibility checks.
 
 ## Non-claims
 
-This accepted design is not a completion claim for T3, FTS, quarantine, app
-lock, live consent, performance, or release validation. It adds no account-sharing
-backend, cross-account labels/threads, automatic legacy migration, or recursive
-legacy deletion. The same-install equality/residency oracle remains explicit.
+Delivered source and automated coverage are not a completion claim for T3's
+manual acceptance, FTS, quarantine, app lock, live consent, performance or
+release validation. It adds no account-sharing backend, cross-account
+labels/threads, automatic legacy migration, or recursive legacy deletion. The
+same-install equality/residency oracle remains explicit.
 
 ## Consequences
 
-If the prerequisites are independently accepted and implemented, the beta gains
-a capped, page-bounded account boundary before mailbox mutation, draft, outbox,
-blob, or rich-content work. It preserves legacy data in a verified quarantine
-rather than claiming deletion safety, and it makes the registry's narrow
-cross-account equality linkage explicit.
+The delivered registry and query provide a capped, page-bounded account
+boundary before future mailbox mutation, draft, outbox, blob or rich-content
+work. The cache-only command preserves account setup while following ordinary
+sync credential rules. Future incompatible-schema recovery must preserve
+legacy data under the reviewed quarantine protocol; that protocol is not yet
+implemented. The registry's narrow cross-account equality linkage remains
+explicit.
