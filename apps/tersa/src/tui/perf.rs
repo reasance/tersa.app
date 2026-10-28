@@ -444,7 +444,7 @@ fn perf_five_account_budgets() {
 
     // The merged first frame opens every store, reads one page from each,
     // and draws, against the same budget as one account.
-    let (first_frame, first_frame_slowest, (mut app, _workers)) = timed(5, || {
+    let (first_frame, first_frame_slowest, (mut app, mut workers)) = timed(5, || {
         let fresh = fixture.source();
         let mut app = super::initial_app(&fresh).unwrap();
         let workers = idle_workers(&mut app, false);
@@ -484,6 +484,27 @@ fn perf_five_account_budgets() {
         &format!("slowest page of {PAGE} across {ACCOUNTS} accounts"),
         slowest_page,
     );
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    let mut slowest_switch = Duration::ZERO;
+    for _ in 0..5 {
+        for scope in [
+            super::ViewScope::Account(multi_account(0)),
+            super::ViewScope::Account(multi_account(1)),
+            super::ViewScope::All,
+        ] {
+            let start = Instant::now();
+            super::change_view(&mut app, &warm, &mut workers, scope).unwrap();
+            terminal
+                .draw(|frame| view::draw(frame, &mut app, 1_761_000_000_000))
+                .unwrap();
+            slowest_switch = slowest_switch.max(start.elapsed());
+        }
+    }
+    report(
+        "slowest All/account view change (fresh global 100 / probes <=101, draw)",
+        slowest_switch,
+    );
+    check(slowest_switch, FIRST_FRAME, "view-change first frame");
     let rss = idle_rss(&fixture.directory, true);
     println!(
         "idle RSS with five workers and total 10,000 rows: {rss:.1} MiB (budget {IDLE_RSS_MIB} MiB)"

@@ -40,8 +40,7 @@ fn bold() -> Style {
 /// Draws the whole interface.
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, now_millis: i64) {
     let failure_count = app
-        .sync
-        .iter()
+        .visible_sync()
         .filter(|sync| matches!(sync.state, SyncState::Failed(_)))
         .count();
     let [top, failures, main, bottom] = Layout::vertical([
@@ -94,26 +93,24 @@ fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
         1 => format!("{count} (1 account unavailable)"),
         unavailable => format!("{count} ({unavailable} accounts unavailable)"),
     };
-    let sync = if app.sync.len() == 1 {
-        match &app.sync[0].state {
+    let visible: Vec<_> = app.visible_sync().collect();
+    let sync = if visible.len() == 1 {
+        match &visible[0].state {
             SyncState::Idle => String::new(),
             SyncState::Running => "syncing… ".to_owned(),
             SyncState::Synced(at) => format!("synced {} ", dates::short(*at, now_millis)),
             SyncState::Failed(_) => "sync failed ".to_owned(),
         }
     } else {
-        let running = app
-            .sync
+        let running = visible
             .iter()
             .filter(|sync| sync.state == SyncState::Running)
             .count();
-        let succeeded = app
-            .sync
+        let succeeded = visible
             .iter()
             .filter(|sync| matches!(sync.state, SyncState::Synced(_)))
             .count();
-        let failed = app
-            .sync
+        let failed = visible
             .iter()
             .filter(|sync| matches!(sync.state, SyncState::Failed(_)))
             .count();
@@ -152,8 +149,7 @@ fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
 /// Errors stay account-specific and visible after transient notices clear.
 fn draw_failures(frame: &mut Frame<'_>, area: Rect, app: &App, now: i64) {
     let lines: Vec<_> = app
-        .sync
-        .iter()
+        .visible_sync()
         .filter_map(|sync| {
             let SyncState::Failed(error) = &sync.state else {
                 return None;
@@ -262,7 +258,7 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
     }
     let total = usize::from(area.width);
     // With one account the rows carry no tag: the bar already names it.
-    let tagged = app.accounts.len() > 1;
+    let tagged = app.accounts.len() > 1 && matches!(app.scope, super::ViewScope::All);
     let lines: Vec<Line<'_>> = (app.list_offset..app.shown.len())
         .take(usize::from(area.height))
         .filter_map(|position| Some((position, app.shown_row(position)?)))
@@ -546,7 +542,9 @@ fn human_size(bytes: usize) -> String {
     format!("{value} {}", UNITS[unit])
 }
 
-const HELP: [(&str, &str); 15] = [
+const HELP: [(&str, &str); 17] = [
+    ("tab / shift-tab", "All/account views (2+)"),
+    ("", "Switch: inbox; clear search"),
     ("j / k, ↓ / ↑", "move or scroll"),
     ("gg / G", "first / last"),
     ("ctrl-d / ctrl-u", "half page down / up"),
@@ -554,7 +552,7 @@ const HELP: [(&str, &str); 15] = [
     ("enter, l", "open message"),
     ("/", "search sender, subject, preview"),
     ("esc", "show every message again"),
-    ("ctrl-r", "sync now (also every 5 minutes)"),
+    ("ctrl-r", "sync view (auto all: 5 min)"),
     ("n / p", "next / previous message"),
     ("H", "switch HTML / plain text"),
     ("q, h, esc", "back"),
@@ -706,7 +704,7 @@ mod tests {
         );
         let lines = screen(&mut app, 90, 5);
         assert!(
-            lines[0].starts_with(" tersa  2 accounts  ·  2 messages"),
+            lines[0].starts_with(" tersa  All accounts (2)  ·  2 messages"),
             "{lines:?}"
         );
         assert!(
@@ -1068,5 +1066,60 @@ Content-Disposition: attachment; filename=\"\u{1b}[2Jevil\u{202e}fdp.exe\"\r\n\r
         app.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         app.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
         assert!(screen(&mut app, 40, 12)[1].contains("long"));
+    }
+
+    #[test]
+    fn single_scope_labels_status_and_help_are_sanitized_and_unambiguous() {
+        let labels = vec![
+            (
+                account("acct_a"),
+                SafeText::single_line("same@example.org\u{1b}\u{202e}"),
+            ),
+            (account("acct_b"), SafeText::single_line("same@example.net")),
+        ];
+        let mut app = App::new(labels, Vec::new());
+        app.synced(
+            &account("acct_a"),
+            Err("failed A\u{1b}\u{202e}".to_owned()),
+            0,
+            None,
+        );
+        app.synced(&account("acct_b"), Ok(()), 1_761_000_000_000, None);
+        app.set_scope(super::super::ViewScope::Account(account("acct_b")))
+            .expect("B");
+        app.append(vec![Row::sample(
+            "acct_b",
+            "same",
+            "Bob",
+            "B subject",
+            false,
+        )]);
+        let lines = screen(&mut app, 100, 8);
+        assert!(
+            lines[0].contains("Account #2: same@example.net"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("synced"));
+        assert!(!lines.join("\n").contains("failed A"));
+        assert!(lines[1].contains("B subject"));
+        assert!(
+            !lines[1].contains("#2"),
+            "single view does not repeat an account tag on each row"
+        );
+        app.show_message(key("acct_b", "same"), Ok(None));
+        let lines = screen(&mut app, 100, 10);
+        assert!(lines.join("\n").contains("Account: same@example.net"));
+        assert_no_controls(&lines);
+        app.set_scope(super::super::ViewScope::Account(account("acct_a")))
+            .expect("A");
+        let lines = screen(&mut app, 100, 8);
+        assert!(lines[0].contains("Account #1: same@example.org"));
+        assert!(lines.join("\n").contains("failed A"));
+        assert_no_controls(&lines);
+        app.help = true;
+        let help = screen(&mut app, 100, 28).join("\n");
+        assert!(help.contains("tab / shift-tab"));
+        assert!(help.contains("inbox; clear search"));
+        assert!(help.contains("sync view (auto all: 5 min)"));
     }
 }

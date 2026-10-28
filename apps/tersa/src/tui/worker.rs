@@ -9,7 +9,7 @@
 //! The UI admits one sync per account and at most eight unsettled fetch jobs;
 //! completed-but-unconsumed events count against that same admission bound.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
@@ -29,13 +29,13 @@ const MAX_FETCHES: usize = 8;
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 
 enum Job {
-    Fetch(MessageKey),
+    Fetch(MessageKey, u64),
     Sync,
 }
 
 pub(super) enum Done {
-    Fetched(MessageKey, Result<Vec<u8>, String>),
-    Skipped(MessageKey),
+    Fetched(MessageKey, Result<Vec<u8>, String>, u64),
+    Skipped(MessageKey, u64),
     Synced(AccountId, Result<(), String>),
 }
 
@@ -73,6 +73,13 @@ impl Workers {
         self.accounts.is_empty()
     }
 
+    /// Cancels only old-view downloads; automatic account sync stays active.
+    pub fn change_view(&self, epoch: u64) {
+        for worker in &self.accounts {
+            worker.view.send_replace(epoch);
+        }
+    }
+
     pub fn set_open(&self, key: Option<&MessageKey>) {
         for worker in &self.accounts {
             worker.set_open(key);
@@ -108,8 +115,9 @@ pub(super) struct Worker {
     pub account: AccountId,
     jobs: tokio::sync::mpsc::UnboundedSender<Job>,
     pub done: Receiver<Done>,
-    pub fetching: HashSet<MessageKey>,
+    pub fetching: HashMap<MessageKey, u64>,
     open: tokio::sync::watch::Sender<Option<MessageKey>>,
+    view: tokio::sync::watch::Sender<u64>,
     pub syncing: bool,
     /// Starts, not repeated/coalesced requests, advance the five-minute clock.
     last_sync: Option<(Instant, SystemTime)>,
@@ -124,6 +132,7 @@ impl Worker {
         let (jobs, mut incoming) = tokio::sync::mpsc::unbounded_channel::<Job>();
         let (outgoing, done) = mpsc::channel();
         let (open, wanted) = tokio::sync::watch::channel(None::<MessageKey>);
+        let (views, view) = tokio::sync::watch::channel(0_u64);
         let (shutdown, mut stopping) = tokio::sync::watch::channel(false);
         let (alive, stopped) = mpsc::channel::<()>();
         let own_account = account.clone();
@@ -133,7 +142,7 @@ impl Worker {
                 // Last local dropped: acknowledgement follows task, remote, store
                 // and executor cleanup. Only then may the UI join this thread.
                 let _alive = alive;
-                let (remote, outgoing, wanted) = (remote, outgoing, wanted);
+                let (remote, outgoing, wanted, view) = (remote, outgoing, wanted, view);
                 let Ok(executor) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -151,10 +160,13 @@ impl Worker {
                         let remote = Rc::clone(&remote);
                         let outgoing = outgoing.clone();
                         let wanted = wanted.clone();
+                        let view = view.clone();
                         let account = own_account.clone();
                         tokio::task::spawn_local(async move {
                             let finished = match job {
-                                Job::Fetch(key) => download(&*remote, wanted, key).await,
+                                Job::Fetch(key, epoch) => {
+                                    download(&*remote, wanted, view, key, epoch).await
+                                }
                                 Job::Sync => {
                                     let result = remote.sync(&account).await;
                                     Done::Synced(account, result)
@@ -174,8 +186,9 @@ impl Worker {
             account,
             jobs,
             done,
-            fetching: HashSet::new(),
+            fetching: HashMap::new(),
             open,
+            view: views,
             syncing: false,
             last_sync: None,
             dead: false,
@@ -203,17 +216,27 @@ impl Worker {
         if key.0 != self.account || self.dead {
             return false;
         }
-        if self.fetching.contains(key) {
+        if self.fetching.contains_key(key) {
             return true;
         }
         if self.fetching.len() >= MAX_FETCHES {
             return false;
         }
-        let sent = self.jobs.send(Job::Fetch(key.clone())).is_ok();
+        let epoch = *self.view.borrow();
+        let sent = self.jobs.send(Job::Fetch(key.clone(), epoch)).is_ok();
         if sent {
-            self.fetching.insert(key.clone());
+            self.fetching.insert(key.clone(), epoch);
         }
         sent
+    }
+
+    /// A stale completion cannot settle a newer same-key request.
+    pub fn finish_fetch(&mut self, key: &MessageKey, epoch: u64) -> bool {
+        if self.fetching.get(key) != Some(&epoch) {
+            return false;
+        }
+        self.fetching.remove(key);
+        true
     }
 
     pub fn sync_at(&mut self, monotonic: Instant, wall: SystemTime) -> bool {
@@ -316,8 +339,9 @@ impl Worker {
             jobs,
             done,
             syncing,
-            fetching,
+            fetching: fetching.into_iter().map(|key| (key, 0)).collect(),
             open: tokio::sync::watch::channel(None).0,
+            view: tokio::sync::watch::channel(0).0,
             last_sync: None,
             dead: false,
             shutdown: tokio::sync::watch::channel(false).0,
@@ -356,10 +380,15 @@ async fn until_stopped(stopping: &mut tokio::sync::watch::Receiver<bool>) {
 async fn download(
     remote: &dyn Remote,
     mut open: tokio::sync::watch::Receiver<Option<MessageKey>>,
+    mut view: tokio::sync::watch::Receiver<u64>,
     key: MessageKey,
+    epoch: u64,
 ) -> Done {
     let other_opened = async {
         loop {
+            if *view.borrow_and_update() != epoch {
+                break;
+            }
             if open
                 .borrow_and_update()
                 .as_ref()
@@ -367,14 +396,15 @@ async fn download(
             {
                 break;
             }
-            if open.changed().await.is_err() {
-                break;
+            match first(view.changed(), open.changed()).await {
+                First::Left(Err(_)) | First::Right(Err(_)) => break,
+                _ => {}
             }
         }
     };
     match first(other_opened, remote.fetch(&key.0, &key.1)).await {
-        First::Left(()) => Done::Skipped(key),
-        First::Right(result) => Done::Fetched(key, result),
+        First::Left(()) => Done::Skipped(key, epoch),
+        First::Right(result) => Done::Fetched(key, result, epoch),
     }
 }
 
@@ -480,7 +510,7 @@ mod tests {
         let mut synced = 0;
         for _ in 0..3 {
             match worker.done.recv_timeout(Duration::from_secs(5)) {
-                Ok(Done::Fetched(_, Ok(_))) => fetched += 1,
+                Ok(Done::Fetched(_, Ok(_), _)) => fetched += 1,
                 Ok(Done::Synced(_, Err(error))) if error == "offline" => synced += 1,
                 _ => panic!("unexpected result"),
             }
@@ -530,8 +560,8 @@ mod tests {
         let mut skipped = 0;
         for _ in 0..7 {
             match worker.done.recv_timeout(Duration::from_secs(5)) {
-                Ok(Done::Skipped(_)) => skipped += 1,
-                Ok(Done::Fetched(key, Ok(_))) => assert_eq!(key.1.as_str(), "now"),
+                Ok(Done::Skipped(_, _)) => skipped += 1,
+                Ok(Done::Fetched(key, Ok(_), _)) => assert_eq!(key.1.as_str(), "now"),
                 _ => panic!("unexpected result"),
             }
         }
@@ -593,8 +623,8 @@ mod tests {
         let mut results = Vec::new();
         for _ in 0..2 {
             match worker.done.recv_timeout(Duration::from_secs(5)) {
-                Ok(Done::Skipped(key)) => results.push(format!("skipped {}", key.1.as_str())),
-                Ok(Done::Fetched(key, Ok(_))) => {
+                Ok(Done::Skipped(key, _)) => results.push(format!("skipped {}", key.1.as_str())),
+                Ok(Done::Fetched(key, Ok(_), _)) => {
                     results.push(format!("fetched {}", key.1.as_str()));
                 }
                 _ => panic!("unexpected result"),
@@ -631,7 +661,7 @@ mod tests {
         gate.add_permits(1);
         assert!(matches!(
             worker.done.recv_timeout(Duration::from_secs(5)),
-            Ok(Done::Fetched(key, Ok(_))) if key.1.as_str() == "slow"
+            Ok(Done::Fetched(key, Ok(_), _)) if key.1.as_str() == "slow"
         ));
     }
 
@@ -671,11 +701,11 @@ mod tests {
             "start slow"
         );
         assert!(
-            matches!(workers.accounts[0].done.recv_timeout(Duration::from_secs(5)), Ok(Done::Skipped(key)) if key == old)
+            matches!(workers.accounts[0].done.recv_timeout(Duration::from_secs(5)), Ok(Done::Skipped(key, _)) if key == old)
         );
         gate.add_permits(1);
         assert!(
-            matches!(workers.accounts[1].done.recv_timeout(Duration::from_secs(5)), Ok(Done::Fetched(key, Ok(_))) if key == current)
+            matches!(workers.accounts[1].done.recv_timeout(Duration::from_secs(5)), Ok(Done::Fetched(key, Ok(_), _)) if key == current)
         );
         assert_eq!(
             entries
@@ -709,7 +739,7 @@ mod tests {
             let wanted = key(account_name, "m");
             assert!(workers.fetch(&wanted));
             assert!(
-                matches!(workers.accounts[index].done.recv_timeout(Duration::from_secs(5)), Ok(Done::Fetched(key, Ok(_))) if key == wanted)
+                matches!(workers.accounts[index].done.recv_timeout(Duration::from_secs(5)), Ok(Done::Fetched(key, Ok(_), _)) if key == wanted)
             );
             assert_eq!(
                 entries.recv_timeout(Duration::from_secs(5)).expect("route"),
@@ -866,7 +896,7 @@ mod tests {
         let wanted = key("acct_b", "same");
         assert!(workers.fetch(&wanted));
         assert!(
-            matches!(workers.accounts[1].done.recv_timeout(TEST_WAIT), Ok(Done::Fetched(key, Ok(raw))) if key == wanted && raw == b"acct_b/same")
+            matches!(workers.accounts[1].done.recv_timeout(TEST_WAIT), Ok(Done::Fetched(key, Ok(raw), _)) if key == wanted && raw == b"acct_b/same")
         );
         assert!(matches!(
             workers.accounts[0].done.try_recv(),
@@ -1293,5 +1323,35 @@ mod tests {
     #[test]
     fn actual_single_worker_drop_keeps_owner_and_lock_until_join() {
         assert_drop_retains_native_owner_and_lock(true);
+    }
+
+    #[test]
+    fn view_change_cancels_a_pending_fetch_before_a_late_release() {
+        let (log, entries) = mpsc::channel();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut workers = Workers::start(vec![(
+            account("acct_a"),
+            Box::new(Gated {
+                log,
+                gate: Arc::clone(&gate),
+            }),
+        )])
+        .expect("worker");
+        let wanted = key("acct_a", "slow");
+        assert!(workers.fetch(&wanted));
+        assert_eq!(
+            entries.recv_timeout(TEST_WAIT).expect("fetch starts"),
+            "start slow"
+        );
+        workers.change_view(1);
+        assert!(
+            matches!(workers.accounts[0].done.recv_timeout(TEST_WAIT), Ok(Done::Skipped(key, 0)) if key == wanted)
+        );
+        assert!(workers.accounts[0].finish_fetch(&wanted, 0));
+        gate.add_permits(1);
+        assert!(
+            matches!(entries.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "dropped old-view future cannot complete on late release"
+        );
     }
 }
