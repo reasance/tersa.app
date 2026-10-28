@@ -273,6 +273,56 @@ mod store {
             outcome.map_err(mailbox_open_error)
         }
 
+        /// Reads a validated address from an authenticated read-only account.
+        ///
+        /// Supported v1 has no email column and returns `None` without migration.
+        /// Current schema returns its validated address or SQL NULL. Ownership
+        /// and schema are rechecked in one read transaction, so invalid drift
+        /// cannot silently become `None`. Opening failures remain errors.
+        ///
+        /// # Errors
+        ///
+        /// Returns `Storage` for a wrong requested account or backend failure;
+        /// invalid schema, owner or email metadata returns `Corrupted`.
+        pub fn load_email_address(
+            &self,
+            account: &AccountId,
+        ) -> Result<Option<AccountEmail>, MailboxStoreError> {
+            self.checked_account(account)?;
+            let mut connection = self
+                .connection
+                .lock()
+                .map_err(|_poison| MailboxStoreError::Storage)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(store_error)?;
+            if validate_identity(&transaction, account).map_err(mailbox_open_error)? {
+                return Err(MailboxStoreError::Corrupted);
+            }
+            let version: i64 = transaction
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .map_err(store_error)?;
+            let email = if version == SCHEMA_VERSION_1 {
+                None
+            } else {
+                let (kind,value): (String,Option<String>) = transaction.query_row(
+                    "SELECT typeof(email_address), CASE WHEN typeof(email_address) = 'text' AND length(CAST(email_address AS BLOB)) <= ?1 THEN email_address END FROM account_binding WHERE singleton = 1",
+                    [i64::try_from(AccountEmail::MAX_LEN).map_err(|_error| MailboxStoreError::Corrupted)?],
+                    |row| Ok((row.get(0)?,row.get(1)?)),
+                ).map_err(|error| mailbox_open_error(classify_open(error)))?;
+                match kind.as_str() {
+                    "null" => None,
+                    "text" => Some(
+                        AccountEmail::new(value.ok_or(MailboxStoreError::Corrupted)?)
+                            .map_err(|_error| MailboxStoreError::Corrupted)?,
+                    ),
+                    _ => return Err(MailboxStoreError::Corrupted),
+                }
+            };
+            transaction.commit().map_err(store_error)?;
+            Ok(email)
+        }
+
         fn checked_account(&self, account: &AccountId) -> Result<(), MailboxStoreError> {
             (self.account == *account)
                 .then_some(())
@@ -2430,7 +2480,9 @@ mod store {
         Connection::open_with_flags(path, flags).map_err(|_error| OpenFailure::Storage)
     }
 
-    fn disable_and_verify_checkpoint_on_close(connection: &Connection) -> Result<(), OpenFailure> {
+    pub(super) fn disable_and_verify_checkpoint_on_close(
+        connection: &Connection,
+    ) -> Result<(), OpenFailure> {
         let config = DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE;
         if !connection
             .set_db_config(config, true)
@@ -2448,7 +2500,7 @@ mod store {
         unsafe_code,
         reason = "SQLite requires a mutable integer pointer for SQLITE_FCNTL_HAS_MOVED"
     )]
-    fn opened_file_has_moved(connection: &Connection) -> Result<(), OpenFailure> {
+    pub(super) fn opened_file_has_moved(connection: &Connection) -> Result<(), OpenFailure> {
         let mut has_moved = 0;
         // SAFETY: `connection.handle()` remains valid for this synchronous call;
         // `main` is a static NUL-terminated database name; and `has_moved` is a
@@ -3124,7 +3176,7 @@ mod store {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum OpenFailure {
+    pub(super) enum OpenFailure {
         Corrupted,
         Storage,
     }
@@ -3294,7 +3346,9 @@ mod store {
         }
     }
 
-    fn set_and_verify_persistent_wal(connection: &Connection) -> Result<(), OpenFailure> {
+    pub(super) fn set_and_verify_persistent_wal(
+        connection: &Connection,
+    ) -> Result<(), OpenFailure> {
         let mut enabled = 1;
         persistent_wal_control(connection, &mut enabled)?;
         let mut current = -1;
@@ -8181,6 +8235,148 @@ mod store {
             ] {
                 assert!(!text.contains(secret));
             }
+        }
+
+        #[test]
+        fn readonly_email_reads_current_address_and_null_without_mail_or_metadata_writes() {
+            let (database, writer) = open("readonly-email");
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            assert_eq!(reader.load_email_address(&account()), Ok(None));
+            let email = AccountEmail::new("preview@example.test").unwrap();
+            writer.store_email_address(&account(), &email).unwrap();
+            let before = reset_snapshot(&writer, true);
+            assert_eq!(reader.load_email_address(&account()), Ok(Some(email)));
+            assert_eq!(
+                reader.load_email_address(&AccountId::new("account-b").unwrap()),
+                Err(MailboxStoreError::Storage)
+            );
+            assert_eq!(reset_snapshot(&writer, true), before);
+            assert_eq!(format!("{reader:?}"), "SqlCipherMailboxReader([REDACTED])");
+        }
+
+        #[test]
+        fn readonly_email_v1_is_authenticated_none_without_upgrade_then_writer_still_upgrades() {
+            let (database, anchor) = version_1_store("readonly-email-v1");
+            let before_main = fs::read(database.path()).unwrap();
+            let before_wal = fs::read(wal_path(&database)).unwrap();
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            assert_eq!(reader.load_email_address(&account()), Ok(None));
+            assert_eq!(
+                anchor
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION_1
+            );
+            assert_eq!(schema(&anchor).unwrap(), canonical_schema_v1());
+            assert_eq!(fs::read(database.path()).unwrap(), before_main);
+            assert_eq!(fs::read(wal_path(&database)).unwrap(), before_wal);
+            drop(reader);
+            let writer = SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
+            assert_eq!(
+                schema_state(&writer),
+                (APPLICATION_ID, VERSION, canonical_schema())
+            );
+            let email = AccountEmail::new("after-upgrade@example.test").unwrap();
+            writer.store_email_address(&account(), &email).unwrap();
+            let reader =
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7)).unwrap();
+            assert_eq!(reader.load_email_address(&account()), Ok(Some(email)));
+        }
+
+        #[test]
+        fn readonly_email_invalid_values_or_schema_drift_are_errors_not_none() {
+            let (database, writer) = open("readonly-email-invalid");
+            let path = database.path();
+            let reader = SqlCipherMailboxReader::open_read_only(account(), path, key(7)).unwrap();
+            for sql in [
+                "UPDATE account_binding SET email_address = X'000000';",
+                "PRAGMA ignore_check_constraints = ON; UPDATE account_binding SET email_address = ''; PRAGMA ignore_check_constraints = OFF;",
+                "UPDATE account_binding SET email_address = 'invalid address@example.test';",
+                "PRAGMA ignore_check_constraints = ON; UPDATE account_binding SET email_address = zeroblob(321); PRAGMA ignore_check_constraints = OFF;",
+            ] {
+                writer
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .execute_batch(sql)
+                    .unwrap();
+                let before = reset_snapshot(&writer, true);
+                assert_eq!(
+                    reader.load_email_address(&account()),
+                    Err(MailboxStoreError::Corrupted)
+                );
+                assert_eq!(reset_snapshot(&writer, true), before);
+            }
+            writer
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "UPDATE account_binding SET email_address = NULL; PRAGMA user_version = 1;",
+                )
+                .unwrap();
+            assert_eq!(
+                reader.load_email_address(&account()),
+                Err(MailboxStoreError::Corrupted),
+                "a v1 marker alone is not authenticated v1"
+            );
+            writer
+                .connection
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "PRAGMA user_version = 2; UPDATE account_binding SET account_id = 'account-b';",
+                )
+                .unwrap();
+            assert_eq!(
+                reader.load_email_address(&account()),
+                Err(MailboxStoreError::Corrupted)
+            );
+        }
+
+        #[test]
+        fn readonly_email_missing_unclaimed_wrong_key_and_wrong_owner_refuse_without_claiming() {
+            let missing = TestDatabase::new("readonly-email-missing");
+            assert!(
+                SqlCipherMailboxReader::open_read_only(account(), missing.path(), key(7)).is_err()
+            );
+            assert!(missing.files().is_empty());
+            for encrypted in [false, true] {
+                let database = TestDatabase::new("readonly-email-unclaimed");
+                if encrypted {
+                    let connection = raw_connection(&database);
+                    apply_key(&connection, &key(7).0).unwrap();
+                    connection
+                        .execute_batch("PRAGMA user_version = 0;")
+                        .unwrap();
+                } else {
+                    write_restrictive(database.path(), b"");
+                }
+                let before = fs::read(database.path()).unwrap();
+                let files = database.files();
+                assert!(
+                    SqlCipherMailboxReader::open_read_only(account(), database.path(), key(7))
+                        .is_err()
+                );
+                assert_eq!(fs::read(database.path()).unwrap(), before);
+                assert_eq!(database.files(), files);
+            }
+            let (database, writer) = open("readonly-email-key-owner");
+            let before = reset_snapshot(&writer, true);
+            assert!(
+                SqlCipherMailboxReader::open_read_only(account(), database.path(), key(8)).is_err()
+            );
+            assert!(
+                SqlCipherMailboxReader::open_read_only(
+                    AccountId::new("account-b").unwrap(),
+                    database.path(),
+                    key(7)
+                )
+                .is_err()
+            );
+            assert_eq!(reset_snapshot(&writer, true), before);
         }
 
         fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
