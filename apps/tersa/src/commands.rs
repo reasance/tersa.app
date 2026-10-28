@@ -24,6 +24,9 @@ use tersa_vault::{SlotKind, Vault, VaultError, VaultState};
 use crate::config::{Config, Paths};
 use crate::prompt;
 
+mod reset;
+pub use reset::account_reset;
+
 const PASSPHRASE_ATTEMPTS: usize = 3;
 
 pub struct Context {

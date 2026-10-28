@@ -57,6 +57,7 @@ fn run(command: Command) -> Result<(), String> {
         Command::AccountAdd => commands::account_add(&context),
         Command::AccountList => commands::account_list(&context),
         Command::AccountRemove(account) => commands::account_remove(&context, &account),
+        Command::AccountReset { account, yes } => commands::account_reset(&context, &account, yes),
         Command::Sync(account) => commands::sync(&context, account.as_deref()),
         Command::Inbox { account, limit } => commands::inbox(&context, account.as_deref(), limit),
         Command::Doctor => {

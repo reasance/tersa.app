@@ -110,6 +110,18 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
+    /// Synthetic configuration without reading inherited credential variables.
+    #[cfg(test)]
+    pub fn for_test(client_id: Option<&str>) -> Self {
+        Self {
+            client_id: client_id.map(str::to_owned),
+            client_secret: None,
+            backend: BackendChoice::File,
+            passphrase: false,
+            file_found: true,
+        }
+    }
+
     /// Loads `config.toml` if present, then applies `TERSA_GOOGLE_CLIENT_ID`
     /// and `TERSA_GOOGLE_CLIENT_SECRET`.
     pub fn load(path: &Path) -> Result<Self, String> {
