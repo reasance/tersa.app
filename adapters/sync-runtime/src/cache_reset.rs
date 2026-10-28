@@ -394,6 +394,274 @@ mod tests {
         }
     }
 
+    fn assert_preview_refuses_mutations(
+        runtime: &mut Runtime,
+        account: &AccountId,
+        directory: &Path,
+    ) {
+        let token_store = InstallationTokens(Arc::clone(runtime.installation()));
+        let account_directories = fs::read_dir(directory.join("accounts"))
+            .expect("account directories")
+            .count();
+        assert!(
+            token_store
+                .store(
+                    &subject("new-unregistered-subject"),
+                    &Zeroizing::new("new-token".to_owned())
+                )
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_dir(directory.join("accounts"))
+                .expect("account directories")
+                .count(),
+            account_directories,
+            "no orphan account store"
+        );
+        assert!(matches!(
+            drive(runtime.add_account(|_| panic!("must not start authorization"))),
+            Err(FlowError::Installation(
+                crate::InstallationError::ReadOnlyRegistry
+            ))
+        ));
+        assert!(matches!(
+            drive(runtime.remove_account(account)),
+            Err(FlowError::Installation(
+                crate::InstallationError::ReadOnlyRegistry
+            ))
+        ));
+        assert!(matches!(
+            runtime.installation().remove_account(account),
+            Err(crate::InstallationError::ReadOnlyRegistry)
+        ));
+        // A never-polled reset cannot clear anything. Preview itself is a
+        // synchronous operation; dropping it was covered by metadata tests.
+        let mail_path = runtime.installation().cache_path_for_test(account);
+        let main_before = fs::read(&mail_path).expect("main bytes");
+        let wal_path = PathBuf::from(format!("{}-wal", mail_path.display()));
+        let wal_before = fs::read(&wal_path).expect("WAL bytes");
+        drop(runtime.reset_cache(account));
+        assert_eq!(fs::read(&mail_path).expect("unpolled main"), main_before);
+        assert_eq!(fs::read(&wal_path).expect("unpolled WAL"), wal_before);
+    }
+
+    async fn sync_rotated_preview(
+        runtime: &Runtime,
+        account: &AccountId,
+        protected: Protected,
+        session: LocalSession,
+    ) -> Result<SyncReport, FlowError> {
+        let cleared = snapshot(runtime.installation(), account);
+        assert!(cleared.envelopes.is_empty());
+        assert_eq!(cleared.protected, protected);
+        assert!(
+            cleared
+                .lifecycle
+                .last_successful_sync_unix_millis()
+                .is_none()
+        );
+        let tokens = InstallationTokens(Arc::clone(runtime.installation()));
+        let subject = subject("private-sub-a");
+        assert_eq!(
+            tokens
+                .load(&subject)
+                .expect("load existing token")
+                .map(|token| token.to_string()),
+            Some("private-token-private-sub-a".to_owned())
+        );
+        tokens
+            .store(&subject, &Zeroizing::new("rotated-token".to_owned()))
+            .expect("known-subject rotation");
+        let store = runtime
+            .installation()
+            .open_store(account)
+            .expect("normal sync store after clear");
+        gated_sync(
+            account,
+            session,
+            &InstallationHasher(Arc::clone(runtime.installation())),
+            store,
+            default_sync_policy(),
+        )
+        .await
+        .map_err(FlowError::Sync)
+    }
+
+    fn assert_revoked_preview_token_lifecycle(runtime: &mut Runtime, account: &AccountId) {
+        // Consent revocation uses this same delete primitive in the existing
+        // broker lifecycle: a readonly registry must not prevent token deletion.
+        let outcome = drive(reset_cache_using(
+            runtime,
+            account,
+            |runtime, _| async move {
+                InstallationTokens(Arc::clone(runtime.installation()))
+                    .delete(&subject("private-sub-a"))
+                    .expect("existing token deletion");
+                Err(FlowError::Token(BrokerError::ConsentRevoked))
+            },
+        ))
+        .expect("clear committed before revoked sync");
+        assert!(matches!(
+            outcome,
+            CacheResetOutcome::ResyncFailed(FlowError::Token(BrokerError::ConsentRevoked))
+        ));
+        assert_eq!(
+            InstallationTokens(Arc::clone(runtime.installation()))
+                .load(&subject("private-sub-a"))
+                .expect("deleted"),
+            None
+        );
+    }
+
+    #[test]
+    fn same_existing_preview_installation_resets_syncs_and_updates_known_tokens() {
+        let Fixture {
+            runtime: setup,
+            accounts: [a, b],
+            _lock: lock,
+            _directory: directory,
+        } = Fixture::new();
+        let before_a = snapshot(setup.installation(), &a);
+        let before_b = snapshot(setup.installation(), &b);
+        drop(setup); // End fixture bootstrap; keep its one installation lock.
+        let registry_path = directory.0.join("registry.sqlite3");
+        let registry_before = fs::read(&registry_path).expect("registry bytes");
+        // One synthetic unlocked root enters the existing-only installation.
+        // That same Arc then crosses the confirmation boundary; no reopen.
+        let preview = Arc::new(
+            Installation::open_existing(&directory.0, RootKey::from_bytes(Zeroizing::new([7; 32])))
+                .expect("existing preview"),
+        );
+        assert_eq!(
+            preview.account_email_existing(&a).expect("preview"),
+            before_a.protected.email
+        );
+        assert_eq!(
+            preview.accounts().expect("accounts"),
+            [a.clone(), b.clone()]
+        );
+        let mut runtime = Runtime::new(
+            Arc::clone(&preview),
+            OAuthClient {
+                client_id: "test-client".to_owned(),
+                client_secret: None,
+            },
+        )
+        .expect("no vault or network");
+        assert!(Arc::ptr_eq(&preview, runtime.installation()));
+        assert_preview_refuses_mutations(&mut runtime, &a, &directory.0);
+        assert_eq!(fs::read(&registry_path).expect("registry"), registry_before);
+        let token_store = InstallationTokens(Arc::clone(&preview));
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let read_log = Arc::clone(&reads);
+        let body_log = Arc::clone(&bodies);
+        let outcome = drive(reset_cache_using(
+            &mut runtime,
+            &a,
+            |runtime, account| async move {
+                assert!(Arc::ptr_eq(&preview, runtime.installation()));
+                sync_rotated_preview(
+                    runtime,
+                    account,
+                    before_a.protected,
+                    LocalSession {
+                        account: account.clone(),
+                        subject: profile_subject("private-sub-a"),
+                        reads: read_log,
+                        bodies: body_log,
+                        fail_body: false,
+                    },
+                )
+                .await
+            },
+        ))
+        .expect("clear committed");
+        let CacheResetOutcome::Resynced(report) = outcome else {
+            panic!("local sync succeeds");
+        };
+        assert_eq!(report.progress().envelopes, 100);
+        assert_eq!(report.progress().bodies_cached, 25);
+        assert_eq!(reads.lock().expect("reads").len(), 4);
+        assert_eq!(bodies.lock().expect("bodies").len(), 25);
+        assert_eq!(
+            token_store
+                .load(&subject("private-sub-a"))
+                .expect("rotated token")
+                .map(|token| token.to_string()),
+            Some("rotated-token".to_owned())
+        );
+        assert_eq!(snapshot(runtime.installation(), &b), before_b);
+        assert_eq!(
+            fs::read(&registry_path).expect("registry unchanged"),
+            registry_before
+        );
+        assert_revoked_preview_token_lifecycle(&mut runtime, &a);
+        assert_eq!(
+            runtime
+                .installation()
+                .accounts()
+                .expect("registry still lists both"),
+            [a, b.clone()]
+        );
+        assert_eq!(snapshot(runtime.installation(), &b), before_b);
+        drop(token_store);
+        drop(runtime);
+        assert_eq!(
+            fs::read(&registry_path).expect("readonly registry after drop"),
+            registry_before
+        );
+        assert!(!registry_path.with_extension("sqlite3-journal").exists());
+        assert!(!registry_path.with_extension("sqlite3-wal").exists());
+        drop(lock);
+    }
+
+    #[test]
+    fn same_existing_installation_refuses_a_lost_store_before_sync_without_fallback() {
+        let Fixture {
+            runtime: setup,
+            accounts: [a, _],
+            _lock: lock,
+            _directory: directory,
+        } = Fixture::new();
+        drop(setup);
+        let preview = Arc::new(
+            Installation::open_existing(&directory.0, RootKey::from_bytes(Zeroizing::new([7; 32])))
+                .expect("preview"),
+        );
+        assert!(
+            preview
+                .account_email_existing(&a)
+                .expect("initial preview")
+                .is_some()
+        );
+        let path = preview.cache_path_for_test(&a);
+        fs::remove_file(&path).expect("simulate lost store after preview");
+        let before = files(path.parent().expect("account directory"));
+        let mut runtime = Runtime::new(
+            preview,
+            OAuthClient {
+                client_id: "test-client".to_owned(),
+                client_secret: None,
+            },
+        )
+        .expect("runtime");
+        assert!(
+            drive(reset_cache_using(&mut runtime, &a, |_, _| async {
+                panic!("a failed existing-only clear must not reach normal sync");
+            }))
+            .is_err()
+        );
+        assert!(!path.exists());
+        assert_eq!(files(path.parent().expect("account directory")), before);
+        assert_eq!(
+            runtime.installation().accounts().expect("registry").len(),
+            2
+        );
+        drop(runtime);
+        drop(lock);
+    }
+
     #[test]
     fn commits_and_closes_before_real_gated_bounded_sync_for_the_same_account() {
         let mut fixture = Fixture::new();

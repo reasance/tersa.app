@@ -213,6 +213,7 @@ impl Runtime {
         &self,
         open_browser: F,
     ) -> Result<AddedAccount, FlowError> {
+        self.installation.require_registry_write()?;
         if !self.installation.has_capacity()? {
             return Err(FlowError::AccountLimit);
         }
@@ -347,6 +348,7 @@ impl Runtime {
     /// Returns a [`FlowError`] when the account is unknown or local removal
     /// fails.
     pub async fn remove_account(&self, account: &AccountId) -> Result<Revocation, FlowError> {
+        self.installation.require_registry_write()?;
         let subject = self.subject_of(account)?;
         let revocation = match self.broker.revoke_provider_grant(&subject).await {
             Ok(()) => Revocation::Confirmed,

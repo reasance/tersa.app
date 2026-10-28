@@ -28,7 +28,9 @@ use tersa_keys::{
     derive_account_key, derive_installation_key, registry_dedup_tag,
 };
 use tersa_store_sqlcipher::registry::{MAX_ACCOUNTS, RegistryError, SqlCipherRegistry};
-use tersa_store_sqlcipher::{CacheResetError, DatabaseKey, IntegrityScan, SqlCipherMailboxStore};
+use tersa_store_sqlcipher::{
+    CacheResetError, DatabaseKey, IntegrityScan, SqlCipherMailboxReader, SqlCipherMailboxStore,
+};
 use tersa_token_broker_core::{RefreshTokenStore, RefreshTokenStoreError, ValidatedSubject};
 use zeroize::Zeroizing;
 
@@ -51,6 +53,8 @@ pub enum InstallationError {
     Key(KeyError),
     /// The account is not registered.
     UnknownAccount,
+    /// Existing-only installations cannot add/remove registry entries.
+    ReadOnlyRegistry,
 }
 
 impl fmt::Display for InstallationError {
@@ -68,6 +72,8 @@ impl fmt::Display for InstallationError {
             Self::Store(_) => formatter.write_str("the account database failed"),
             Self::Key(error) => write!(formatter, "{error}"),
             Self::UnknownAccount => formatter.write_str("no such account"),
+            Self::ReadOnlyRegistry => formatter
+                .write_str("this installation does not support adding or removing accounts"),
         }
     }
 }
@@ -97,6 +103,7 @@ pub struct Installation {
     data_dir: PathBuf,
     root: RootKey,
     registry: SqlCipherRegistry,
+    registry_writable: bool,
     allocation: Mutex<()>,
     /// Accounts whose database this process has opened with the full
     /// integrity scan. Later opens skip it: it reads the whole database, and
@@ -179,6 +186,81 @@ impl InstallationLock {
         )?;
         Ok(Self { _file: file })
     }
+
+    /// Locks an existing private installation without creating or hardening it.
+    ///
+    /// Only a new owner-only `.lock` coordination file may be created. Existing
+    /// lock leaves must already be regular, current-user-owned 0600 files;
+    /// unsafe leaves are refused, not chmodded. No data/registry/vault is opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Busy` for an existing lock holder and `Directory` for missing,
+    /// insecure, moved or unusable directories/lock leaves.
+    pub fn acquire_existing(data_dir: &Path) -> Result<Self, LockError> {
+        let parent = existing_private_directory(data_dir).map_err(|_error| LockError::Directory)?;
+        let path = data_dir.join(LOCK_FILE);
+        let flags = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK)
+            .bits()
+            .cast_signed();
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(flags)
+            .open(&path)
+        {
+            Ok(file) => {
+                // Fresh O_EXCL provenance allows normalizing only this new FD,
+                // including under a restrictive umask; never an existing leaf.
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(|_error| LockError::Directory)?;
+                file
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let before = fs::symlink_metadata(&path).map_err(|_error| LockError::Directory)?;
+                if !private_lock_metadata(&before, rustix::process::geteuid().as_raw()) {
+                    return Err(LockError::Directory);
+                }
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(flags)
+                    .open(&path)
+                    .map_err(|_error| LockError::Directory)?;
+                if file_identity(&file.metadata().map_err(|_error| LockError::Directory)?)
+                    != file_identity(&before)
+                {
+                    return Err(LockError::Directory);
+                }
+                file
+            }
+            Err(_error) => return Err(LockError::Directory),
+        };
+        let opened = file.metadata().map_err(|_error| LockError::Directory)?;
+        if !private_lock_metadata(&opened, rustix::process::geteuid().as_raw()) {
+            return Err(LockError::Directory);
+        }
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |error| {
+                if error == rustix::io::Errno::WOULDBLOCK {
+                    LockError::Busy
+                } else {
+                    LockError::Directory
+                }
+            },
+        )?;
+        let leaf = fs::symlink_metadata(&path).map_err(|_error| LockError::Directory)?;
+        let after = existing_private_directory(data_dir).map_err(|_error| LockError::Directory)?;
+        if !private_lock_metadata(&leaf, rustix::process::geteuid().as_raw())
+            || file_identity(&leaf) != file_identity(&opened)
+            || file_identity(&parent) != file_identity(&after)
+        {
+            return Err(LockError::Directory);
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 impl Installation {
@@ -199,9 +281,86 @@ impl Installation {
             data_dir: data_dir.to_owned(),
             root,
             registry,
+            registry_writable: true,
             allocation: Mutex::new(()),
             scanned: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Opens existing metadata without creating, hardening or claiming state.
+    ///
+    /// Derives keys privately and keeps the registry read-only. This SAME
+    /// installation may be passed to [`crate::Runtime`] after confirmation for reset and
+    /// normal sync of an existing subject: account writes use separate stores.
+    /// No writable reopen, key export or second vault unlock is necessary.
+    ///
+    /// This is not a read-only capability for every `Installation` method. Add
+    /// and remove are unsupported; generic [`Self::open_store`]/[`Self::account_email`]
+    /// remain create-capable and MUST NOT be used for preview. Use
+    /// [`Self::account_email_existing`].
+    /// The caller retains the same installation lock across preview and reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallationError::Directory`] for absent/insecure directories,
+    /// [`InstallationError::Registry`] for missing/unclaimed/invalid registry
+    /// state and [`InstallationError::Key`] for key-derivation failures.
+    pub fn open_existing(data_dir: &Path, root: RootKey) -> Result<Self, InstallationError> {
+        existing_private_directory(data_dir)?;
+        existing_private_directory(&data_dir.join(ACCOUNTS_DIR))?;
+        let key = derive_installation_key(&root, InstallationKeyPurpose::RegistryDatabaseV1)?
+            .into_bytes();
+        let registry = SqlCipherRegistry::open_existing(&data_dir.join(REGISTRY_FILE), &key)?;
+        Ok(Self {
+            data_dir: data_dir.to_owned(),
+            root,
+            registry,
+            registry_writable: false,
+            allocation: Mutex::new(()),
+            scanned: Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// Reads an existing registered account's address without write authority.
+    ///
+    /// Authenticated supported v1 and current NULL return `None`. Missing or
+    /// unreadable peers return an error: callers resolving addresses must not
+    /// skip them or manufacture a false unique match. No key/subject/token is
+    /// returned, no store/directory is created and v1 is never upgraded here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an installation error for unknown accounts, invalid directories,
+    /// registry/key failures or unreadable stores, without a fallback.
+    pub fn account_email_existing(
+        &self,
+        account: &AccountId,
+    ) -> Result<Option<AccountEmail>, InstallationError> {
+        if !self.registry.accounts()?.contains(account) {
+            return Err(InstallationError::UnknownAccount);
+        }
+        for path in [
+            &self.data_dir,
+            &self.data_dir.join(ACCOUNTS_DIR),
+            &self.account_dir(account),
+        ] {
+            existing_private_directory(path)?;
+        }
+        let key = derive_account_key(&self.root, account, AccountKeyPurpose::SqlCipherDatabaseV1)?;
+        let reader = SqlCipherMailboxReader::open_read_only(
+            account.clone(),
+            self.account_dir(account).join(MAIL_FILE),
+            DatabaseKey::from_zeroizing(key.into_bytes()),
+        )?;
+        Ok(reader.load_email_address(account)?)
+    }
+
+    pub(crate) fn require_registry_write(&self) -> Result<(), InstallationError> {
+        if self.registry_writable {
+            Ok(())
+        } else {
+            Err(InstallationError::ReadOnlyRegistry)
+        }
     }
 
     /// Registered accounts in display order.
@@ -364,6 +523,7 @@ impl Installation {
     ///
     /// Returns [`InstallationError::UnknownAccount`] or a storage error.
     pub fn remove_account(&self, account: &AccountId) -> Result<(), InstallationError> {
+        self.require_registry_write()?;
         let _guard = self
             .allocation
             .lock()
@@ -440,6 +600,7 @@ impl Installation {
         if let Some(account) = self.registry.find_by_tag(&tag)? {
             return Ok(account);
         }
+        self.require_registry_write()?;
         if !self.has_capacity()? {
             return Err(InstallationError::Registry(RegistryError::Full));
         }
@@ -481,6 +642,31 @@ fn hex(bytes: &[u8]) -> String {
         })
 }
 
+fn private_directory_metadata(metadata: &fs::Metadata, owner: u32) -> bool {
+    metadata.is_dir() && metadata.uid() == owner && metadata.mode() & 0o7777 == 0o700
+}
+
+fn existing_private_directory(path: &Path) -> Result<fs::Metadata, InstallationError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_error| InstallationError::Directory)?;
+    if !private_directory_metadata(&metadata, rustix::process::geteuid().as_raw()) {
+        return Err(InstallationError::Directory);
+    }
+    Ok(metadata)
+}
+
+fn private_lock_metadata(metadata: &fs::Metadata, owner: u32) -> bool {
+    metadata.is_file() && metadata.uid() == owner && metadata.mode() & 0o7777 == 0o600
+}
+
+fn file_identity(metadata: &fs::Metadata) -> (u64, u64, u32, u32) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.mode(),
+    )
+}
+
 fn ensure_private_dir(path: &Path) -> Result<(), InstallationError> {
     fs::DirBuilder::new()
         .recursive(true)
@@ -500,7 +686,8 @@ fn ensure_private_dir(path: &Path) -> Result<(), InstallationError> {
 
 /// The token service's refresh-token store, backed by account databases.
 ///
-/// Storing a token for an unknown subject registers a new account.
+/// Storing a token for an unknown subject registers a new account on ordinary
+/// installations; existing-only installations refuse it before creating a store.
 #[derive(Clone, Debug)]
 pub struct InstallationTokens(pub Arc<Installation>);
 
@@ -780,3 +967,7 @@ mod tests {
         assert!(installation.has_capacity().expect("capacity"));
     }
 }
+
+#[cfg(test)]
+#[path = "existing_metadata_tests.rs"]
+mod existing_metadata_tests;
