@@ -7,6 +7,7 @@ one at https://mozilla.org/MPL/2.0/.
 # ADR 0017: Production account store
 
 - Status: Accepted
+- T4 v3 prerequisite contract: source implementation pending
 - Amended by: [ADR 0031](adr-0031-tui-only-pivot.md): portable store for macOS and Linux
 - Date: 2026-07-16
 
@@ -70,8 +71,12 @@ Later orchestration must poll it on a bounded blocking executor; it must not be
 run on a latency-sensitive async executor thread. Each write is one SQLCipher
 transaction, and a dropped unpolled future has no effect.
 
-Schema v1 owns a singleton account binding and message envelopes with nullable
-RFC 5322 content. Only an exactly empty database may be claimed. Ownership,
+The implemented account schema is v2: the v1 singleton binding, messages with
+nullable RFC 5322 content, identity and lifecycle rows, plus the nullable account
+email added by `0002_account_email.sql`. Writable opens transactionally upgrade
+recognized v1 to v2; readonly v1 opens do not migrate. The separate registry is
+schema v1 and the identity-hash algorithm is version 2. Only an exactly empty
+database may be claimed. Ownership,
 version, schema, integrity, missing identity rows, invalid SQLite types or
 conversions, empty cipher versions, and decoded domain values are revalidated
 and map to opaque corruption errors. SQLite operational failures, including
@@ -112,6 +117,128 @@ accepted same-user swap-in/open/swap-back non-detection and deletion/recreation
 residual instead of claiming prevention. An absent sidecar at preflight still
 fails without creation; deletion after preflight can be recreated by the VFS
 before the post-read identity check fails closed.
+
+## T4 account schema v3 prerequisite contract
+
+This T4 prerequisite design follows
+[ADR 0027](adr-0027-gmail-modify-history-and-mailbox-commands.md); source
+implementation is pending. It describes no current migration or command
+implementation. `tersa-store-sqlcipher` remains the sole schema and
+transaction owner; runtime composition does not issue SQL or migrate stores.
+
+Recognized owned v1/v2 account stores migrate to v3 in **one writer transaction**:
+include the existing email upgrade when needed, create the complete v3 object
+set, update the version and canonically revalidate before commit. Preserve
+binding, identity, credentials, email, lifecycle and cached messages. Existing
+grants default to ReadOnly; cursor is null, queue empty and provider membership
+Unknown. Registry stays v1 and identity algorithm stays 2. Foreign, unknown,
+noncanonical or corrupt formats remain unwritten; failure rolls back the
+migration, never resets or quarantines the only readable copy.
+
+The first schema slice defines every v3 canonical object, including dormant
+later History/command tables. The data model must hold account capability
+alongside broker routing/credential state; History cursor;
+provider labels and complete observed membership separate from local-read
+presentation; command aggregates, full bounded targets, desired patches and
+dispatch/reconciliation evidence; retained terminal summaries and the one undo
+candidate's touched-field pre/post-state and a queued conditional compensation's
+expected post-state. Concrete SQL definitions and bounded
+decoders belong to that source slice. Subsequent method slices may not add
+canonical objects under v3; layout changes require separately reviewed version
+policy. Credential generation is process-local, not a v3 column; restart drops
+access sessions and treats durable Dispatching as Ambiguous. Existing
+`AccountProfile` remains the application identity trait, not
+the name of a replacement store/identity API.
+
+Readonly opens support recognized v1/v2/v3 without migration. Known-version
+decoding must remain valid around a writable upgrade or fail closed before
+returning incompatible data; no permission to repair or migrate a readonly open
+is added. Preserve path, key, owner, account, sidecar, type/length, integrity and
+identity-fence checks, including the filesystem residuals described above.
+Baseline binaries reject v3; source rollback does not restore readability.
+There is no implicit downgrade, reset, quarantine, key export or plaintext copy.
+
+The store supplies these atomic boundaries for the planned ports:
+
+- Read token plus capability consistently. Bind upgrade to the existing account
+  and expected immutable subject; replace token plus capability together, with
+  process-local credential-generation fencing in runtime composition. Two
+  independent successful writes are not an
+  atomic implementation. Broker retains sole token custody.
+- Apply one complete, fully decided History record and that record ID in one
+  transaction. Successive commits may form a contiguous decided prefix; never
+  advance past an undecided record or commit a subset of one. The decoder's
+  local reference budget truncates at a whole-record boundary with an explicit
+  local indicator, not a fabricated provider token. Resume from the last record
+  cursor; a locally truncated page cannot install response `historyId`. Invalid
+  page envelopes fail before application; an over-limit/undecidable next record
+  stays unapplied. Validate final-page current-mailbox cursor rules before commit.
+  Network lookups happen outside SQL transactions; optional body writes follow
+  metadata/cursor commit.
+- Commit collected bounded snapshot metadata plus the retained pre-snapshot
+  baseline in one transaction. Failure preserves the prior cursor and pending
+  commands; snapshot absence never settles a command.
+- Admit Queued desired state, command ID and full target set while checking both
+  account quotas (32 nonterminal commands, 4,096 target references). Queued means
+  no mailbox mutation attempted; read-only preflight/network remains possible.
+  Before a mailbox mutation, commit Dispatching and reconciled undo pre-state.
+  Persist item reconciliation
+  and account aggregate status without fabricating success from cache rows.
+- Store full observed membership up to 512 labels/message, or fail the
+  record/command closed. Partial sets are never stored as complete observations.
+  Names remain exact encrypted bytes for equality and sanitized only for display.
+- Retain at most 128 terminal aggregate summaries plus one undo candidate.
+  Compact terminal item rows except that candidate; never evict nonterminal
+  evidence for quota. Replay lookup is distinct from admission: expired/unknown
+  command IDs cannot create new work.
+- Complete is terminal success; Partial is terminal when all items resolve and
+  at least one fails, including TargetMissing, even with zero successes. These
+  release FIFO without creating an undo candidate except Complete message-state.
+  Ambiguous/NeedsAttention stay nonterminal. Explicit Retry reconciles first,
+  authorizes at most one guarded dispatch and never resets the automatic budget.
+  That automatic budget is three total attempts, including the initial attempt.
+  Failed reconciliation cannot dispatch. Label-create zero-match retry requires
+  explicit duplicate-risk confirmation; multiple matches never permit creation.
+- Explicit Abandon atomically retains a terminal Abandoned summary before
+  releasing FIFO/pins/quota or reset/remove guards. Its confirmation warns that
+  Gmail may already have applied the operation and automatic recovery stops;
+  it claims neither success nor rollback. The abandoned ID never retries or
+  reenqueues; bounded terminal retention applies.
+- Offline undo admission persists conditional compensation and expected
+  post-state through the ordinary queue, refusing admission if a pre-existing
+  account command is nonterminal, without claiming provider eligibility or
+  performing a mutation. The admitted undo is itself Queued: do not reapply that
+  admission-only gate at dispatch to itself or later queued commands. FIFO
+  prevents later work from overtaking it or causing self-deadlock.
+  After reconnect and before any dispatch, fresh
+  reconciliation must validate the entire target set/required User labels and
+  touched expected-post-state fields. Any mismatch refuses the whole compensation
+  without writes; only a passing check permits touched-pre-state restoration.
+
+Pruning pins all nonterminal targets and the undo candidate, even outside the
+normal keep-100 recent set. Local-read overlay never supplies provider evidence.
+Reset/removal refuse every nonterminal command, including Queued; cancellation
+of Queued work, settlement or explicit terminal abandonment is required first.
+Only a committed terminal disposition releases unresolved-evidence guards.
+Identity replacement also refuses destructive
+change while nonterminal evidence exists. A guarded successful cache clear
+removes cursor, terminal summaries, undo and cached membership while retaining
+registration, capability, grant, identity and disconnect recovery. Guarded
+removal/purge deletes all T4 rows in its account-local transaction. These future
+extensions do not claim the baseline reset already has these guards. History
+RecoveryRequired offers later explicit retry or guarded cache reset after all
+nonterminal commands are cancelled, settled or abandoned. Reset clears cursor
+and captures a new baseline; failures/budget exhaustion never cause automatic
+non-404 snapshot fallback.
+
+Migration/reopen, token/capability and cursor/data rollback, whole-record boundaries,
+quota admission, complete membership, pins and lifecycle refusal need adapter
+evidence against actual SQLCipher. No network wait holds a SQL transaction; lazy
+unpolled futures still have no effect. Committed Dispatching survives
+cancellation for reconciliation, not blind retry. Abandoned-summary commit must
+precede evidence/guard release, with failure rollback preserving the old guard.
+Secure deletion remains a
+logical policy without a secure-erasure or backup-removal guarantee.
 
 ## Consequences
 

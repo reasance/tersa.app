@@ -55,6 +55,14 @@ these observations for the table's bounded manual condition.
 Capability upgrade, account-local FTS, drafts/outbox, app lock and T4–T8 remain
 planned; this source delivery does not complete the entire ADR or MVP.
 
+## T4 prerequisite status
+
+The [execution plan](development/t4-execution-plan.md) and
+[ADR 0027](architecture/adr-0027-gmail-modify-history-and-mailbox-commands.md)
+define the T4 prerequisite contract and source sequence. Source implementation
+and separately authorized live Modify acceptance remain pending. T3 acceptance
+above is unchanged.
+
 ## Initial performance budgets
 
 From ADR 0031, measured on a warm cache of at least 10,000 messages: first
