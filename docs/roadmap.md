@@ -41,10 +41,17 @@ registration and ordinary credential lifecycle. It is not the deferred
 incompatible-schema/new-ID/quarantine protocol in
 [ADR 0026](architecture/adr-0026-multi-account-and-unified-mailbox.md).
 
-**T3 manual acceptance is pending.** Two real accounts must demonstrate macOS
-isolation, independent sync, All/single-account display and offline reopen.
-No candidate-specific two-account evidence has been recorded here; fixtures,
-independent code review and CI do not close the table's done-when condition.
+**The bounded sampled T3 manual gate is closed for candidate `06a7e0f`, following
+independent Grok 4.7 review.** On this macOS development candidate, two
+real accounts demonstrated add/sync, independent per-account sync/status,
+All/single-account display, offline reopen and removal with the remaining
+account usable. Six sampled messages passed the recorded scoped/unified
+content-isolation checks. See the
+[redacted evidence report](development/t3-live-acceptance-2026-11-04.md) for
+the full candidate binding, method, harness corrections and limits. This is
+sampled evidence, not exhaustive isolation proof; live cache reset was not
+exercised and retains automated coverage as its evidence. The review accepted
+these observations for the table's bounded manual condition.
 Capability upgrade, account-local FTS, drafts/outbox, app lock and T4–T8 remain
 planned; this source delivery does not complete the entire ADR or MVP.
 

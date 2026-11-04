@@ -78,8 +78,13 @@ is required. Reset does not retry or start reconsent automatically.
 ## Project status
 
 Multi-account source implementation and automated coverage are delivered.
-Two-real-account macOS isolation and offline acceptance remain pending; fixtures
-and CI do not establish that manual gate or MVP completion.
+Two-real-account macOS observations on candidate `06a7e0f` cover add/sync,
+All/single-account views, offline reopen, removal and six content-isolation
+samples. The [redacted acceptance report](docs/development/t3-live-acceptance-2026-11-04.md)
+records the candidate, method and limits. Independent Grok 4.7 review accepted
+closure of this bounded sampled manual gate. These observations do not establish
+exhaustive isolation, whole-ADR, MVP or release readiness. Cache reset has automated
+coverage but was not exercised live.
 
 See the [roadmap](docs/roadmap.md) and
 [ADR 0031](docs/architecture/adr-0031-tui-only-pivot.md) for the terminal

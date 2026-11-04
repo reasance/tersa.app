@@ -60,7 +60,7 @@ unlock, passphrase, or Google credentials.
 | Malicious HTML, tracking pixels | HTML converted to text with size and depth limits; no remote resource is ever fetched; links listed and opened only on explicit keypress after showing the URL | Conversion implemented (T2a): linear, capped, no fetch. Opening links is not implemented yet |
 | Malicious attachment or decompression bomb | Fetch on demand, size limits, sanitized filenames, never auto-opened | Planned (T5–T6) |
 | Sync replay, ambiguity, or duplicate send | Transactional history cursor, idempotent desired state, bounded retries, client-generated Message-ID, reconciliation after ambiguous outcomes | Planned (T4–T5) |
-| Cross-account access | `(AccountId, MessageId)` routing, per-account database/key/session, application-level 200-row unified query, independent sync workers, fresh scoped views and stale-result rejection | Implemented in source with automated isolation tests. Two-real-account macOS isolation/offline acceptance remains pending |
+| Cross-account access | `(AccountId, MessageId)` routing, per-account database/key/session, application-level 200-row unified query, independent sync workers, fresh scoped views and stale-result rejection | Implemented in source with automated isolation tests. Independent Grok 4.7 review accepted the bounded sampled macOS manual gate for `06a7e0f`; see the [redacted report](../development/t3-live-acceptance-2026-11-04.md). Six samples do not establish exhaustive isolation |
 | Accidental cache reset or unsafe preview | Exact account resolution; existing-only private lock/readonly registry and profile; unreadable peers fail email resolution; completed `yes` line or explicit `--yes`; same lock/installation through transactional clear and bounded sync | Implemented. Missing/unclaimed/unsafe state is not provisioned or repaired. A committed clear can be followed by failed sync and partial new cache; the command fails nonzero and distinguishes that phase |
 | Worker shutdown releases secrets or storage owners prematurely | Restore terminal, signal all workers, cancel owned futures, retain and join native-call owners before releasing installation lock | Implemented. Native calls can delay exit beyond the cooperative grace period; no forced abort. Already-dispatched DNS may finish detached without store state |
 | Composition temp-file exposure | Owner-only directory, removal after editor exit | Plaintext exists on disk while the editor runs; editor swap/backup files are outside tersa's control |
@@ -87,9 +87,12 @@ compromised same-user code replacing paths. An owner-only coordination lock may
 be created and existing SQLite SHM bookkeeping may change during preview.
 
 Capability upgrade, account-local FTS, drafts/outbox, app lock and later roadmap
-milestones remain planned. Source review, automated fixtures and CI do not close
-the pending two-real-account macOS isolation and offline acceptance gate or
-establish full ADR/MVP completion.
+milestones remain planned. Source review, automated fixtures and CI alone do
+not establish live acceptance. Independent Grok 4.7 review accepted closure of
+the bounded sampled two-real-account macOS isolation/offline manual gate for
+`06a7e0f`, as recorded in the [redacted report](../development/t3-live-acceptance-2026-11-04.md).
+This does not establish exhaustive security proof, live cache-reset validation,
+full ADR/MVP completion or release readiness.
 
 ## Explicit exclusions
 
