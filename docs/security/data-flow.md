@@ -3,8 +3,11 @@
 Status values: **Implemented** (present in the tree), **Planned** (required
 by [ADR 0031](../architecture/adr-0031-tui-only-pivot.md), not yet built),
 **Closed** (must not receive data). Implemented describes source and automated
-coverage, not live acceptance: two-real-account macOS isolation and offline
-validation remain pending.
+coverage. Separately, independent Grok 4.7 review accepted closure of the
+bounded sampled two-real-account macOS isolation/offline manual gate for
+candidate `06a7e0f`; see the [redacted report](../development/t3-live-acceptance-2026-11-04.md).
+That acceptance is not exhaustive security proof or release readiness; live
+cache reset remains untested.
 
 ## End-to-end flow
 

@@ -18,7 +18,14 @@ bounded application-layer unified query are implemented. The TUI has an All
 accounts inbox, single-account views, independent account sync/status and
 confirmed cache-only reset. Automated tests cover these source paths.
 
-Two-real-account macOS isolation and offline acceptance remain pending.
+Two-real-account macOS observations are recorded for development candidate
+`06a7e0f`: add/sync, independent sync/status, All/single-account views, offline
+reopen, removal and six sampled content-isolation checks. The
+[redacted evidence report](../development/t3-live-acceptance-2026-11-04.md)
+binds these observations to the full candidate and documents their limits.
+Independent Grok 4.7 review accepted closure of the bounded sampled T3 manual
+gate for this candidate. Live cache reset was not exercised and its evidence
+remains automated coverage.
 Capability upgrade, account-local FTS, drafts/outbox, app lock, and the
 incompatible-schema/new-ID/quarantine protocol below remain planned. Delivered
 source does not certify completion of T3 or this entire accepted design. The
@@ -253,10 +260,14 @@ fan-out work and returns no partial durable mutation.
   readonly preview, no-create refusal, transaction boundaries, same-account
   dispatch and pre-clear versus post-clear failure reporting with isolated
   stores and local provider seams.
-- Pending T3 manual evidence must exercise two real accounts on macOS: add,
-  All/single-account switch, independent sync, remove, offline reopen and
-  account isolation. Local fixtures, source tests and CI do not establish this
-  acceptance gate, live consent or release readiness.
+- Candidate-specific T3 manual observations cover two real accounts on macOS:
+  add, All/single-account switch, independent sync/status, remove, offline
+  reopen and six sampled content-isolation checks. See the
+  [redacted report](../development/t3-live-acceptance-2026-11-04.md) for the
+  candidate, method, selection limits and independent Grok 4.7 decision
+  accepting closure of the bounded sampled manual gate. Local
+  fixtures, source tests and CI alone do not establish live acceptance;
+  these observations do not establish release readiness.
 - Deferred capability upgrade, FTS, quarantine/bounded purge and app-lock
   behavior need separate implementation/evidence gates: target-specific FTS5
   compile options and account-local schema ownership; no-write legacy detection
@@ -265,9 +276,13 @@ fan-out work and returns no partial durable mutation.
 
 ## Non-claims
 
-Delivered source and automated coverage are not a completion claim for T3's
-manual acceptance, FTS, quarantine, app lock, live consent, performance or
-release validation. It adds no account-sharing backend, cross-account
+Delivered source, automated coverage and the bounded live observations are
+not a completion claim for the entire ADR, MVP, FTS, quarantine, app lock,
+performance or release validation. The six-message sample is not exhaustive
+security proof; live cache reset, five-minute sync timing and teardown stress
+were not exercised. Closure of the bounded sampled manual gate for `06a7e0f`
+does not extend to these untested cases.
+The implementation adds no account-sharing backend, cross-account
 labels/threads, automatic legacy migration, or recursive legacy deletion. The
 same-install equality/residency oracle remains explicit.
 
