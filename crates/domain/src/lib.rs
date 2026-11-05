@@ -6,6 +6,18 @@
 
 #![forbid(unsafe_code)]
 
+/// Closed account access capability.
+pub mod account;
+
+/// Account-local write intent, touched state and compensation values.
+pub mod command;
+
+/// Canonical decimal History cursors with redacted formatting.
+pub mod history;
+
+/// Validated labels, complete membership and bounded catalogs.
+pub mod label;
+
 /// Shared mailbox identifiers, envelopes, and redacted message content.
 pub mod mailbox;
 
