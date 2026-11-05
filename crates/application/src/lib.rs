@@ -3,6 +3,46 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Application commands, queries, and use-case orchestration for tersa.app.
+//!
+//! Consumers can use the shared closed command values through [`crate::command`],
+//! label values through [`crate::mailbox_state`] and cursors through
+//! [`crate::history`]. These reexports retain the original types and validation.
+//! Construction validates intent; admission and live authority remain store/runtime
+//! responsibilities.
+//!
+//! ```
+//! use tersa_application::{
+//!     AccountCapability,
+//!     command::{CommandError, MailboxCommand, MailboxCommandId, MessageAction, MessageTargets},
+//!     history::{HistoryCursor, InvalidHistoryCursor},
+//!     mailbox::{AccountId, MessageId},
+//!     mailbox_state::{LabelDefinition, LabelError, LabelId, LabelKind, LabelName, UserLabel},
+//! };
+//!
+//! fn label_intent(
+//!     account: AccountId,
+//!     message: MessageId,
+//!     label: UserLabel,
+//! ) -> Result<MailboxCommand, CommandError> {
+//!     MailboxCommand::message_state(
+//!         AccountCapability::Modify,
+//!         MailboxCommandId::new("fresh-command")?,
+//!         MessageTargets::new(account, vec![message])?,
+//!         &MessageAction::ApplyLabel(label),
+//!     )
+//! }
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let account = AccountId::new("account")?;
+//! let definition: Result<LabelDefinition, LabelError> = LabelDefinition::new(
+//!     account.clone(), LabelId::new("Label_1")?, LabelName::new("Follow up")?, LabelKind::User,
+//! );
+//! let intent = label_intent(account, MessageId::new("message")?, definition?.user_label()?)?;
+//! let cursor: Result<HistoryCursor, InvalidHistoryCursor> = HistoryCursor::new("42");
+//! # let _ = (intent, cursor?);
+//! # Ok(())
+//! # }
+//! ```
 
 #![forbid(unsafe_code)]
 

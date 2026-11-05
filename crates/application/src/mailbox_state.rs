@@ -11,7 +11,17 @@
 
 use crate::mailbox::{AccountId, MessageEnvelope, MessageId};
 use std::fmt;
-use tersa_domain::{command::MessageTargets, label::LabelMembership};
+use tersa_domain::command::MessageTargets;
+
+/// Shared validated label values and constructor errors used by mailbox extension ports.
+///
+/// Includes complete membership and its explicit Unknown/Observed distinction,
+/// known User-label identity, definitions and bounded complete catalogs.
+#[doc(inline)]
+pub use tersa_domain::label::{
+    LabelCatalog, LabelDefinition, LabelError, LabelId, LabelKind, LabelMembership, LabelName,
+    ObservedMembership, UserLabel,
+};
 
 /// Reports invalid extension-port values without retaining any rejected input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

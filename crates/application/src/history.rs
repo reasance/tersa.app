@@ -19,7 +19,11 @@ use crate::{
     profile::AccountFence,
 };
 use std::fmt;
-use tersa_domain::{history::HistoryCursor, label::LabelId};
+use tersa_domain::label::LabelId;
+
+/// Shared canonical History cursor and its constructor error used by the History ports.
+#[doc(inline)]
+pub use tersa_domain::history::{HistoryCursor, InvalidHistoryCursor};
 
 /// Maximum provider History records per page.
 pub const MAX_HISTORY_RECORDS: usize = 500;

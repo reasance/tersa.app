@@ -20,12 +20,19 @@ use crate::{
 };
 use std::fmt;
 use tersa_domain::{
-    command::{
-        CommandItemOutcome, CompensationBatch, MailboxCommand, MailboxCommandId,
-        MailboxCommandKind, MailboxCommandStatus, MailboxField, MessageTargets,
-    },
     label::{LabelCatalog, LabelDefinition, UserLabel},
     mailbox::MessageId,
+};
+
+/// Shared validated intent, target, touched-state, compensation and outcome values.
+///
+/// Label values used by these commands are reexported through
+/// [`crate::mailbox_state`]; capability is available as [`crate::AccountCapability`].
+#[doc(inline)]
+pub use tersa_domain::command::{
+    CommandError, CommandItemOutcome, CompensationBatch, ConditionalCompensation,
+    DesiredMailboxState, DesiredMembership, MailboxCommand, MailboxCommandId, MailboxCommandKind,
+    MailboxCommandStatus, MailboxField, MessageAction, MessageCompensation, MessageTargets,
 };
 
 /// Maximum nonterminal commands per account, including label-only commands.
@@ -1420,9 +1427,6 @@ mod tests {
     };
     use tersa_domain::{
         account::AccountCapability,
-        command::{
-            ConditionalCompensation, DesiredMailboxState, MessageAction, MessageCompensation,
-        },
         label::{LabelId, LabelKind, LabelMembership, LabelName},
     };
     fn account(value: &str) -> AccountId {
