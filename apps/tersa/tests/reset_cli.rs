@@ -111,6 +111,15 @@ mod tests {
         out
     }
 
+    // Lowercase SHA256 of the fixed account IDs' UTF-8 bytes (no newline),
+    // in account order. These fixture paths do not rely on runtime provisioning.
+    const ACCOUNT_DIRECTORY_NAMES: [&str; 2] = [
+        // acct_00000000000000000000000000000001
+        "4f4b5f23e8fe1bc7c70aac651d808a2118a2eaf69145f174181b7b48329d812a",
+        // acct_00000000000000000000000000000002
+        "3120152975130f54133b7dab0053d79e08fda1e89eb3306653a734fc853ceda1",
+    ];
+
     struct Registered {
         fixture: Fixture,
         accounts: [tersa_application::mailbox::AccountId; 2],
@@ -120,9 +129,11 @@ mod tests {
         fn new() -> Self {
             use tersa_application::mailbox::AccountId;
             use tersa_keys::{
-                InstallationKeyPurpose, RootKey, derive_installation_key, registry_dedup_tag,
+                AccountKeyPurpose, InstallationKeyPurpose, RootKey, derive_account_key,
+                derive_installation_key, registry_dedup_tag,
             };
             use tersa_store_sqlcipher::registry::SqlCipherRegistry;
+            use tersa_store_sqlcipher::{DatabaseKey, SqlCipherMailboxStore};
             use tersa_sync_runtime::Installation;
             use zeroize::Zeroizing;
 
@@ -156,20 +167,31 @@ mod tests {
                 Installation::open(&fixture.data, root()).expect("fixture installation");
             let mut stores = Vec::new();
             for (index, account) in accounts.iter().enumerate() {
-                let directories = fixture.data.join("accounts");
-                let before: Vec<_> = fs::read_dir(&directories)
-                    .expect("directories")
-                    .map(|entry| entry.expect("entry").path())
-                    .collect();
-                let store = installation.open_store(account).expect("fixture account");
-                stores.push(
-                    fs::read_dir(directories)
-                        .expect("directories")
-                        .map(|entry| entry.expect("entry").path())
-                        .find(|path| !before.contains(path))
-                        .expect("created fixture directory")
-                        .join("mail.sqlite3"),
+                let directory = fixture
+                    .data
+                    .join("accounts")
+                    .join(ACCOUNT_DIRECTORY_NAMES[index]);
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&directory)
+                    .expect("fixture account directory");
+                let path = directory.join("mail.sqlite3");
+                let account_key =
+                    derive_account_key(&root(), account, AccountKeyPurpose::SqlCipherDatabaseV1)
+                        .expect("fixture account key");
+                // Provision this synthetic store before the runtime existing-account open.
+                drop(
+                    SqlCipherMailboxStore::open(
+                        account.clone(),
+                        &path,
+                        DatabaseKey::from_zeroizing(account_key.into_bytes()),
+                    )
+                    .expect("explicit fixture database"),
                 );
+                let store = installation
+                    .open_store(account)
+                    .expect("existing fixture account");
+                stores.push(path);
                 store
                     .store_email_address(
                         account,
