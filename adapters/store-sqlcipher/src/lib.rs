@@ -178,7 +178,7 @@ mod store {
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum OpenMode {
         Bootstrap,
-        CacheReset,
+        ExistingOwned,
     }
 
     /// Reads envelope rows, but no complete message bodies, from one account database.
@@ -482,6 +482,41 @@ mod store {
             }
         }
 
+        /// Opens an existing, owned database using the requested integrity-scan policy.
+        ///
+        /// Never creates a missing main file or claims an uninitialized schema.
+        /// Both policies retain path, owner, key, schema, bounded metadata and
+        /// foreign-key-enforcement checks. `Skip` omits whole-database page and
+        /// foreign-key scans; unread pages are not thereby verified. Recognized
+        /// v1/v2 migrations always authenticate all pages before changing format,
+        /// even when `scan` is [`IntegrityScan::Skip`].
+        ///
+        /// The caller retains the installation lock across account operations.
+        /// Accepted owned stores may recreate legitimate coordination sidecars
+        /// through the same guarded writer recovery as [`Self::open`].
+        ///
+        /// # Errors
+        ///
+        /// Returns [`MailboxStoreError::Storage`] for missing or unusable paths,
+        /// and opaque corruption for unclaimed, foreign, unsupported, wrong-key
+        /// or invalid stores. With `Skip`, corruption on an unread data page can
+        /// remain undetected until that page is read.
+        pub fn open_existing_owned_with_scan<P: AsRef<Path>>(
+            account: AccountId,
+            path: P,
+            key: DatabaseKey,
+            scan: IntegrityScan,
+        ) -> Result<Self, MailboxStoreError> {
+            Self::open_inner_with_mode(
+                account,
+                path.as_ref(),
+                key,
+                scan,
+                &mut |_point, _path| Ok(()),
+                OpenMode::ExistingOwned,
+            )
+        }
+
         /// Opens only an existing, claimed account database for cache reset.
         ///
         /// Never creates a missing file or claims an empty schema. Uses the
@@ -507,15 +542,8 @@ mod store {
                 Err(_error) => return Err(CacheResetError::Storage),
                 Ok(true) => {}
             }
-            Self::open_inner_with_mode(
-                account,
-                path.as_ref(),
-                key,
-                IntegrityScan::Full,
-                &mut |_point, _path| Ok(()),
-                OpenMode::CacheReset,
-            )
-            .map_err(Into::into)
+            Self::open_existing_owned_with_scan(account, path, key, IntegrityScan::Full)
+                .map_err(Into::into)
         }
 
         /// Atomically clears cached mail, T4 cache metadata and sync freshness.
@@ -659,7 +687,7 @@ mod store {
         ) -> Result<Self, MailboxStoreError> {
             let canonical_path = canonical_database_path(path).map_err(mailbox_open_error)?;
             let mut leaf = LeafGuard::open(&canonical_path).map_err(mailbox_open_error)?;
-            if mode == OpenMode::CacheReset && leaf.snapshot.main.is_none() {
+            if mode == OpenMode::ExistingOwned && leaf.snapshot.main.is_none() {
                 // The existing-only path has no authority to claim a fresh
                 // leaf, including a disappearance after the presence check.
                 return Err(MailboxStoreError::Storage);
@@ -681,7 +709,7 @@ mod store {
             } else {
                 None
             };
-            if mode == OpenMode::CacheReset
+            if mode == OpenMode::ExistingOwned
                 && existing_preflight.is_some_and(ExistingPreflight::is_unclaimed)
             {
                 // Read-only preflight identified an unclaimed logical store.
@@ -3402,7 +3430,7 @@ mod store {
             )
             .map_err(classify_open)?;
         let fresh = validate_identity(connection, account)?;
-        if fresh && mode == OpenMode::CacheReset {
+        if fresh && mode == OpenMode::ExistingOwned {
             return Err(OpenFailure::Corrupted);
         }
         configure_owned_storage(connection)?;
@@ -4421,13 +4449,13 @@ mod store {
             bytes[at] ^= 0xff;
             fs::write(database.path(), &bytes).unwrap();
 
-            assert_corrupted(SqlCipherMailboxStore::open_with_scan(
+            assert_corrupted(SqlCipherMailboxStore::open_existing_owned_with_scan(
                 account(),
                 database.path(),
                 key(7),
                 IntegrityScan::Full,
             ));
-            let store = SqlCipherMailboxStore::open_with_scan(
+            let store = SqlCipherMailboxStore::open_existing_owned_with_scan(
                 account(),
                 database.path(),
                 key(7),
@@ -7684,16 +7712,27 @@ mod store {
         }
 
         #[test]
-        fn read_only_open_rejects_rollback_journal_and_nonregular_sidecars_unchanged() {
+        fn reader_and_owned_writer_refuse_invalid_coordination_files() {
             let (journal_database, journal_store) = open("reader-journal");
             drop(journal_store);
             fs::write(journal_path(&journal_database), b"foreign-journal").unwrap();
             let journal_files = journal_database.files();
+            let journal_before: Vec<_> = journal_files
+                .iter()
+                .map(|path| (fs::read(path).unwrap(), file_identity(path).unwrap()))
+                .collect();
             assert!(matches!(
                 SqlCipherMailboxReader::open_read_only(account(), journal_database.path(), key(7),),
                 Err(MailboxStoreError::Storage)
             ));
+            // Readonly treats the journal as unavailable coordination. The
+            // owned writer classifies it as corruption before write-open/recovery.
+            assert_strict_writer_refused(&journal_database, MailboxStoreError::Corrupted);
             assert_eq!(journal_database.files(), journal_files);
+            for (path, (bytes, identity)) in journal_files.iter().zip(journal_before) {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                assert_eq!(file_identity(path).unwrap(), identity);
+            }
             assert_eq!(
                 fs::read(journal_path(&journal_database)).unwrap(),
                 b"foreign-journal"
@@ -7708,6 +7747,7 @@ mod store {
                 SqlCipherMailboxReader::open_read_only(account(), symlink_database.path(), key(7),),
                 Err(MailboxStoreError::Storage)
             ));
+            assert_strict_writer_refused(&symlink_database, MailboxStoreError::Storage);
             assert!(
                 fs::symlink_metadata(wal_path(&symlink_database))
                     .unwrap()
@@ -7728,6 +7768,7 @@ mod store {
                 ),
                 Err(MailboxStoreError::Storage)
             ));
+            assert_strict_writer_refused(&directory_database, MailboxStoreError::Storage);
             assert!(shm_path(&directory_database).is_dir());
         }
 
@@ -7768,6 +7809,7 @@ mod store {
                     SqlCipherMailboxStore::open(account(), database.path(), key(7)),
                     Err(MailboxStoreError::Storage)
                 ));
+                assert_strict_writer_refused(&database, MailboxStoreError::Storage);
                 assert_eq!(database.files(), files_before);
                 assert_eq!(fs::read(database.path()).unwrap(), main_before);
                 assert_eq!(fs::read(wal_path(&database)).unwrap(), wal_before);
@@ -8026,6 +8068,14 @@ mod store {
                 Err(MailboxStoreError::Storage)
             ));
 
+            assert_strict_writer_refused(&link_database, MailboxStoreError::Storage);
+            assert!(
+                fs::symlink_metadata(link_database.path())
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+
             let (_database, poisoned) = open("poisoned");
             let panic = catch_unwind(AssertUnwindSafe(|| {
                 let _guard = poisoned.connection.lock().unwrap();
@@ -8103,6 +8153,25 @@ mod store {
         {
             let (database, store) = reset_fixture("cache-reset-success", &account());
             let protected = reset_snapshot(&store, false);
+            for scan in [IntegrityScan::Full, IntegrityScan::Skip] {
+                let owned = SqlCipherMailboxStore::open_existing_owned_with_scan(
+                    account(),
+                    database.path(),
+                    key(7),
+                    scan,
+                )
+                .unwrap();
+                assert_eq!(reset_snapshot(&owned, false), protected);
+                assert_eq!(
+                    owned
+                        .connection
+                        .lock()
+                        .unwrap()
+                        .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+            }
             assert!(
                 run(store.get_message(&account(), &MessageId::new("body").unwrap()))
                     .unwrap()
@@ -8166,8 +8235,62 @@ mod store {
             assert_eq!(reset_snapshot(&store_b, true), before_b);
         }
 
+        #[derive(Clone, Copy, Debug)]
+        enum StrictWriterOpen {
+            Reset,
+            Scan(IntegrityScan),
+        }
+
+        impl StrictWriterOpen {
+            const ALL: [Self; 3] = [
+                Self::Reset,
+                Self::Scan(IntegrityScan::Full),
+                Self::Scan(IntegrityScan::Skip),
+            ];
+
+            fn open(
+                self,
+                account: AccountId,
+                path: &Path,
+                key: DatabaseKey,
+            ) -> Result<SqlCipherMailboxStore, CacheResetError> {
+                match self {
+                    Self::Reset => {
+                        SqlCipherMailboxStore::open_existing_for_cache_reset(account, path, key)
+                    }
+                    Self::Scan(scan) => SqlCipherMailboxStore::open_existing_owned_with_scan(
+                        account, path, key, scan,
+                    )
+                    .map_err(Into::into),
+                }
+            }
+
+            const fn missing_error(self) -> CacheResetError {
+                match self {
+                    Self::Reset => CacheResetError::Ineligible,
+                    Self::Scan(_) => CacheResetError::Storage,
+                }
+            }
+        }
+
+        fn assert_strict_writer_refused(database: &TestDatabase, expected: MailboxStoreError) {
+            for scan in [IntegrityScan::Full, IntegrityScan::Skip] {
+                let result = SqlCipherMailboxStore::open_existing_owned_with_scan(
+                    account(),
+                    database.path(),
+                    key(7),
+                    scan,
+                );
+                assert_eq!(
+                    result.expect_err("strict existing writer must reject the fixture"),
+                    expected,
+                    "{scan:?}: wrong rejection classification",
+                );
+            }
+        }
+
         #[test]
-        fn cache_reset_refuses_missing_paths_without_creating_files_or_parents() {
+        fn strict_existing_openers_refuse_missing_paths_without_creating_files_or_parents() {
             let database = TestDatabase::new("cache-reset-missing");
             for path in [
                 database.path().to_path_buf(),
@@ -8176,17 +8299,19 @@ mod store {
                     .join("absent-parent")
                     .join("mail.sqlite3"),
             ] {
-                assert!(matches!(
-                    SqlCipherMailboxStore::open_existing_for_cache_reset(account(), &path, key(7)),
-                    Err(CacheResetError::Ineligible)
-                ));
+                for opener in StrictWriterOpen::ALL {
+                    assert!(matches!(
+                        opener.open(account(), &path, key(7)),
+                        Err(error) if error == opener.missing_error()
+                    ));
+                }
                 assert!(!path.exists());
             }
             assert!(fs::read_dir(&database.directory).unwrap().next().is_none());
         }
 
         #[test]
-        fn cache_reset_never_claims_an_empty_or_uninitialized_encrypted_file() {
+        fn strict_existing_openers_never_claim_empty_or_uninitialized_encrypted_files() {
             for encrypted in [false, true] {
                 let database = TestDatabase::new("cache-reset-unclaimed");
                 if encrypted {
@@ -8200,20 +8325,18 @@ mod store {
                 }
                 let before = fs::read(database.path()).unwrap();
                 let files = database.files();
-                assert!(matches!(
-                    SqlCipherMailboxStore::open_existing_for_cache_reset(
-                        account(),
-                        database.path(),
-                        key(7)
-                    ),
-                    Err(CacheResetError::Corrupted)
-                ));
-                assert_eq!(fs::read(database.path()).unwrap(), before);
-                assert_eq!(
-                    database.files(),
-                    files,
-                    "no write-open sidecars or format claim"
-                );
+                for opener in StrictWriterOpen::ALL {
+                    assert!(matches!(
+                        opener.open(account(), database.path(), key(7)),
+                        Err(CacheResetError::Corrupted)
+                    ));
+                    assert_eq!(fs::read(database.path()).unwrap(), before);
+                    assert_eq!(
+                        database.files(),
+                        files,
+                        "no write-open sidecars or format claim"
+                    );
+                }
                 let normal =
                     SqlCipherMailboxStore::open(account(), database.path(), key(7)).unwrap();
                 assert_eq!(
@@ -8225,7 +8348,7 @@ mod store {
         }
 
         #[test]
-        fn cache_reset_refuses_unclaimed_wal_before_write_or_migration() {
+        fn strict_existing_openers_refuse_unclaimed_wal_before_write_or_migration() {
             for missing_shm in [false, true] {
                 let database = TestDatabase::new("cache-reset-unclaimed-wal");
                 let anchor = raw_connection(&database);
@@ -8243,21 +8366,19 @@ mod store {
                 let main = fs::read(database.path()).unwrap();
                 let wal = fs::read(wal_path(&database)).unwrap();
                 let files = database.files();
-                assert!(matches!(
-                    SqlCipherMailboxStore::open_existing_for_cache_reset(
-                        account(),
-                        database.path(),
-                        key(7)
-                    ),
-                    Err(CacheResetError::Corrupted)
-                ));
-                assert_eq!(fs::read(database.path()).unwrap(), main);
-                assert_eq!(fs::read(wal_path(&database)).unwrap(), wal);
-                assert_eq!(
-                    database.files(),
-                    files,
-                    "reset never claims or creates original coordination leaves"
-                );
+                for opener in StrictWriterOpen::ALL {
+                    assert!(matches!(
+                        opener.open(account(), database.path(), key(7)),
+                        Err(CacheResetError::Corrupted)
+                    ));
+                    assert_eq!(fs::read(database.path()).unwrap(), main);
+                    assert_eq!(fs::read(wal_path(&database)).unwrap(), wal);
+                    assert_eq!(
+                        database.files(),
+                        files,
+                        "strict open never claims or creates original coordination leaves"
+                    );
+                }
                 assert!(
                     recovery_stage_paths(&database)
                         .iter()
@@ -8280,26 +8401,24 @@ mod store {
         }
 
         #[test]
-        fn cache_reset_open_rejects_wrong_keys_owners_and_unsupported_formats_without_deleting() {
+        fn strict_existing_openers_preserve_foreign_or_invalid_stores() {
             let (database, store) = reset_fixture("cache-reset-open-rejection", &account());
             let before = reset_snapshot(&store, true);
-            assert!(matches!(
-                SqlCipherMailboxStore::open_existing_for_cache_reset(
-                    account(),
-                    database.path(),
-                    key(8)
-                ),
-                Err(CacheResetError::Corrupted)
-            ));
-            assert!(matches!(
-                SqlCipherMailboxStore::open_existing_for_cache_reset(
-                    AccountId::new("account-b").unwrap(),
-                    database.path(),
-                    key(7)
-                ),
-                Err(CacheResetError::Corrupted)
-            ));
-            assert_eq!(reset_snapshot(&store, true), before);
+            for opener in StrictWriterOpen::ALL {
+                assert!(matches!(
+                    opener.open(account(), database.path(), key(8)),
+                    Err(CacheResetError::Corrupted)
+                ));
+                assert!(matches!(
+                    opener.open(
+                        AccountId::new("account-b").unwrap(),
+                        database.path(),
+                        key(7)
+                    ),
+                    Err(CacheResetError::Corrupted)
+                ));
+                assert_eq!(reset_snapshot(&store, true), before);
+            }
             for (pragma, value) in [("user_version", VERSION + 1), ("application_id", 1)] {
                 let prior: i64 = store
                     .connection
@@ -8313,14 +8432,12 @@ mod store {
                     .unwrap()
                     .pragma_update(None, pragma, value)
                     .unwrap();
-                assert!(matches!(
-                    SqlCipherMailboxStore::open_existing_for_cache_reset(
-                        account(),
-                        database.path(),
-                        key(7)
-                    ),
-                    Err(CacheResetError::Corrupted)
-                ));
+                for opener in StrictWriterOpen::ALL {
+                    assert!(matches!(
+                        opener.open(account(), database.path(), key(7)),
+                        Err(CacheResetError::Corrupted)
+                    ));
+                }
                 assert_eq!(
                     store.clear_cached_mail(&account()),
                     Err(CacheResetError::Corrupted),
@@ -8340,14 +8457,12 @@ mod store {
                 .unwrap()
                 .execute_batch("CREATE TABLE future_protected_intent (value TEXT)")
                 .unwrap();
-            assert!(matches!(
-                SqlCipherMailboxStore::open_existing_for_cache_reset(
-                    account(),
-                    database.path(),
-                    key(7)
-                ),
-                Err(CacheResetError::Corrupted)
-            ));
+            for opener in StrictWriterOpen::ALL {
+                assert!(matches!(
+                    opener.open(account(), database.path(), key(7)),
+                    Err(CacheResetError::Corrupted)
+                ));
+            }
             assert_eq!(
                 store.clear_cached_mail(&account()),
                 Err(CacheResetError::Corrupted)

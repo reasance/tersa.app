@@ -18,6 +18,66 @@ mod p5a {
         (database, connection)
     }
 
+    // Skip applies to current-format reopens, never to authentication before
+    // changing a legacy format. Restoring the same page is the positive control.
+    #[test]
+    fn strict_existing_skip_authenticates_legacy_body_pages_before_migration() {
+        for version in [SCHEMA_VERSION_1, SCHEMA_VERSION_2] {
+            let (database, anchor) = if version == SCHEMA_VERSION_1 {
+                version_1_store("strict-skip-v1")
+            } else {
+                version_2_store("strict-skip-v2")
+            };
+            anchor.execute_batch("UPDATE messages SET content = zeroblob(262144) WHERE message_id = 'm1'; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            let original_schema = schema(&anchor).unwrap();
+            let original = fs::read(database.path()).unwrap();
+            assert!(
+                original.len() > 256 * 1024,
+                "body overflow pages are in the main file"
+            );
+            let mut damaged = original.clone();
+            let offset = damaged.len() / 2;
+            damaged[offset] ^= 0xff;
+            fs::write(database.path(), &damaged).unwrap();
+            anchor.execute_batch("PRAGMA shrink_memory").unwrap();
+            let wal_before = fs::read(wal_path(&database)).unwrap();
+
+            assert_corrupted(SqlCipherMailboxStore::open_existing_owned_with_scan(
+                account(),
+                database.path(),
+                key(7),
+                IntegrityScan::Skip,
+            ));
+            assert_eq!(fs::read(database.path()).unwrap(), damaged);
+            assert_eq!(fs::read(wal_path(&database)).unwrap(), wal_before);
+            assert_eq!(
+                anchor
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                version
+            );
+            assert_eq!(schema(&anchor).unwrap(), original_schema);
+            drop(anchor);
+
+            fs::write(database.path(), original).unwrap();
+            let store = SqlCipherMailboxStore::open_existing_owned_with_scan(
+                account(),
+                database.path(),
+                key(7),
+                IntegrityScan::Skip,
+            )
+            .unwrap();
+            assert_eq!(
+                schema_state(&store),
+                (APPLICATION_ID, VERSION, canonical_schema())
+            );
+            let body = run(store.get_message(&account(), &MessageId::new("m1").unwrap()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(body.into_content().into_bytes(), vec![0; 256 * 1024]);
+        }
+    }
+
     fn values(connection: &Connection, sql: &str) -> Vec<Vec<Value>> {
         let mut statement = connection.prepare(sql).unwrap();
         let count = statement.column_count();
@@ -479,7 +539,7 @@ mod p5a {
                 Err(MailboxStoreError::Corrupted)
             ));
             assert!(matches!(
-                SqlCipherMailboxStore::open_with_scan(
+                SqlCipherMailboxStore::open_existing_owned_with_scan(
                     account(),
                     database.path(),
                     key(7),
