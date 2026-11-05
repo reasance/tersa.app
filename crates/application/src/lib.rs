@@ -6,6 +6,19 @@
 
 #![forbid(unsafe_code)]
 
+/// Shared account capability for consumers using the application dependency.
+#[doc(inline)]
+pub use tersa_domain::account::AccountCapability;
+
+/// Closed mailbox command transport and durable lifecycle contracts.
+pub mod command;
+/// Bounded History, metadata and atomic cursor transaction contracts.
+pub mod history;
+/// Complete message-bound provider observations and shared contract failures.
+pub mod mailbox_state;
+/// Readonly existing-account metadata and selected-account Upgrade binding.
+pub mod profile;
+
 /// Account-identity gate ports and the pure preserve-vs-clear decision.
 pub mod identity;
 /// Privacy-safe durable sync freshness and disconnect-recovery metadata.
