@@ -19,9 +19,12 @@ mod credentials;
 mod history_store;
 mod pins;
 mod schema_v3;
+mod triage_reads;
 
 #[doc(inline)]
 pub use cached::{CachedProviderMessage, CachedProviderState};
+#[doc(inline)]
+pub use triage_reads::CachedMailboxFilter;
 
 #[doc(inline)]
 pub use credentials::{CredentialSnapshot, CredentialStoreError, StoreCredential};
@@ -3383,7 +3386,9 @@ mod store {
         Ok(())
     }
 
-    fn envelope_from_row(row: &rusqlite::Row<'_>) -> Result<MessageEnvelope, MailboxStoreError> {
+    pub(super) fn envelope_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> Result<MessageEnvelope, MailboxStoreError> {
         let message_id: String = row.get(0).map_err(corrupted)?;
         let thread_id: String = row.get(1).map_err(corrupted)?;
         let sender: String = row.get(2).map_err(corrupted)?;
@@ -4010,6 +4015,7 @@ mod store {
         include!("p5a_tests.rs");
         include!("p5b_tests.rs");
         include!("p5c_tests.rs");
+        include!("p7b_reads_tests.rs");
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
