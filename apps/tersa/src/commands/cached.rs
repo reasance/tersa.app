@@ -4,7 +4,7 @@
 
 //! Production cached views use runtime filtering and opaque runtime continuations.
 
-use crate::tui::{MailContinuation, MailPage, MailSource, Row, ViewScope};
+use crate::tui::{MailContinuation, MailPage, MailSource, ReadMarker, Row, ViewScope};
 use std::{cell::RefCell, sync::Arc};
 use tersa_application::{
     command::MailboxField,
@@ -63,9 +63,17 @@ impl MailSource for RuntimeSource {
             .into_iter()
             .map(|raw| {
                 let mut row = Row::from_envelope(&raw.envelope, &raw.account);
-                // Unknown is not converted into a legacy Modify read fact. The
-                // existing boolean controls emphasis only; triage retains Unknown.
-                row.unread = raw.display_unread.unwrap_or(false);
+                // P7b supplies legacy display for ReadOnly and complete observed
+                // read state for Modify. Absence remains visible in the list.
+                row.read = match raw.display_unread {
+                    Some(unread) => ReadMarker::from_unread(unread),
+                    None => match &raw.observed {
+                        CachedProviderState::Missing => ReadMarker::Missing,
+                        CachedProviderState::Unknown | CachedProviderState::Known(_) => {
+                            ReadMarker::Unknown
+                        }
+                    },
+                };
                 row.triage = Some(message_document(
                     &raw,
                     catalogs.get(&raw.account).and_then(Option::as_ref),

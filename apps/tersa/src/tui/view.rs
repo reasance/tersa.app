@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use tersa_presentation::message::{BodyFormat, RenderedMessage};
 use tersa_presentation::terminal::SafeText;
 
-use super::app::{App, Body, MessageView, Row, Screen, SyncState, account_tag};
+use super::app::{App, Body, MessageView, ReadMarker, Row, Screen, SyncState, account_tag};
 use super::wrap::{truncate, width, wrap, wrap_chars};
 use crate::dates;
 
@@ -295,9 +295,19 @@ fn inbox_line(
     let remaining = total.saturating_sub(fixed);
     let subject = truncate(row.subject.as_str(), remaining);
     let preview_room = remaining.saturating_sub(width(&subject) + 3);
-    let weight = if row.unread { bold() } else { Style::new() };
+    let weight = if row.read == ReadMarker::Unread {
+        bold()
+    } else {
+        Style::new()
+    };
+    let marker = match row.read {
+        ReadMarker::Read => "  ",
+        ReadMarker::Unread => "● ",
+        ReadMarker::Unknown => "? ",
+        ReadMarker::Missing => "× ",
+    };
     let mut spans = vec![
-        Span::styled(if row.unread { "● " } else { "  " }, weight),
+        Span::styled(marker, weight),
         Span::styled(format!("{date:>DATE_WIDTH$}  "), dim()),
     ];
     if let Some(label) = tag {

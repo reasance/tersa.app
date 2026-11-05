@@ -36,7 +36,7 @@ use tersa_application::unified_mailbox::{
 use tersa_presentation::terminal::SafeText;
 
 use app::{App, Request};
-pub use app::{MessageKey, Row, ViewScope, account_tag_label};
+pub use app::{MessageKey, ReadMarker, Row, ViewScope, account_tag_label};
 use worker::{Done, Worker, Workers};
 
 /// Distinct continuation types prevent a legacy query cursor from posing as a runtime view.
@@ -955,7 +955,7 @@ mod tests {
                                 row.received_at_millis,
                             )
                             .expect("time"),
-                            row.unread,
+                            row.read == super::ReadMarker::Unread,
                         )
                     })
                     .collect(),

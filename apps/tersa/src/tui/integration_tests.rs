@@ -256,7 +256,7 @@ fn real_source_uses_filtered_runtime_continuations_and_preserves_deep_pages() {
         .expect("filtered");
     assert_eq!(filtered.rows.len(), 1);
     assert_eq!(filtered.rows[0].id.as_str(), "m249");
-    assert!(filtered.rows[0].unread);
+    assert_eq!(filtered.rows[0].read, super::ReadMarker::Unread);
     assert_eq!(
         filtered.rows[0]
             .triage
@@ -584,4 +584,215 @@ fn late_real_control_receipts_update_owner_state_without_retargeting_the_new_vie
             .epoch,
         original_epoch
     );
+}
+
+fn marker_envelope(id: &str, unread: bool, at: i64) -> MessageEnvelope {
+    MessageEnvelope::new(
+        MessageId::new(id).expect("id"),
+        ThreadId::new("thread").expect("thread"),
+        HeaderText::new("sender").expect("sender"),
+        HeaderText::new(id).expect("subject"),
+        HeaderText::new("preview").expect("preview"),
+        UnixTimestampMillis::new(at).expect("time"),
+        unread,
+    )
+}
+fn seed_marker_observations(fixture: &Fixture, workers: &mut Workers) {
+    let account = &fixture.accounts[0];
+    let store = fixture
+        .installation
+        .open_store(account)
+        .expect("Modify store");
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("executor");
+    executor
+        .block_on(store.upsert_envelopes(
+            account,
+            &[
+                marker_envelope("marker-unknown", true, 6),
+                marker_envelope("marker-read", true, 5),
+                marker_envelope("marker-unread", false, 4),
+                marker_envelope("marker-missing", true, 3),
+            ],
+        ))
+        .expect("local cached headers");
+    // The missing observation must remain retained after its envelope is removed.
+    let worker = workers
+        .accounts
+        .iter_mut()
+        .find(|worker| &worker.account == account)
+        .expect("worker");
+    worker
+        .control(
+            ControlJob::Admit {
+                intent: intent(account, "marker-missing"),
+                resume: false,
+            },
+            0,
+        )
+        .expect("pin missing target");
+    final_event(worker);
+    let identity = executor
+        .block_on(store.load_identity(account))
+        .expect("identity")
+        .expect("known");
+    let fence = AccountFence::new(account.clone(), identity);
+    let metadata = [("marker-read", false, 5), ("marker-unread", true, 4)]
+        .into_iter()
+        .map(|(id, unread, at)| {
+            MessageMetadata::new(
+                TypedKey::new(account.clone(), MessageId::new(id).expect("id")),
+                marker_envelope(id, unread, at),
+                LabelMembership::new(
+                    account.clone(),
+                    if unread {
+                        vec![LabelId::new("UNREAD").expect("label")]
+                    } else {
+                        Vec::new()
+                    },
+                )
+                .expect("membership"),
+            )
+            .expect("metadata")
+        })
+        .collect();
+    let snapshot = SnapshotCommit::new(
+        executor
+            .block_on(store.checkpoint(&fence))
+            .expect("checkpoint"),
+        CapturedBaseline::new(account.clone(), HistoryCursor::new("1").expect("cursor")),
+        metadata,
+        SnapshotCoverage::RecentChainEnded,
+        SnapshotFallbackReason::NoCursor,
+    )
+    .expect("observed snapshot");
+    executor
+        .block_on(store.commit_snapshot(&snapshot))
+        .expect("observed state saved");
+    seed_missing_marker(&store, &executor, fence);
+}
+
+fn seed_missing_marker(
+    store: &tersa_store_sqlcipher::SqlCipherMailboxStore,
+    executor: &tokio::runtime::Runtime,
+    fence: AccountFence,
+) {
+    use tersa_application::{
+        history::{
+            DecidedHistoryRecord, HistoryDecision, HistoryEvent, HistoryEventKind, HistoryPage,
+            HistoryQuery, HistoryRecord, ProviderContinuation,
+        },
+        mailbox::PageSize,
+        mailbox_state::{MessageObservation, RemoteMessageState},
+    };
+    let owner = fence.account_id().clone();
+    let account = &owner;
+    let key = TypedKey::new(
+        account.clone(),
+        MessageId::new("marker-missing").expect("id"),
+    );
+    let record = HistoryRecord::new(
+        account.clone(),
+        HistoryCursor::new("2").expect("cursor"),
+        vec![HistoryEvent::new(key.clone(), HistoryEventKind::Deleted).expect("event")],
+        1,
+    )
+    .expect("record");
+    let page = HistoryPage::new(
+        HistoryQuery::new(
+            account.clone(),
+            HistoryCursor::new("1").expect("cursor"),
+            PageSize::new(25).expect("size"),
+        ),
+        HistoryCursor::new("2").expect("cursor"),
+        vec![record],
+        ProviderContinuation::End,
+        None,
+        1,
+    )
+    .expect("page");
+    let decision = DecidedHistoryRecord::new(
+        fence,
+        &page,
+        0,
+        vec![HistoryDecision::Observe(
+            MessageObservation::new(key, RemoteMessageState::Missing).expect("missing"),
+        )],
+    )
+    .expect("decided record");
+    executor
+        .block_on(store.apply_record(&decision))
+        .expect("retained exact-key Missing observation");
+    // A compatibility header update can coexist with retained Missing evidence;
+    // it must not reinterpret that observation as either read or unread.
+    executor
+        .block_on(store.upsert_envelopes(account, &[marker_envelope("marker-missing", true, 3)]))
+        .expect("cached compatibility header");
+}
+
+#[test]
+fn real_cached_source_draws_unknown_and_missing_without_inventing_modify_read_state() {
+    let fixture = Fixture::new();
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("executor");
+    let legacy = fixture
+        .installation
+        .open_store(&fixture.accounts[1])
+        .expect("ReadOnly store");
+    let expected = legacy
+        .load_credential_snapshot(&fixture.accounts[1])
+        .expect("grant");
+    legacy
+        .replace_credential_snapshot(
+            &expected,
+            tersa_application::AccountCapability::ReadOnly,
+            &tersa_store_sqlcipher::StoreCredential::Active(zeroize::Zeroizing::new(
+                "synthetic-readonly".to_owned(),
+            )),
+        )
+        .expect("ReadOnly fixture");
+    executor
+        .block_on(legacy.upsert_envelopes(
+            &fixture.accounts[1],
+            &[
+                marker_envelope("marker-local-unread", true, 2),
+                marker_envelope("marker-local-read", false, 1),
+            ],
+        ))
+        .expect("legacy local flags");
+    let (source, mut workers) = components(&fixture);
+    seed_marker_observations(&fixture, &mut workers);
+    let mut app = initial_app(&source).expect("actual runtime source to App");
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 16)).expect("terminal");
+    terminal
+        .draw(|frame| view::draw(frame, &mut app, 1_761_000_000_000))
+        .expect("current list rendering");
+    let buffer = terminal.backend().buffer();
+    // Known provider flags and ReadOnly's local flags are independent controls.
+    // The unknown row is locally unread, but must display neither known glyph.
+    for (subject, marker) in [
+        ("marker-local-unread", "●"),
+        ("marker-local-read", " "),
+        ("marker-unread", "●"),
+        ("marker-read", " "),
+        ("marker-unknown", "?"),
+        ("marker-missing", "×"),
+    ] {
+        let y = (0..16)
+            .find(|&y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains(subject)
+            })
+            .expect("case rendered in current list");
+        assert_eq!(
+            buffer[(0, y)].symbol(),
+            marker,
+            "read marker for {subject} must reflect its actual legacy/observed/unknown/missing fact"
+        );
+    }
 }

@@ -19,6 +19,24 @@ const MAX_QUERY_LEN: usize = 256;
 /// mailbox, so everything that names a message goes through both.
 pub type MessageKey = (AccountId, MessageId);
 
+/// Read-marker knowledge selected by the source, without inferring provider state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadMarker {
+    /// Known read display (legacy local flag or complete provider observation).
+    Read,
+    /// Known unread display (legacy local flag or complete provider observation).
+    Unread,
+    /// No complete provider observation is available.
+    Unknown,
+    /// Exact-key provider absence was observed; the cached row is not a read fact.
+    Missing,
+}
+impl ReadMarker {
+    pub const fn from_unread(unread: bool) -> Self {
+        if unread { Self::Unread } else { Self::Read }
+    }
+}
+
 /// One inbox row, already sanitized.
 #[derive(Clone, Debug)]
 pub struct Row {
@@ -28,7 +46,7 @@ pub struct Row {
     pub subject: SafeText,
     pub preview: SafeText,
     pub received_at_millis: i64,
-    pub unread: bool,
+    pub read: ReadMarker,
     /// Sanitized observed/pending T4 facts; raw action keys remain account/id above.
     pub triage: Option<tersa_presentation::triage::MessageStateDocument>,
     pub capability: Option<tersa_application::AccountCapability>,
@@ -82,7 +100,7 @@ impl Row {
             subject,
             preview,
             received_at_millis,
-            unread,
+            read: ReadMarker::from_unread(unread),
             triage: None,
             capability: None,
             observed: None,
