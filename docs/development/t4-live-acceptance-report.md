@@ -97,7 +97,7 @@ request 170 does not change that.
   History writes, labels, Undo, or Abandon.
 - No claim that tests, mocks, or the candidate hash contacted Google.
 - No full-mailbox copy. History caught-up and a 200-row page are bounded
-  cache results. A full page probes 201 source rows so paging can continue.
+  cache results. A full page reads at most 201 rows from each ready account.
 - No secure erasure, app lock, send, draft, watch, classification label, or
   permanent delete.
 - No ownership of browser descendants. The launcher bound and the

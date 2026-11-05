@@ -53,10 +53,12 @@ URLs, raw message bodies, raw subjects, raw label names, addresses, account
 identifiers, key material, or private paths. `tersa account list` output stays
 out of the repository; copy only the stored-access word onto the alias.
 
-A count that ends in `+` means another cached page is available. Each merged
-query page holds at most 200 rows. A 200-row page probes 201 source rows so
-another page can follow. Do not record 200 as the size of the mailbox or of
-the view.
+Only the header message count ending in `+` means another cached page is
+available. A search-match count can also end in `+` when rows could not be
+read; the header then says `(some could not be read)` and no further page
+exists. Each merged query page holds at most 200 rows. A 200-row page reads
+at most 201 rows from each ready account. Do not record 200 as the size of
+the mailbox or of the view.
 
 ## Allowed actions
 
@@ -191,8 +193,10 @@ not run. Do not invent a stand-in target.
 12. **History progress.** Record one `tersa sync` notice. If it says bounded
     progress, run sync again and record whether another bounded step or
     caught-up is shown. Caught-up still says it is not full-mailbox coverage.
-    In the interface, if the count ends in `+`, page further and record that
-    another page loaded. Do not treat the first page as the whole view.
+    In the interface, page further only when the header message count ends in
+    `+`, and record that another page loaded. If the header says `(some could
+    not be read)`, record that no further page exists; a search-match `+` is
+    not another page. Do not treat the first page as the whole view.
 13. **Stale view.** Start an action confirmation, then switch account scope
     or press `F` before confirming. A changed view says to reopen the action
     and that nothing was submitted. Reopen `m` on the new view and confirm
