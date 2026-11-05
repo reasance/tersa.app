@@ -14,6 +14,7 @@ pub(crate) mod control;
 mod integration_tests;
 #[cfg(test)]
 mod perf;
+mod triage;
 mod view;
 mod worker;
 mod wrap;
@@ -80,13 +81,6 @@ pub trait MailSource {
     /// stored Gmail address or its id. Read again after every finished sync.
     fn account_labels(&self) -> Vec<(AccountId, SafeText)>;
     fn set_filter(&self, filter: &tersa_sync_runtime::CachedMailboxFilter) -> Result<(), ()>;
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "P9b cached account inspector uses this required source facet"
-        )
-    )]
     fn account_state(
         &self,
         account: &AccountId,
@@ -258,7 +252,15 @@ pub fn run(
         PANICKED.store(true, Ordering::SeqCst);
         restore_terminal(info);
     }));
+    let paste = BracketedPaste(
+        ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::EnableBracketedPaste
+        )
+        .is_ok(),
+    );
     let result = event_loop(&mut terminal, &mut app, source, &mut worker);
+    drop(paste);
     silence_closed_stderr();
     ratatui::restore();
     // Stops account work once the terminal is restored. External browser apps
@@ -270,6 +272,19 @@ pub fn run(
         eprintln!("{notice}");
     }
     result
+}
+
+/// Terminal input mode is owned independently of external browser applications.
+struct BracketedPaste(bool);
+impl Drop for BracketedPaste {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = ratatui::crossterm::execute!(
+                std::io::stdout(),
+                ratatui::crossterm::event::DisableBracketedPaste
+            );
+        }
+    }
 }
 
 const WORKER_GONE: &str = "the network worker stopped";
@@ -322,15 +337,30 @@ fn event_loop(
             Input::Closed => return Ok(()),
         }
         let key = match event::read().map_err(terminal_error)? {
+            Event::Paste(text) => {
+                if app.triage.modal.is_some() {
+                    triage::paste(app, &text);
+                } else {
+                    app.paste_search(&text);
+                }
+                dirty = true;
+                continue;
+            }
             Event::Key(key) if key.kind == KeyEventKind::Press => key,
             Event::Resize(..) => {
+                app.triage.invalidate_modal_viewport();
                 dirty = true;
                 continue;
             }
             _ => continue,
         };
         dirty = true;
-        match app.key(key) {
+        let request = if app.triage.modal.is_some() {
+            triage::key(app, source, worker, key)
+        } else {
+            app.key(key)
+        };
+        match request {
             Some(Request::OpenMessage(key)) => {
                 let raw = source.message(&key.0, &key.1);
                 let missing = matches!(raw, Ok(None));
@@ -358,6 +388,7 @@ fn event_loop(
                     app.status = Some("That observed mailbox filter is unavailable.".to_owned());
                 }
             }
+            Some(Request::Triage(tool)) => triage::open(app, source, worker, tool),
             Some(Request::Sync) => {
                 if worker.is_empty() {
                     app.status = Some("Syncing needs a readable account and the Google OAuth client; see `tersa doctor`.".to_owned());
@@ -444,7 +475,7 @@ fn start_sync(workers: &mut Workers, app: &mut App, now: i64, due_only: bool) ->
 /// batch, starting fresh even after a failed sync may have stored metadata.
 fn finish_work(workers: &mut Workers, app: &mut App, source: &dyn MailSource, now: i64) -> bool {
     let mut changed = false;
-    let mut reload = false;
+    let mut reload = app.triage.modal.is_none() && std::mem::take(&mut app.triage.deferred_reload);
     for worker in &mut workers.accounts {
         loop {
             let done = match worker.done.try_recv() {
@@ -474,6 +505,7 @@ fn finish_work(workers: &mut Workers, app: &mut App, source: &dyn MailSource, no
                     }
                 }
                 Done::Control(event) if worker.finish_control(&event) => {
+                    triage::completed(app, &event);
                     let binding = event.binding();
                     let account = binding.account.clone();
                     let visible = binding.epoch == app.view_epoch && app.scope.contains(&account);
@@ -501,7 +533,7 @@ fn finish_work(workers: &mut Workers, app: &mut App, source: &dyn MailSource, no
                     if final_result {
                         app.set_accounts(source.account_labels());
                     }
-                    reload |= final_result && app.scope.contains(&account);
+                    reload |= final_result && visible;
                     // This is an already-consumed owner summary (at most one per
                     // registered account), not an unbounded second result queue.
                     app.control_results.insert(account, event);
@@ -515,6 +547,10 @@ fn finish_work(workers: &mut Workers, app: &mut App, source: &dyn MailSource, no
                 _ => {} // A completion from any other account is never applied.
             }
         }
+    }
+    if reload && app.triage.modal.is_some() {
+        app.triage.deferred_reload = true;
+        return changed;
     }
     if reload {
         let loaded = app.rows.len().max(usize::from(FIRST_PAGE));

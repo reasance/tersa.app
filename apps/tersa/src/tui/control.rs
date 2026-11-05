@@ -32,10 +32,6 @@ const MAX_PROGRESS: usize = 2;
 const MAX_AUTH_LINK_BYTES: usize = 16 * 1024;
 
 /// Exact work; caller retains typed targets and captured dialog/view epoch.
-#[expect(
-    dead_code,
-    reason = "P9b adds user menu submitters; P9a exhaustively wires these required runtime operations"
-)]
 #[derive(Clone, Debug)]
 pub enum ControlJob {
     Admit {
@@ -43,6 +39,7 @@ pub enum ControlJob {
         resume: bool,
     },
     Undo {
+        expected_source: CommandStamp,
         resume: bool,
     },
     Cancel(CommandStamp),
@@ -230,7 +227,10 @@ impl ControlResult {
                     Some(Err(error)) => format!(
                         "Online follow-up failed: {error}. The durable receipt remains saved."
                     ),
-                    Some(Ok(report)) => command_notice(report).to_string(),
+                    Some(Ok(report)) => format!(
+                        "Online follow-up processed independently: {}",
+                        command_notice(report)
+                    ),
                 };
                 SafeText::single_line(&format!("{} {suffix}", durable.notice()))
             }
@@ -352,7 +352,7 @@ fn command_notice(report: &AccountCommandReport) -> SafeText {
         }
     });
     SafeText::single_line(&format!(
-        "{}: {}. {} {}{convergence}",
+        "Processed command {}: {}. {} {}{convergence}",
         doc.identifier, doc.status, doc.outcomes, doc.notice
     ))
 }

@@ -288,12 +288,10 @@ pub enum Request {
     Sync,
     /// Start a fresh inbox for this explicit view.
     ChangeScope(ViewScope),
-    /// Mechanical observed-filter routing; P9b owns user menu bindings.
-    #[expect(
-        dead_code,
-        reason = "P9b adds filter menu bindings; this slice implements actual filter routing"
-    )]
+    /// Start a fresh observed-membership query.
     ChangeFilter(tersa_sync_runtime::CachedMailboxFilter),
+    /// Open typed triage controls without dispatching from display strings.
+    Triage(super::triage::Tool),
 }
 
 /// The whole interface state.
@@ -305,6 +303,7 @@ pub struct App {
     pub accounts: Vec<(AccountId, SafeText)>,
     pub scope: ViewScope,
     pub filter: tersa_sync_runtime::CachedMailboxFilter,
+    pub triage: super::triage::Ui,
     pub control_results: std::collections::HashMap<AccountId, super::control::ControlEvent>,
     /// Changes only on a real view change, fencing old download completions.
     pub view_epoch: u64,
@@ -372,6 +371,7 @@ impl App {
             scope: ViewScope::All,
             filter: tersa_sync_runtime::CachedMailboxFilter::Recent,
             control_results: std::collections::HashMap::new(),
+            triage: super::triage::Ui::default(),
             view_epoch: 0,
             unavailable_accounts: Vec::new(),
             continuation: None,
@@ -498,6 +498,9 @@ impl App {
     fn reset_view(&mut self) -> Result<(), ()> {
         let epoch = self.view_epoch.checked_add(1).ok_or(())?;
         self.view_epoch = epoch;
+        self.triage.clear_selection();
+        self.triage.modal = None;
+        self.triage.deferred_reload = false;
         self.rows.clear();
         self.shown.clear();
         self.continuation = None;
@@ -589,6 +592,7 @@ impl App {
     /// Replaces the rows after a sync, keeping the selection and any open
     /// message; `more` says whether older rows follow.
     pub fn reload(&mut self, rows: Vec<Row>, more: bool) {
+        self.triage.clear_selection();
         let selected = self
             .shown_row(self.selected)
             .map(|row| (row.message_key(), row.received_at_millis));
@@ -660,6 +664,7 @@ impl App {
     }
 
     fn set_query(&mut self, query: String) {
+        self.triage.clear_selection();
         let selected = self.shown_row(self.selected).map(Row::message_key);
         self.search.query = query;
         self.selected = 0;
@@ -711,6 +716,9 @@ impl App {
         }
         if control && matches!(key.code, KeyCode::Char('r')) {
             return Some(Request::Sync);
+        }
+        if !control && let Some(tool) = super::triage::Tool::from_key(key.code) {
+            return Some(Request::Triage(tool));
         }
         let half = (self.page / 2).max(1);
         let motion = match key.code {
@@ -775,6 +783,21 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Bracketed paste follows the same bounded, control-free search input contract.
+    pub fn paste_search(&mut self, text: &str) {
+        if !self.search.editing {
+            return;
+        }
+        if self.search.query.len().saturating_add(text.len()) > MAX_QUERY_LEN {
+            self.status =
+                Some("Search paste exceeds 256 UTF-8 bytes; nothing was pasted.".to_owned());
+            return;
+        }
+        let mut query = self.search.query.clone();
+        query.extend(text.chars().filter(|c| !c.is_control()));
+        self.set_query(query);
     }
 
     /// Keys while a search query is being typed: the list narrows as it
