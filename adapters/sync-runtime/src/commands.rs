@@ -141,11 +141,45 @@ impl Runtime {
 
     /// Admits conditional offline undo through the store's separate admission gate.
     ///
+    /// Selects the current candidate when admission acquires the account permit.
+    /// A confirmation-bound UI must use [`Self::admit_undo_for`] to preserve the
+    /// exact source the user confirmed instead of selecting a newer candidate.
+    ///
     /// # Errors
     /// Rejects missing/stale undo, pending work, identity or capability/quota failures.
     pub async fn admit_undo(
         &self,
         account: &AccountId,
+    ) -> Result<CommandAdmissionOutcome, CompositionError> {
+        self.admit_undo_with_source(account, None).await
+    }
+
+    /// Admits offline conditional undo only for the exact confirmed source.
+    ///
+    /// Compares account, command ID and revision under the account permit before
+    /// building any new intent. The store transaction still compares the full
+    /// current candidate and enforces identity, capability, pending-work and
+    /// quota guards. Admission needs neither OAuth configuration nor a token;
+    /// it does not claim current provider eligibility or successful compensation.
+    ///
+    /// # Errors
+    /// Returns [`CompositionError::NoUndo`] when no candidate remains and
+    /// [`CompositionError::Triage`] with [`TriageStoreError::Conflict`] for a
+    /// changed or foreign source. Also rejects existing-account, identity,
+    /// capability, pending-work, quota or durable admission failures.
+    pub async fn admit_undo_for(
+        &self,
+        account: &AccountId,
+        expected_source: &CommandStamp,
+    ) -> Result<CommandAdmissionOutcome, CompositionError> {
+        self.admit_undo_with_source(account, Some(expected_source))
+            .await
+    }
+
+    async fn admit_undo_with_source(
+        &self,
+        account: &AccountId,
+        expected_source: Option<&CommandStamp>,
     ) -> Result<CommandAdmissionOutcome, CompositionError> {
         let operation = self.operations.get(account)?;
         let _permit = operation.permit.lock().await;
@@ -155,6 +189,9 @@ impl Runtime {
             .undo_candidate(&fence)
             .await?
             .ok_or(CompositionError::NoUndo)?;
+        if expected_source.is_some_and(|expected| candidate.source() != expected) {
+            return Err(TriageStoreError::Conflict.into());
+        }
         let metadata = store
             .read_metadata(account)
             .await?

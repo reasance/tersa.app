@@ -14,8 +14,8 @@ use std::task::{Context, Poll, Waker};
 use tersa_application::{
     command::{
         AbandonConfirmation, CommandAdmissionOutcome, CommandDispatchError, CommandKey,
-        CommandLabelReader, DispatchFact, DispatchReceipt, DuplicateRiskConfirmation,
-        MailboxCommandId, MailboxCommandStatus, MessageAction, MessageTargets,
+        CommandLabelReader, CommandStamp, DispatchFact, DispatchReceipt, DuplicateRiskConfirmation,
+        MailboxCommandId, MailboxCommandKind, MailboxCommandStatus, MessageAction, MessageTargets,
         RemoteCommandOutcome, RemoteMailboxCommands, UserLabelObservation, WriteAcknowledgement,
     },
     command_coordinator::{CommandDriveStop, CommandWritePolicy},
@@ -33,7 +33,7 @@ use tersa_application::{
     mailbox_state::{
         LabelCatalog, LabelDefinition, LabelId, LabelKind, LabelMembership, LabelName, MessageKey,
         MessageMetadata, MessageObservation, MetadataObservation, MetadataReadError,
-        RemoteMessageState, UserLabel,
+        RemoteMessageState, TriageStoreError, UserLabel,
     },
 };
 
@@ -1164,6 +1164,116 @@ fn readonly_observation_settles_label_work_without_constructing_modify_transport
         assert_eq!(provider.writers.load(Ordering::SeqCst), 0);
         assert_eq!(provider.dispatches.load(Ordering::SeqCst), 0);
     });
+}
+
+#[test]
+fn confirmed_undo_source_cannot_retarget_a_newer_complete_command() {
+    drive(async {
+        let (mut f, provider) = fixture(AccountCapability::Modify);
+        record_identity(&f).await;
+        provider.row("a", 1, &["INBOX", "UNREAD"]);
+        let first = admitted(
+            f.runtime
+                .admit_command(&f.account, &intent(&f.account, &["a"], MessageAction::Read))
+                .await
+                .expect("first admission"),
+        );
+        assert!(matches!(
+            f.runtime.admit_undo_for(&f.account, first.stamp()).await,
+            Err(CompositionError::NoUndo)
+        ));
+        assert_eq!(command_state(&f.runtime, &f.account).await.pending, [first]);
+        assert_eq!(provider.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(f.port.refreshes.load(Ordering::SeqCst), 0);
+        complete_queued_read(&f, &provider, "a").await;
+        let candidate_a = command_state(&f.runtime, &f.account).await.undo.expect("A");
+
+        provider.row("b", 2, &["INBOX", "UNREAD"]);
+        let second = admitted(
+            f.runtime
+                .admit_command(&f.account, &intent(&f.account, &["b"], MessageAction::Read))
+                .await
+                .expect("second admission"),
+        );
+        complete_queued_read(&f, &provider, "b").await;
+        let store = f
+            .runtime
+            .installation
+            .open_store(&f.account)
+            .expect("store");
+        store
+            .delete_credential_snapshot(&f.snapshot())
+            .expect("token lost");
+        f.runtime = Runtime::local(Arc::clone(&f.runtime.installation));
+        let before = command_state(&f.runtime, &f.account).await;
+        let candidate_b = before.undo.as_ref().expect("B");
+        assert!(before.pending.is_empty());
+        assert_eq!(candidate_b.source().key(), second.stamp().key());
+        assert_ne!(candidate_b.source().revision(), second.stamp().revision());
+        let foreign = CommandStamp::new(
+            CommandKey::new(
+                AccountId::new("foreign-account").expect("foreign"),
+                candidate_b.source().key().command_id().clone(),
+            ),
+            candidate_b.source().revision(),
+        );
+        let online_counts = (
+            f.port.refreshes.load(Ordering::SeqCst),
+            provider.writers.load(Ordering::SeqCst),
+            provider.dispatches.load(Ordering::SeqCst),
+        );
+        for expected in [candidate_a.source(), second.stamp(), &foreign] {
+            assert!(matches!(
+                f.runtime.admit_undo_for(&f.account, expected).await,
+                Err(CompositionError::Triage(TriageStoreError::Conflict))
+            ));
+            let after = command_state(&f.runtime, &f.account).await;
+            assert_eq!(after.pending, before.pending);
+            assert_eq!(after.undo, before.undo);
+            assert_eq!(after.terminal, before.terminal);
+        }
+        let undo = admitted(
+            f.runtime
+                .admit_undo_for(&f.account, candidate_b.source())
+                .await
+                .expect("exact confirmed B admits offline"),
+        );
+        assert_eq!(undo.status(), MailboxCommandStatus::Queued);
+        assert_eq!(
+            undo.command().kind(),
+            &MailboxCommandKind::Compensate(candidate_b.compensation().clone())
+        );
+        assert_eq!(command_state(&f.runtime, &f.account).await.pending, [undo]);
+        assert_eq!(
+            (
+                f.port.refreshes.load(Ordering::SeqCst),
+                provider.writers.load(Ordering::SeqCst),
+                provider.dispatches.load(Ordering::SeqCst),
+            ),
+            online_counts,
+            "neither rejected confirmations nor accepted offline undo do online work"
+        );
+    });
+}
+
+/// Completes a real queued Read through dispatch followed by provider observation.
+async fn complete_queued_read(f: &Fixture, provider: &Provider, id: &str) {
+    let sent = f
+        .runtime
+        .drive_commands(&f.account, Some(&CommandWritePolicy::Automatic))
+        .await
+        .expect("dispatch queued read");
+    assert!(sent.command.dispatch_invoked());
+    provider.row(id, 1, &["INBOX"]);
+    let settled = f
+        .runtime
+        .drive_commands(&f.account, None)
+        .await
+        .expect("observe read completion");
+    assert_eq!(
+        settled.command.snapshot().expect("snapshot").status(),
+        MailboxCommandStatus::Complete
+    );
 }
 
 #[test]
