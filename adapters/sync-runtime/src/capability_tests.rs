@@ -1045,3 +1045,6 @@ fn new_connect_completion_cannot_register_during_another_empty_snapshot_cleanup(
         assert_eq!(f.port.revokes.load(Ordering::SeqCst), 1);
     });
 }
+
+#[path = "composition_tests.rs"]
+mod composition_tests;

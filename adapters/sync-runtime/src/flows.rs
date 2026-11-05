@@ -141,7 +141,8 @@ pub enum Revocation {
 
 /// The account flows over one unlocked installation.
 pub struct Runtime {
-    installation: Arc<Installation>,
+    pub(crate) installation: Arc<Installation>,
+    pub(crate) mailboxes: Arc<dyn crate::mailbox_ports::MailboxFactory>,
     online: Option<Online>,
     // Match the broker's eight pending-session ceiling across isolated brokers.
     authorizations: tokio::sync::Semaphore,
@@ -149,7 +150,7 @@ pub struct Runtime {
     // an empty-snapshot cleanup cannot race another Connect registering it.
     connections: tokio::sync::Mutex<()>,
     pub(crate) operations: Accounts,
-    hasher: InstallationHasher,
+    pub(crate) hasher: InstallationHasher,
     /// One Gmail session per account, reused until shortly before its access
     /// token expires.
     sessions: SessionCache<SharedSession, Arc<FlowError>, SystemCacheClock>,
@@ -187,6 +188,7 @@ impl Runtime {
         Self {
             hasher: InstallationHasher(Arc::clone(&installation)),
             installation,
+            mailboxes: Arc::new(crate::mailbox_ports::GoogleMailboxes),
             online: None,
             authorizations: tokio::sync::Semaphore::new(8),
             connections: tokio::sync::Mutex::new(()),
@@ -368,7 +370,11 @@ impl Runtime {
     ) -> AddedAccount {
         let account = token.account_id().clone();
         let first_sync = match self.operations.get(&account) {
-            Ok(operation) => match GmailSession::from_capability(token, operation.generation()) {
+            Ok(operation) => match GmailSession::from_capability(
+                token,
+                operation.generation(),
+                self.mailboxes.as_ref(),
+            ) {
                 Ok(session) => self.sync_with_session(&account, session).await,
                 Err(error) => Err(FlowError::Session(error)),
             },
@@ -608,7 +614,10 @@ impl Runtime {
 
     /// The account's Gmail session, refreshing its access token only when
     /// none is cached or the cached one is about to expire.
-    async fn session(&self, account: &AccountId) -> Result<(SharedSession, Origin), FlowError> {
+    pub(crate) async fn session(
+        &self,
+        account: &AccountId,
+    ) -> Result<(SharedSession, Origin), FlowError> {
         self.subject_of(account)?;
         let result = self
             .sessions
@@ -649,8 +658,9 @@ impl Runtime {
         // A successful refresh may rotate credentials; advance even if the
         // provider omitted rotation, conservatively fencing old completions.
         self.invalidate_known(account, &operation);
-        let session = GmailSession::from_capability(token, operation.generation())
-            .map_err(FlowError::Session)?;
+        let session =
+            GmailSession::from_capability(token, operation.generation(), self.mailboxes.as_ref())
+                .map_err(FlowError::Session)?;
         Ok((SharedSession::new(session), lifetime))
     }
 
