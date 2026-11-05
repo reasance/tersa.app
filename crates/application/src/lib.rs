@@ -14,6 +14,8 @@ pub use tersa_domain::account::AccountCapability;
 pub mod command;
 /// Bounded History, metadata and atomic cursor transaction contracts.
 pub mod history;
+/// Pure bounded History and baseline-first snapshot orchestration.
+pub mod history_sync;
 /// Complete message-bound provider observations and shared contract failures.
 pub mod mailbox_state;
 /// Readonly existing-account metadata and selected-account Upgrade binding.
