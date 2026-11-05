@@ -26,11 +26,11 @@ use serde::Deserialize;
 use tersa_application::mailbox::{
     AccountEmail, BoxFuture, Page, PageSize, PageToken, RemoteMailbox, RemoteMailboxError,
 };
-use tersa_application::oauth::GMAIL_READONLY_SCOPE;
 use tersa_application::token::{
     ExchangeRequest, IdTokenClaims, RefreshRequest, TokenResponse, TokenTransport,
     TokenTransportError,
 };
+use tersa_application::{AccountCapability, scope::ScopeEvidence};
 use tersa_domain::mailbox::{
     AccountId, HeaderText, Message, MessageContent, MessageEnvelope, MessageId, ThreadId,
     UnixTimestampMillis,
@@ -53,6 +53,8 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const REVOKE_ENDPOINT: &str = "https://oauth2.googleapis.com/revoke";
 const TOKEN_RESPONSE_LIMIT: usize = 64 * 1024;
+
+mod history;
 
 type TransportFuture<'a> =
     Pin<Box<dyn Future<Output = Result<HttpResponse, TransportError>> + Send + 'a>>;
@@ -108,6 +110,37 @@ impl GmailMailbox {
         let profile: GmailProfile = self.request_json(profile_request()?, JSON_LIMIT).await?;
         AccountEmail::new(profile.email_address)
             .map_err(|_error| RemoteMailboxError::InvalidResponse)
+    }
+
+    /// Reads the complete bounded label catalog without mailbox write authority.
+    ///
+    /// # Errors
+    /// Returns closed read failures for wrong account, invalid/duplicate definitions,
+    /// overflow or incomplete documents. Exact label names are never normalized.
+    pub async fn label_catalog(
+        &self,
+        account: &AccountId,
+    ) -> Result<
+        tersa_domain::label::LabelCatalog,
+        tersa_application::mailbox_state::MetadataReadError,
+    > {
+        history::read_label_catalog(self, account).await
+    }
+
+    /// Reads one exact label ID, retaining its provider User/System classification.
+    ///
+    /// # Errors
+    /// Returns closed read failures for wrong account, malformed identity/name/kind
+    /// or transport errors. None means only this exact label GET returned 404.
+    pub async fn label_definition(
+        &self,
+        account: &AccountId,
+        id: &tersa_domain::label::LabelId,
+    ) -> Result<
+        Option<tersa_domain::label::LabelDefinition>,
+        tersa_application::mailbox_state::MetadataReadError,
+    > {
+        history::read_label_definition(self, account, id).await
     }
 
     fn checked_account(&self, account: &AccountId) -> Result<(), RemoteMailboxError> {
@@ -278,6 +311,7 @@ impl TransportError {
 struct BoundedBody {
     bytes: Vec<u8>,
     limit: usize,
+    expected_len: Option<usize>,
 }
 
 const fn body_limit(status: u16, success_limit: usize) -> usize {
@@ -300,6 +334,7 @@ impl BoundedBody {
         Ok(Self {
             bytes: Vec::with_capacity(content_length.unwrap_or(0).min(limit)),
             limit,
+            expected_len: content_length,
         })
     }
 
@@ -316,8 +351,14 @@ impl BoundedBody {
         Ok(())
     }
 
-    fn finish(mut self) -> Vec<u8> {
-        std::mem::take(&mut self.bytes)
+    fn finish(mut self) -> Result<Vec<u8>, TransportError> {
+        if self
+            .expected_len
+            .is_some_and(|length| length != self.bytes.len())
+        {
+            return Err(TransportError::InvalidResponse);
+        }
+        Ok(std::mem::take(&mut self.bytes))
     }
 }
 
@@ -387,7 +428,7 @@ impl Transport for ReqwestTransport {
             }
             Ok(HttpResponse {
                 status,
-                body: body.finish(),
+                body: body.finish()?,
             })
         })
     }
@@ -419,6 +460,7 @@ fn list_request(size: PageSize, token: Option<&PageToken>) -> Result<Request, Re
 #[derive(Clone, Copy)]
 enum MessageFormat {
     Metadata,
+    Minimal,
     Raw,
 }
 
@@ -432,6 +474,10 @@ fn message_request(id: &MessageId, format: MessageFormat) -> Result<Request, Rem
             ("metadataHeaders", "From".to_owned()),
             ("metadataHeaders", "Subject".to_owned()),
             ("fields", METADATA_FIELDS.to_owned()),
+        ],
+        MessageFormat::Minimal => vec![
+            ("format", "minimal".to_owned()),
+            ("fields", "id,labelIds".to_owned()),
         ],
         MessageFormat::Raw => vec![
             ("format", "raw".to_owned()),
@@ -685,6 +731,7 @@ impl GmailTokenTransport {
     async fn post_token(
         &self,
         parameters: &[(&'static str, Zeroizing<String>)],
+        capability: AccountCapability,
     ) -> Result<TokenResponse, TokenTransportError> {
         let response = self
             .transport
@@ -693,7 +740,7 @@ impl GmailTokenTransport {
             .map_err(TransportError::into_token_error)?;
         let mut body = response.body;
         let result = if response.status == 200 {
-            parse_token_response(&body)
+            parse_token_response(&body, capability)
         } else {
             Err(map_error_response(&body))
         };
@@ -711,14 +758,20 @@ impl TokenTransport for GmailTokenTransport {
         &self,
         request: ExchangeRequest,
     ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
-        Box::pin(async move { self.post_token(&request.parameters()).await })
+        Box::pin(async move {
+            self.post_token(&request.parameters(), request.requested_capability())
+                .await
+        })
     }
 
     fn refresh(
         &self,
         request: RefreshRequest,
     ) -> BoxFuture<'_, Result<TokenResponse, TokenTransportError>> {
-        Box::pin(async move { self.post_token(&request.parameters()).await })
+        Box::pin(async move {
+            self.post_token(&request.parameters(), request.stored_capability())
+                .await
+        })
     }
 
     /// Revokes a token at Google's revoke endpoint, best-effort.
@@ -801,7 +854,7 @@ impl PostTransport for ReqwestPostTransport {
             }
             Ok(HttpResponse {
                 status,
-                body: body.finish(),
+                body: body.finish()?,
             })
         })
     }
@@ -833,7 +886,18 @@ where
     Ok(Option::<String>::deserialize(deserializer)?.map(Zeroizing::new))
 }
 
-fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportError> {
+// With default=None, this runs only for a present field. String deserialization
+// rejects JSON null/type mismatch rather than converting it to absent evidence.
+fn deserialize_present_scope<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Zeroizing<String>>, D::Error> {
+    deserialize_zeroizing(deserializer).map(Some)
+}
+
+fn parse_token_response(
+    bytes: &[u8],
+    capability: AccountCapability,
+) -> Result<TokenResponse, TokenTransportError> {
     #[derive(Deserialize)]
     #[expect(
         dead_code,
@@ -846,32 +910,32 @@ fn parse_token_response(bytes: &[u8]) -> Result<TokenResponse, TokenTransportErr
         #[serde(default, deserialize_with = "deserialize_optional_zeroizing")]
         refresh_token: Option<Zeroizing<String>>,
         token_type: String,
-        scope: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_present_scope")]
+        scope: Option<Zeroizing<String>>,
         #[serde(default, deserialize_with = "deserialize_optional_zeroizing")]
         id_token: Option<Zeroizing<String>>,
     }
     let parsed = serde_json::from_slice::<TokenResponseBody>(bytes)
         .map_err(|_error| TokenTransportError::MalformedResponse)?;
-    let gmail_read_granted = parsed.scope.as_deref().is_none_or(|scope| {
-        scope
-            .split_ascii_whitespace()
-            .any(|granted| granted == GMAIL_READONLY_SCOPE)
-    });
+    let evidence =
+        ScopeEvidence::from_scope_field(parsed.scope.as_ref().map(|value| value.as_str()))
+            .map_err(|_error| TokenTransportError::MalformedResponse)?;
+    let accepted = evidence.validate_for(capability).is_ok();
     // Scope is the earlier security boundary: an explicitly under-scoped
     // response must reach lifecycle cleanup with its minted token handles even
     // when the same response carries a malformed id_token. Identity is never
     // consumed for a rejected scope, so parsing it here would only strand the
     // provider grant before the caller can revoke it.
-    let id_token_claims = match (gmail_read_granted, parsed.id_token) {
+    let id_token_claims = match (accepted, parsed.id_token) {
         (true, Some(id_token)) => Some(parse_id_token_claims(id_token.as_str())?),
         (true, None) | (false, _) => None,
     };
-    Ok(TokenResponse::new(
+    Ok(TokenResponse::with_scope_evidence(
         parsed.access_token,
         Duration::from_secs(parsed.expires_in),
         parsed.refresh_token,
         id_token_claims,
-        gmail_read_granted,
+        evidence,
     ))
 }
 
@@ -997,6 +1061,8 @@ fn map_revoke_error_response(bytes: &[u8]) -> TokenTransportError {
 
 #[cfg(test)]
 mod tests {
+    mod t4_tests;
+
     use std::collections::VecDeque;
     use std::future::pending;
     use std::pin::Pin;
@@ -1105,7 +1171,7 @@ mod tests {
                         }
                         Ok(HttpResponse {
                             status,
-                            body: body.finish(),
+                            body: body.finish()?,
                         })
                     }
                     Some(Reply::Network) | None => Err(TransportError::Network),
@@ -1130,7 +1196,8 @@ mod tests {
         future.poll(&mut Context::from_waker(&waker))
     }
 
-    fn ready<T>(mut future: Pin<Box<dyn Future<Output = T> + Send + '_>>) -> T {
+    fn ready<T, F: Future<Output = T>>(future: F) -> T {
+        let mut future = Box::pin(future);
         match poll_once(future.as_mut()) {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("test future unexpectedly remained pending"),
@@ -1218,7 +1285,7 @@ mod tests {
                         }
                         Ok(HttpResponse {
                             status,
-                            body: body.finish(),
+                            body: body.finish()?,
                         })
                     }
                     Some(Reply::Network) | None => Err(TransportError::Network),
@@ -1293,10 +1360,18 @@ mod tests {
     }
 
     fn make_grant(code: &str) -> AuthorizationGrant {
-        let config = AuthorizationConfig::new(
+        make_grant_for(code, tersa_application::AccountCapability::ReadOnly)
+    }
+
+    fn make_grant_for(
+        code: &str,
+        capability: tersa_application::AccountCapability,
+    ) -> AuthorizationGrant {
+        let config = AuthorizationConfig::for_capability(
             "public-test-client",
             test_redirect(),
             Duration::from_secs(60),
+            capability,
         )
         .unwrap_or_else(|error| panic!("invalid test authorization configuration: {error}"));
         let prepared = prepare_authorization(config, TestClock::default())
@@ -1979,10 +2054,12 @@ mod tests {
             r#"{{"access_token":"a","expires_in":3599,"token_type":"Bearer","id_token":"{}"}}"#,
             jwt(payload)
         );
-        let (_access, _expires, _refresh, claims, gmail_read_granted) =
-            parse_token_response(body.as_bytes())
-                .unwrap_or_else(|error| panic!("expected a token response: {error:?}"))
-                .into_parts();
+        let (_access, _expires, _refresh, claims, gmail_read_granted) = parse_token_response(
+            body.as_bytes(),
+            tersa_application::AccountCapability::ReadOnly,
+        )
+        .unwrap_or_else(|error| panic!("expected a token response: {error:?}"))
+        .into_parts();
         assert!(claims.is_some());
         assert!(gmail_read_granted);
     }
@@ -1990,10 +2067,12 @@ mod tests {
     #[test]
     fn parse_token_response_without_an_id_token_carries_no_claims() {
         let body = r#"{"access_token":"a","expires_in":3599,"token_type":"Bearer"}"#;
-        let (_access, _expires, _refresh, claims, gmail_read_granted) =
-            parse_token_response(body.as_bytes())
-                .unwrap_or_else(|error| panic!("expected a token response: {error:?}"))
-                .into_parts();
+        let (_access, _expires, _refresh, claims, gmail_read_granted) = parse_token_response(
+            body.as_bytes(),
+            tersa_application::AccountCapability::ReadOnly,
+        )
+        .unwrap_or_else(|error| panic!("expected a token response: {error:?}"))
+        .into_parts();
         assert!(claims.is_none());
         assert!(gmail_read_granted);
     }
@@ -2002,13 +2081,15 @@ mod tests {
     fn token_response_records_an_explicit_scope_without_gmail_read_access() {
         let under_scoped =
             br#"{"access_token":"a","expires_in":3599,"token_type":"Bearer","scope":"openid"}"#;
-        let response = parse_token_response(under_scoped)
-            .unwrap_or_else(|error| panic!("expected a parsed token response: {error:?}"));
+        let response =
+            parse_token_response(under_scoped, tersa_application::AccountCapability::ReadOnly)
+                .unwrap_or_else(|error| panic!("expected a parsed token response: {error:?}"));
         assert!(!response.gmail_read_granted());
 
         let fully_scoped = br#"{"access_token":"a","expires_in":3599,"token_type":"Bearer","scope":"openid https://www.googleapis.com/auth/gmail.readonly"}"#;
-        let response = parse_token_response(fully_scoped)
-            .unwrap_or_else(|error| panic!("expected a parsed token response: {error:?}"));
+        let response =
+            parse_token_response(fully_scoped, tersa_application::AccountCapability::ReadOnly)
+                .unwrap_or_else(|error| panic!("expected a parsed token response: {error:?}"));
         assert!(response.gmail_read_granted());
     }
 
@@ -2016,7 +2097,7 @@ mod tests {
     fn under_scoped_response_preserves_tokens_despite_a_malformed_id_token() {
         let under_scoped = br#"{"access_token":"access","expires_in":3599,"refresh_token":"refresh","token_type":"Bearer","scope":"openid","id_token":"malformed"}"#;
         let (access, _expires, refresh, claims, gmail_read_granted) =
-            parse_token_response(under_scoped)
+            parse_token_response(under_scoped, tersa_application::AccountCapability::ReadOnly)
                 .unwrap_or_else(|error| panic!("expected an under-scoped response: {error:?}"))
                 .into_parts();
         assert_eq!(access.as_str(), "access");
