@@ -1,8 +1,7 @@
-# Account schema v3: P5a handoff
+# Account schema v3: storage handoff
 
-P5a owns schema and credential transactions. History/command transactions,
-retention, domain reconstruction of dormant rows and runtime activation remain
-P5b/P5c/P7 work. No broker adapter dependency is introduced. Registry schema
+P5a owns schema and credential transactions; P5b and P5c implement the History
+and command methods described below. Runtime activation remains P7 work. No broker adapter dependency is introduced. Registry schema
 remains v1 and identity hashing remains algorithm 2. Old binaries reject v3;
 source rollback does not downgrade its format.
 
@@ -276,3 +275,80 @@ undo pins, Missing versus snapshot omission, the full 1,000-target record path,
 reads, readonly v1/v2/v3 no-write reads and migration coexistence, new read-time
 main/sidecar refusals, and damaged-body/unrelated-membership noninterference.
 They make no live provider, runtime, recovery-coordinator or P5c completion claim.
+
+
+## P5c durable command implementation
+
+`MailboxCommandStore` is implemented by `SqlCipherMailboxStore` without changing
+canonical v3 SQL, migrations, dependencies or registry format. Private bounded
+codecs reconstruct named message actions, classified User IDs and touched states
+through domain constructors. Raw SQLite types and byte lengths are checked before
+Rust allocation. Accessed item, membership, field and undo-source relationships
+reject corruption or orphans; routine open still does not walk these tables.
+Full membership decoding is bounded to 512 IDs per accessed command item.
+
+Every semantic mutation takes an immediate transaction and checks actual owning
+account, algorithm-2 identity, command revision and applicable FIFO conditions.
+Fresh admission and dispatch require persisted Modify and no disconnect recovery;
+usable credentials are not loaded. Retained admission IDs return saved state.
+Lookup is separate: unknown/expired replay does not admit intent. Fresh compensation
+is admitted only through the current undo candidate and its admission-only empty
+nonterminal-queue gate. Both 32-command and 4,096-full-target-reference limits,
+FIFO allocation, Queued intent, fields and pins commit together. Revision and FIFO
+exhaustion fail without wrap or partial writes.
+
+Preparation compares fresh whole-command evidence against the actual snapshot,
+selects only unsettled unmet targets, captures actual touched pre-state for all
+known targets (including initial already-satisfied targets), and commits selected
+IDs, Dispatching, dispatch revision/authorization and attempt/ticket consumption
+before returning a receipt. Original touched pre-state and possible-dispatch
+markers survive later failures and revisions. Interrupted Dispatching recovers as
+Ambiguous, including an explicit-only attempt with zero automatic attempts and no
+recorded transport result. Acknowledgements do not settle commands; stale outcomes
+and retry tickets cannot overwrite later revisions. Three automatic attempts are
+separate from each single-use explicit retry permission, and reconciliation moves
+an unused ticket to the new revision. Failed reads invalidate the ticket.
+
+Settlement derives item outcomes from complete same-account exact-key observations.
+All missing is terminal Partial with zero successes. Unknown/failed reads retain
+uncertainty and pins. An ordinary Remove User label can complete without a write
+when membership already lacks that exact ID, even if the definition is missing;
+Apply and dispatch still need the actual User definition. Create adopts exactly
+one complete-catalog match; zero/multiple never permit automatic recreation after
+possible dispatch. A further explicit create requires fresh zero matches and the
+duplicate-risk confirmation. Rename/delete use observed known-ID name/absence.
+
+The first compensation settlement or dispatch must freshly validate the entire
+target set, required User label and touched expected post-state. Generic desired
+state matching cannot bypass that comparison. The admission-only queue gate is
+not repeated for the undo itself or later queued work. First dispatch persists the
+guard marker, allowing partial recovery against remaining targets without
+reapplying the original condition to targets already restored. This is local SQL
+atomicity, without provider CAS or distributed rollback.
+
+Terminal disposition and bounded summaries commit before FIFO/quota/pin release.
+Only Complete original message-state work replaces the undo slot. Label CRUD and
+compensation preserve it; its full body can outlive the 128-summary window. Cache
+pruning retains every nonterminal/undo target, including through the existing
+legacy 10,000-envelope reconciliation API. Terminal release prunes observations
+that no longer have a cache row or pin. No nonterminal evidence is evicted.
+
+Reset, purge and identity replacement refuse all nonterminal work. The existing
+`mark_disconnect_started` operation now checks this guard in the same transaction
+before recording the pre-revocation marker. Recording a post-attempt unconfirmed
+revoke and local cancellation/settlement/Abandon remain possible after grant loss.
+Warned Abandon retains a terminal summary before releasing guards in the same
+commit. After safe disposition, reset clears terminal/undo/History/catalog/cache
+metadata while preserving binding, grant, identity and existing disconnect rules;
+purge performs its existing grant/identity teardown atomically. The old cache-reset
+identity/subject/credential/recovery eligibility checks remain in force.
+
+SQLCipher tests use production admission, preparation and settlement, competing
+connections and real deferred foreign-key commit failures. They cover rollback,
+FIFO/account/identity/revision guards, replay, automatic/explicit budgets, restart
+ambiguity, label ambiguity, full-target pre-state, whole-set undo refusal and
+partial recovery, bounded membership, retention, pins, lifecycle guards and
+Abandon commit failure. No owner receipt is fabricated to claim persistence.
+P6 orchestration, P7 runtime composition, independent approval, full-host checks,
+provider freshness/provenance, process-local generation fencing and live account
+acceptance remain separate responsibilities and claims.

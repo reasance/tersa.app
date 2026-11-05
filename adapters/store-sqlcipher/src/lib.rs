@@ -13,6 +13,8 @@
 #![deny(unsafe_code)]
 
 mod cached;
+mod command_codec;
+mod command_store;
 mod credentials;
 mod history_store;
 mod pins;
@@ -519,7 +521,7 @@ mod store {
         /// Atomically clears cached mail, T4 cache metadata and sync freshness.
         ///
         /// Keeps identity, binding, subject, token, email and recovery state.
-        /// Refuses retained command/undo bodies until pin-aware P5c paths exist.
+        /// Refuses any nonterminal command; clears terminal summaries and undo atomically.
         /// Requires an existing current identity and required account metadata,
         /// without pending disconnect recovery. This is not account purge.
         /// Callers hold the installation lock; no network work belongs here.
@@ -542,7 +544,18 @@ mod store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(store_error)?;
             validate_cache_reset_account(&transaction, account)?;
-            clear_triage_cache(&transaction)?;
+            crate::command_store::guard_lifecycle(&transaction, account).map_err(|error| {
+                match error {
+                    tersa_application::mailbox_state::TriageStoreError::NotEligible => {
+                        CacheResetError::Ineligible
+                    }
+                    tersa_application::mailbox_state::TriageStoreError::Corrupt => {
+                        CacheResetError::Corrupted
+                    }
+                    _ => CacheResetError::Storage,
+                }
+            })?;
+            clear_triage_cache(&transaction, account)?;
             transaction
                 .execute("DELETE FROM messages", [])
                 .map_err(store_error)?;
@@ -1229,7 +1242,7 @@ mod store {
             })
         }
 
-        fn reconcile(
+        fn reconcile_envelopes(
             &self,
             account: &AccountId,
             envelopes: &[MessageEnvelope],
@@ -1263,11 +1276,14 @@ mod store {
                         return Err(MailboxStoreError::Storage);
                     }
                 }
-                refuse_command_evidence(&transaction)?;
+                let pins = crate::pins::read(&transaction, account).map_err(command_mailbox_error)?;
+                // Preserve the legacy 10,000-envelope input/keep contract. All retained
+                // command items are pins after bounded relationship validation above.
                 transaction.execute(
-                    "DELETE FROM messages WHERE message_id NOT IN (SELECT message_id FROM messages ORDER BY received_at DESC, message_id ASC LIMIT ?1)",
+                    "DELETE FROM messages WHERE message_id NOT IN (SELECT message_id FROM messages ORDER BY received_at DESC, message_id ASC LIMIT ?1) AND message_id NOT IN (SELECT message_id FROM command_items)",
                     params![i64::from(keep_limit.get())],
                 ).map_err(store_error)?;
+                crate::history_store::prune_provider(&transaction, account, &pins).map_err(command_mailbox_error)?;
                 #[cfg(test)]
                 if self.take_failpoint()? {
                     return Err(MailboxStoreError::Storage);
@@ -1342,8 +1358,11 @@ mod store {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(store_error)?;
                 assert_identity_matches_expected(&transaction, account, expected)?;
+                if expected.is_some_and(|old| old != fresh) {
+                    crate::command_store::guard_lifecycle(&transaction, account).map_err(command_mailbox_error)?;
+                }
                 if clear_mailbox {
-                    clear_triage_cache(&transaction)?;
+                    clear_triage_cache(&transaction, account)?;
                     transaction
                         .execute("DELETE FROM messages", [])
                         .map_err(store_error)?;
@@ -1440,7 +1459,7 @@ mod store {
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(store_error)?;
-                clear_triage_cache(&transaction)?;
+                clear_triage_cache(&transaction, account)?;
                 transaction
                     .execute("DELETE FROM messages", [])
                     .map_err(store_error)?;
@@ -1496,13 +1515,19 @@ mod store {
                 DisconnectRecoveryState::RevokeUnconfirmed => 2,
             });
             self.with_connection(|connection| {
-                connection
-                    .execute(
-                        "INSERT INTO account_lifecycle (singleton, disconnect_recovery, last_successful_sync_unix_millis) VALUES (1, NULLIF(?1, 0), NULL) ON CONFLICT(singleton) DO UPDATE SET disconnect_recovery = excluded.disconnect_recovery",
-                        params![value],
-                    )
+                let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(store_error)?;
-                Ok(())
+                // This is the pre-revocation boundary used by the existing removal flow.
+                // A post-attempt unconfirmed fact must remain recordable even after grant loss.
+                if recovery == Some(DisconnectRecoveryState::IncompleteTeardown) {
+                    crate::command_store::guard_lifecycle(&transaction, &self.account)
+                        .map_err(command_mailbox_error)?;
+                }
+                transaction.execute(
+                    "INSERT INTO account_lifecycle (singleton, disconnect_recovery, last_successful_sync_unix_millis) VALUES (1, NULLIF(?1, 0), NULL) ON CONFLICT(singleton) DO UPDATE SET disconnect_recovery = excluded.disconnect_recovery",
+                    params![value],
+                ).map_err(store_error)?;
+                transaction.commit().map_err(store_error)
             })
         }
 
@@ -2905,7 +2930,7 @@ mod store {
         ) -> BoxFuture<'a, Result<Vec<MessageId>, MailboxStoreError>> {
             Box::pin(async move {
                 self.checked_account(account)?;
-                self.reconcile(account, envelopes, keep_limit, fence)
+                self.reconcile_envelopes(account, envelopes, keep_limit, fence)
             })
         }
         fn cache_message_if_present<'a>(
@@ -3859,24 +3884,27 @@ mod store {
         }
     }
 
-    // Until the pin-aware P5c methods land, legacy destructive paths refuse
-    // retained command/undo bodies. They must never silently erase evidence.
-    fn refuse_command_evidence(connection: &Connection) -> Result<(), MailboxStoreError> {
-        let occupied: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM mailbox_commands) OR EXISTS(SELECT 1 FROM mailbox_undo)", [], |r| r.get(0)
-        ).map_err(store_error)?;
-        if occupied {
-            Err(MailboxStoreError::Storage)
-        } else {
-            Ok(())
+    fn command_mailbox_error(
+        error: tersa_application::mailbox_state::TriageStoreError,
+    ) -> MailboxStoreError {
+        match error {
+            tersa_application::mailbox_state::TriageStoreError::Corrupt => {
+                MailboxStoreError::Corrupted
+            }
+            _ => MailboxStoreError::Storage,
         }
     }
 
-    fn clear_triage_cache(connection: &Connection) -> Result<(), MailboxStoreError> {
-        refuse_command_evidence(connection)?;
+    fn clear_triage_cache(
+        connection: &Connection,
+        account: &AccountId,
+    ) -> Result<(), MailboxStoreError> {
+        crate::command_store::guard_lifecycle(connection, account)
+            .map_err(command_mailbox_error)?;
         connection.execute_batch(
-            "DELETE FROM terminal_commands; DELETE FROM provider_memberships; DELETE FROM provider_messages;
-             DELETE FROM provider_labels; UPDATE mailbox_checkpoint SET history_cursor = NULL, recovery_required = 0, catalog_known = 0;"
+            "DELETE FROM mailbox_undo; DELETE FROM mailbox_commands; DELETE FROM terminal_commands;
+             DELETE FROM provider_memberships; DELETE FROM provider_messages; DELETE FROM provider_labels;
+             UPDATE mailbox_checkpoint SET history_cursor = NULL, recovery_required = 0, catalog_known = 0;"
         ).map_err(store_error)
     }
 
@@ -3953,6 +3981,7 @@ mod store {
 
         include!("p5a_tests.rs");
         include!("p5b_tests.rs");
+        include!("p5c_tests.rs");
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 

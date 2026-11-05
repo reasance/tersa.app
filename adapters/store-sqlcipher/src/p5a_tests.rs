@@ -557,9 +557,9 @@ mod p5a {
         );
     }
 
-    // Proves all pre-P5c destructive entry points refuse durable target/undo bodies.
+    // Pending work and incomplete seeded undo evidence both refuse destructive lifecycle operations.
     #[test]
-    fn legacy_destructive_paths_refuse_command_evidence_and_reset_clears_only_cache_state() {
+    fn destructive_paths_refuse_pending_or_corrupt_undo_and_reset_clears_only_cache_state() {
         for undo in [false, true] {
             let (_database, store) = reset_fixture("p5a-legacy-guards", &account());
             {
@@ -590,15 +590,6 @@ mod p5a {
                 ))
                 .is_err()
             );
-            assert!(
-                run(store.reconcile_recent_envelopes(
-                    &account(),
-                    &[],
-                    StoreLimit::new(1).unwrap(),
-                    &fence()
-                ))
-                .is_err()
-            );
             assert_eq!(reset_snapshot(&store, true), before);
             assert_eq!(
                 values(
@@ -615,7 +606,7 @@ mod p5a {
              INSERT INTO provider_labels VALUES ('Label_a','exact',1);
              INSERT INTO provider_messages VALUES ('body',1);
              INSERT INTO provider_memberships VALUES ('body','Label_a');
-             INSERT INTO terminal_commands VALUES ('expired',zeroblob(8),1,7,0,1,0,0,0);"
+             INSERT INTO terminal_commands VALUES ('expired',zeroblob(8),1,7,0,1,0,0,0); UPDATE mailbox_checkpoint SET next_fifo = 2;"
         ).unwrap();
         store.clear_cached_mail(&account()).unwrap();
         assert_eq!(
