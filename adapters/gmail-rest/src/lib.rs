@@ -11,8 +11,9 @@
 //! ADR-0023 `TokenTransport` port as form-encoded `POST` exchanges against the
 //! OAuth 2 token endpoint, plus a best-effort revoke call. It shares the
 //! hardened client policy with the `GET` path but no endpoint or state, and
-//! `GmailMailbox` itself remains `GET`-only. The crate never persists or logs
-//! credentials.
+//! `GmailMailbox` itself remains `GET`-only. The separate `GmailModifyMailbox`
+//! sends only the closed receipt-driven write set. The crate never persists or
+//! logs credentials.
 
 #![forbid(unsafe_code)]
 
@@ -55,6 +56,11 @@ const REVOKE_ENDPOINT: &str = "https://oauth2.googleapis.com/revoke";
 const TOKEN_RESPONSE_LIMIT: usize = 64 * 1024;
 
 mod history;
+mod json_object;
+mod modify;
+
+#[doc(inline)]
+pub use modify::GmailModifyMailbox;
 
 type TransportFuture<'a> =
     Pin<Box<dyn Future<Output = Result<HttpResponse, TransportError>> + Send + 'a>>;

@@ -10,6 +10,7 @@
 //! No response cursor is persisted, no fallback/retention policy is run, and no
 //! mailbox mutation endpoint is available through this module.
 
+use super::json_object::Object;
 use super::{
     AccountId, BASE_URL, BoxFuture, GmailMailbox, GmailMetadata, JSON_LIMIT, MessageFormat,
     MessageId, PageSize, PageToken, RemoteMailboxError, Request, ThreadId, Url, envelope_from,
@@ -277,12 +278,14 @@ fn complete_membership(
     LabelMembership::new(account.clone(), ids).map_err(|_e| invalid())
 }
 
+type LabelsDocument = Object<LabelEntries>;
+type LabelDocument = Object<LabelFields>;
 #[derive(Deserialize)]
-struct LabelsDocument {
+struct LabelEntries {
     labels: Vec<LabelDocument>,
 }
 #[derive(Deserialize)]
-struct LabelDocument {
+struct LabelFields {
     id: String,
     name: String,
     #[serde(rename = "type")]
@@ -292,6 +295,7 @@ fn label_definition(
     account: &AccountId,
     value: LabelDocument,
 ) -> Result<LabelDefinition, MetadataReadError> {
+    let Object(value) = value;
     let kind = match value.kind.as_str() {
         "system" => LabelKind::System,
         "user" => LabelKind::User,
@@ -305,12 +309,20 @@ fn label_definition(
     )
     .map_err(|_e| invalid())
 }
+pub(super) fn decode_label_response(
+    account: &AccountId,
+    body: &[u8],
+) -> Result<LabelDefinition, MetadataReadError> {
+    let value: LabelDocument = serde_json::from_slice(body).map_err(|_e| invalid())?;
+    label_definition(account, value)
+}
+
 pub(super) async fn read_label_catalog(
     mailbox: &GmailMailbox,
     account: &AccountId,
 ) -> Result<LabelCatalog, MetadataReadError> {
     mailbox.checked_account(account).map_err(map_read)?;
-    let labels: LabelsDocument = mailbox
+    let Object(labels): LabelsDocument = mailbox
         .request_json(
             read_request(
                 &["labels"],
