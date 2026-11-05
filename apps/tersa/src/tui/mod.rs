@@ -9,6 +9,9 @@
 //! ratatui's test backend.
 
 mod app;
+pub(crate) mod control;
+#[cfg(test)]
+mod integration_tests;
 #[cfg(test)]
 mod perf;
 mod view;
@@ -33,8 +36,23 @@ use tersa_application::unified_mailbox::{
 use tersa_presentation::terminal::SafeText;
 
 use app::{App, Request};
-pub use app::{MessageKey, Row, ViewScope, account_tag_label};
+pub use app::{MessageKey, ReadMarker, Row, ViewScope, account_tag_label};
 use worker::{Done, Worker, Workers};
+
+/// Distinct continuation types prevent a legacy query cursor from posing as a runtime view.
+#[derive(Clone, Debug)]
+pub enum MailContinuation {
+    Legacy(UnifiedMailboxContinuation),
+    Runtime(tersa_sync_runtime::CachedViewContinuation),
+}
+impl MailContinuation {
+    pub(crate) fn legacy(&self) -> Result<&UnifiedMailboxContinuation, ()> {
+        match self {
+            Self::Legacy(value) => Ok(value),
+            Self::Runtime(_) => Err(()),
+        }
+    }
+}
 
 /// Where the interface reads cached mail from.
 pub trait MailSource {
@@ -46,7 +64,7 @@ pub trait MailSource {
     fn page(
         &self,
         scope: &ViewScope,
-        continuation: Option<&UnifiedMailboxContinuation>,
+        continuation: Option<&MailContinuation>,
         limit: u16,
     ) -> Result<MailPage, ()>;
 
@@ -61,13 +79,29 @@ pub trait MailSource {
     /// Every account the source reads, in registry order, each with its
     /// stored Gmail address or its id. Read again after every finished sync.
     fn account_labels(&self) -> Vec<(AccountId, SafeText)>;
+    fn set_filter(&self, filter: &tersa_sync_runtime::CachedMailboxFilter) -> Result<(), ()>;
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "P9b cached account inspector uses this required source facet"
+        )
+    )]
+    fn account_state(
+        &self,
+        account: &AccountId,
+    ) -> Result<tersa_sync_runtime::AccountCommandStatus, ()>;
+    fn label_catalog(
+        &self,
+        account: &AccountId,
+    ) -> Result<Option<tersa_application::mailbox_state::LabelCatalog>, ()>;
 }
 
 /// Sanitized rows with the application's account-scoped pagination state.
 #[derive(Default)]
 pub struct MailPage {
     pub rows: Vec<Row>,
-    pub continuation: Option<UnifiedMailboxContinuation>,
+    pub continuation: Option<MailContinuation>,
     pub unavailable_accounts: Vec<UnavailableAccount>,
 }
 
@@ -79,7 +113,7 @@ impl From<UnifiedMailboxDocument> for MailPage {
                 .into_iter()
                 .map(|row| Row::from_envelope(&row.envelope, &row.account_id))
                 .collect(),
-            continuation: document.continuation,
+            continuation: document.continuation.map(MailContinuation::Legacy),
             unavailable_accounts: document.unavailable_accounts,
         }
     }
@@ -87,6 +121,7 @@ impl From<UnifiedMailboxDocument> for MailPage {
 
 /// Initializes display state without terminal or network I/O.
 pub(crate) fn initial_app(source: &dyn MailSource) -> Result<App, ()> {
+    source.set_filter(&tersa_sync_runtime::CachedMailboxFilter::Recent)?;
     let page = read_page(source, &ViewScope::All, None, FIRST_PAGE)?;
     let mut app = App::new(source.account_labels(), Vec::new());
     set_progress(&mut app, &page);
@@ -137,6 +172,14 @@ pub trait Remote: Send + 'static {
 
     /// Syncs only this account through its identity gate.
     fn sync<'a>(&'a self, account: &'a AccountId) -> Pending<'a, ()>;
+
+    /// Required real account-local controls; production implementations may not omit wiring.
+    fn control<'a>(
+        &'a self,
+        account: &'a AccountId,
+        job: control::ControlJob,
+        progress: &'a control::ProgressSink,
+    ) -> Pending<'a, control::ControlResult>;
 }
 
 /// How often the loop checks for finished work while idle.
@@ -197,6 +240,9 @@ pub fn run(
     let mut app =
         initial_app(source).map_err(|()| "could not read the local mailbox".to_owned())?;
     let mut worker = Workers::start(remotes)?;
+    for account in &mut worker.accounts {
+        let _ = account.control(control::ControlJob::Status, app.view_epoch);
+    }
     // Installs a panic hook that restores the terminal before reporting.
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
@@ -215,8 +261,14 @@ pub fn run(
     let result = event_loop(&mut terminal, &mut app, source, &mut worker);
     silence_closed_stderr();
     ratatui::restore();
-    // Stops the network thread once the terminal is back to normal.
+    // Stops account work once the terminal is restored. External browser apps
+    // are intentionally not killed or joined with these account tasks.
+    worker.stop_all();
+    let interrupted = worker.interruption_notice();
     drop(worker);
+    if let Some(notice) = interrupted {
+        eprintln!("{notice}");
+    }
     result
 }
 
@@ -232,6 +284,7 @@ fn event_loop(
     let mut dirty = true;
     let mut drawn = Instant::now();
     loop {
+        crate::browser::reap();
         if PANICKED.load(Ordering::SeqCst) {
             return Err("tersa stopped after an internal error".to_owned());
         }
@@ -300,6 +353,11 @@ fn event_loop(
                     app.status = Some("That account view is unavailable.".to_owned());
                 }
             }
+            Some(Request::ChangeFilter(filter)) => {
+                if change_filter(app, source, worker, filter).is_err() {
+                    app.status = Some("That observed mailbox filter is unavailable.".to_owned());
+                }
+            }
             Some(Request::Sync) => {
                 if worker.is_empty() {
                     app.status = Some("Syncing needs a readable account and the Google OAuth client; see `tersa doctor`.".to_owned());
@@ -323,12 +381,34 @@ fn change_view(
         return Ok(false);
     }
     workers.change_view(app.view_epoch);
+    source.set_filter(&app.filter)?;
     if let Ok(page) = read_page(source, &app.scope, None, FIRST_PAGE) {
         set_progress(app, &page);
         app.append(page.rows);
     } else {
         app.rows_failed();
         app.status = Some("The selected mailbox view could not be read.".to_owned());
+    }
+    Ok(true)
+}
+
+fn change_filter(
+    app: &mut App,
+    source: &dyn MailSource,
+    workers: &mut Workers,
+    filter: tersa_sync_runtime::CachedMailboxFilter,
+) -> Result<bool, ()> {
+    if !app.set_filter(filter)? {
+        return Ok(false);
+    }
+    workers.change_view(app.view_epoch);
+    source.set_filter(&app.filter)?;
+    match read_page(source, &app.scope, None, FIRST_PAGE) {
+        Ok(page) => {
+            set_progress(app, &page);
+            app.append(page.rows);
+        }
+        Err(()) => app.rows_failed(),
     }
     Ok(true)
 }
@@ -392,6 +472,39 @@ fn finish_work(workers: &mut Workers, app: &mut App, source: &dyn MailSource, no
                     if worker.finish_fetch(&key, epoch) {
                         resume_open_message(worker, app, source, &key);
                     }
+                }
+                Done::Control(event) if worker.finish_control(&event) => {
+                    let binding = event.binding();
+                    let account = binding.account.clone();
+                    let visible = binding.epoch == app.view_epoch && app.scope.contains(&account);
+                    let final_result = matches!(event, control::ControlEvent::Finished(_, _));
+                    if visible {
+                        app.status = Some(match &event {
+                            control::ControlEvent::Progress(
+                                _,
+                                control::Progress::Durable(receipt),
+                            ) => receipt.notice().to_string(),
+                            control::ControlEvent::Progress(
+                                _,
+                                control::Progress::AuthorizationLink(link),
+                            ) => format!(
+                                "Authorization for {}: {}",
+                                SafeText::single_line(account.as_str()),
+                                link
+                            ),
+                            control::ControlEvent::Finished(_, Ok(result)) => {
+                                result.notice().to_string()
+                            }
+                            control::ControlEvent::Finished(_, Err(error)) => error.to_string(),
+                        });
+                    }
+                    if final_result {
+                        app.set_accounts(source.account_labels());
+                    }
+                    reload |= final_result && app.scope.contains(&account);
+                    // This is an already-consumed owner summary (at most one per
+                    // registered account), not an unbounded second result queue.
+                    app.control_results.insert(account, event);
                 }
                 Done::Synced(account, result) if account == worker.account => {
                     worker.syncing = false;
@@ -457,7 +570,7 @@ fn load_page(app: &mut App, source: &dyn MailSource) -> bool {
 fn read_page(
     source: &dyn MailSource,
     scope: &ViewScope,
-    continuation: Option<&UnifiedMailboxContinuation>,
+    continuation: Option<&MailContinuation>,
     limit: u16,
 ) -> Result<MailPage, ()> {
     if !(1..=MAX_PAGE_SIZE).contains(&limit) {
@@ -612,11 +725,27 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        App, Done, FIRST_PAGE, MailPage, MailSource, MessageKey, Row, UnifiedMailboxContinuation,
-        ViewScope, WORKER_GONE, Worker, Workers, change_view, finish_work, initial_app, load_page,
-        read_page, read_rows, read_scoped_rows, set_progress, start_sync, terminal_open,
-        unreadable_status, view,
+        App, Done, FIRST_PAGE, MailContinuation, MailPage, MailSource, MessageKey, Row, ViewScope,
+        WORKER_GONE, Worker, Workers, change_view, finish_work, initial_app, load_page, read_page,
+        read_rows, read_scoped_rows, set_progress, start_sync, terminal_open, unreadable_status,
+        view,
     };
+
+    fn assert_legacy_cursor_retained(
+        actual: Option<&MailContinuation>,
+        expected: Option<&MailContinuation>,
+    ) {
+        assert_eq!(
+            actual
+                .map(MailContinuation::legacy)
+                .transpose()
+                .expect("legacy cursor"),
+            expected
+                .map(MailContinuation::legacy)
+                .transpose()
+                .expect("legacy cursor")
+        );
+    }
 
     fn id(text: &str) -> MessageId {
         MessageId::new(text).expect("id")
@@ -644,7 +773,7 @@ mod tests {
         fn page(
             &self,
             _scope: &ViewScope,
-            _continuation: Option<&UnifiedMailboxContinuation>,
+            _continuation: Option<&MailContinuation>,
             _limit: u16,
         ) -> Result<MailPage, ()> {
             Ok(MailPage::default())
@@ -656,6 +785,25 @@ mod tests {
 
         fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
             vec![(account("acct"), SafeText::single_line("acct"))]
+        }
+        fn set_filter(&self, filter: &tersa_sync_runtime::CachedMailboxFilter) -> Result<(), ()> {
+            if *filter == tersa_sync_runtime::CachedMailboxFilter::Recent {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        fn account_state(
+            &self,
+            _: &AccountId,
+        ) -> Result<tersa_sync_runtime::AccountCommandStatus, ()> {
+            Err(())
+        }
+        fn label_catalog(
+            &self,
+            _: &AccountId,
+        ) -> Result<Option<tersa_application::mailbox_state::LabelCatalog>, ()> {
+            Err(())
         }
     }
 
@@ -782,7 +930,7 @@ mod tests {
         fn page(
             &self,
             scope: &ViewScope,
-            continuation: Option<&UnifiedMailboxContinuation>,
+            continuation: Option<&MailContinuation>,
             limit: u16,
         ) -> Result<MailPage, ()> {
             assert!(
@@ -807,7 +955,7 @@ mod tests {
                                 row.received_at_millis,
                             )
                             .expect("time"),
-                            row.unread,
+                            row.read == super::ReadMarker::Unread,
                         )
                     })
                     .collect(),
@@ -829,7 +977,7 @@ mod tests {
                     tersa_application::unified_mailbox::UnifiedMailboxQuery.execute(
                         &sources,
                         limit,
-                        continuation,
+                        continuation.map(MailContinuation::legacy).transpose()?,
                         false,
                     ),
                 )
@@ -848,6 +996,25 @@ mod tests {
 
         fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
             vec![(account("acct"), SafeText::single_line("acct"))]
+        }
+        fn set_filter(&self, filter: &tersa_sync_runtime::CachedMailboxFilter) -> Result<(), ()> {
+            if *filter == tersa_sync_runtime::CachedMailboxFilter::Recent {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        fn account_state(
+            &self,
+            _: &AccountId,
+        ) -> Result<tersa_sync_runtime::AccountCommandStatus, ()> {
+            Err(())
+        }
+        fn label_catalog(
+            &self,
+            _: &AccountId,
+        ) -> Result<Option<tersa_application::mailbox_state::LabelCatalog>, ()> {
+            Err(())
         }
     }
 
@@ -912,7 +1079,7 @@ mod tests {
             fn page(
                 &self,
                 scope: &ViewScope,
-                continuation: Option<&UnifiedMailboxContinuation>,
+                continuation: Option<&MailContinuation>,
                 limit: u16,
             ) -> Result<MailPage, ()> {
                 if continuation.is_some() {
@@ -931,6 +1098,28 @@ mod tests {
 
             fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
                 vec![(account("acct"), SafeText::single_line("acct"))]
+            }
+            fn set_filter(
+                &self,
+                filter: &tersa_sync_runtime::CachedMailboxFilter,
+            ) -> Result<(), ()> {
+                if *filter == tersa_sync_runtime::CachedMailboxFilter::Recent {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            fn account_state(
+                &self,
+                _: &AccountId,
+            ) -> Result<tersa_sync_runtime::AccountCommandStatus, ()> {
+                Err(())
+            }
+            fn label_catalog(
+                &self,
+                _: &AccountId,
+            ) -> Result<Option<tersa_application::mailbox_state::LabelCatalog>, ()> {
+                Err(())
             }
         }
         let source = OlderFail(Pages::new(1_234));
@@ -958,7 +1147,7 @@ mod tests {
             fn page(
                 &self,
                 scope: &ViewScope,
-                continuation: Option<&UnifiedMailboxContinuation>,
+                continuation: Option<&MailContinuation>,
                 limit: u16,
             ) -> Result<MailPage, ()> {
                 if self.1.get() {
@@ -977,6 +1166,28 @@ mod tests {
 
             fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
                 vec![(account("acct"), SafeText::single_line("acct"))]
+            }
+            fn set_filter(
+                &self,
+                filter: &tersa_sync_runtime::CachedMailboxFilter,
+            ) -> Result<(), ()> {
+                if *filter == tersa_sync_runtime::CachedMailboxFilter::Recent {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            fn account_state(
+                &self,
+                _: &AccountId,
+            ) -> Result<tersa_sync_runtime::AccountCommandStatus, ()> {
+                Err(())
+            }
+            fn label_catalog(
+                &self,
+                _: &AccountId,
+            ) -> Result<Option<tersa_application::mailbox_state::LabelCatalog>, ()> {
+                Err(())
             }
         }
         let source = FailAfterSync(Pages::new(1_234), std::cell::Cell::new(false));
@@ -1069,7 +1280,7 @@ mod tests {
         fn page(
             &self,
             scope: &ViewScope,
-            continuation: Option<&UnifiedMailboxContinuation>,
+            continuation: Option<&MailContinuation>,
             limit: u16,
         ) -> Result<MailPage, ()> {
             self.0.page(scope, continuation, limit)
@@ -1086,6 +1297,25 @@ mod tests {
                 stored.unwrap_or_else(|| SafeText::single_line("acct_1234")),
             )]
         }
+        fn set_filter(&self, filter: &tersa_sync_runtime::CachedMailboxFilter) -> Result<(), ()> {
+            if *filter == tersa_sync_runtime::CachedMailboxFilter::Recent {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        fn account_state(
+            &self,
+            _: &AccountId,
+        ) -> Result<tersa_sync_runtime::AccountCommandStatus, ()> {
+            Err(())
+        }
+        fn label_catalog(
+            &self,
+            _: &AccountId,
+        ) -> Result<Option<tersa_application::mailbox_state::LabelCatalog>, ()> {
+            Err(())
+        }
     }
 
     /// Two accounts whose labels change between reads, like stores that gain
@@ -1096,7 +1326,7 @@ mod tests {
         fn page(
             &self,
             scope: &ViewScope,
-            _continuation: Option<&UnifiedMailboxContinuation>,
+            _continuation: Option<&MailContinuation>,
             _limit: u16,
         ) -> Result<MailPage, ()> {
             Ok(MailPage {
@@ -1116,6 +1346,25 @@ mod tests {
 
         fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
             self.1.borrow().clone()
+        }
+        fn set_filter(&self, filter: &tersa_sync_runtime::CachedMailboxFilter) -> Result<(), ()> {
+            if *filter == tersa_sync_runtime::CachedMailboxFilter::Recent {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        fn account_state(
+            &self,
+            _: &AccountId,
+        ) -> Result<tersa_sync_runtime::AccountCommandStatus, ()> {
+            Err(())
+        }
+        fn label_catalog(
+            &self,
+            _: &AccountId,
+        ) -> Result<Option<tersa_application::mailbox_state::LabelCatalog>, ()> {
+            Err(())
         }
     }
 
@@ -1210,7 +1459,7 @@ mod tests {
             fn page(
                 &self,
                 scope: &ViewScope,
-                continuation: Option<&UnifiedMailboxContinuation>,
+                continuation: Option<&MailContinuation>,
                 limit: u16,
             ) -> Result<MailPage, ()> {
                 if self.1.get() {
@@ -1224,6 +1473,28 @@ mod tests {
             }
             fn account_labels(&self) -> Vec<(AccountId, SafeText)> {
                 self.0.account_labels()
+            }
+            fn set_filter(
+                &self,
+                filter: &tersa_sync_runtime::CachedMailboxFilter,
+            ) -> Result<(), ()> {
+                if *filter == tersa_sync_runtime::CachedMailboxFilter::Recent {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            fn account_state(
+                &self,
+                _: &AccountId,
+            ) -> Result<tersa_sync_runtime::AccountCommandStatus, ()> {
+                Err(())
+            }
+            fn label_catalog(
+                &self,
+                _: &AccountId,
+            ) -> Result<Option<tersa_application::mailbox_state::LabelCatalog>, ()> {
+                Err(())
             }
         }
         let source = BecomesUnavailable(Pages::new(300), std::cell::Cell::new(false));
@@ -1421,6 +1692,21 @@ mod tests {
                 assert_eq!(account, &self.account);
                 let _ = self.started.send(account.clone());
                 std::future::pending().await
+            })
+        }
+        fn control<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            job: crate::tui::control::ControlJob,
+            _progress: &'a crate::tui::control::ProgressSink,
+        ) -> crate::tui::Pending<'a, crate::tui::control::ControlResult> {
+            Box::pin(async move {
+                match job {
+                    crate::tui::control::ControlJob::Status => {
+                        Err("status not provided by fetch/sync fixture".to_owned())
+                    }
+                    _ => panic!("unexpected control work in fetch/sync fixture"),
+                }
             })
         }
     }
@@ -1738,7 +2024,7 @@ mod tests {
             .expect("no-op")
         );
         assert_eq!(source.requests.borrow().len(), calls);
-        assert_eq!(app.continuation, cursor);
+        assert_legacy_cursor_retained(app.continuation.as_ref(), cursor.as_ref());
         assert_eq!(app.view_epoch, epoch);
         assert!(
             change_view(
@@ -1844,6 +2130,21 @@ mod tests {
             }
             fn sync<'a>(&'a self, _: &'a AccountId) -> super::Pending<'a, ()> {
                 Box::pin(std::future::pending())
+            }
+            fn control<'a>(
+                &'a self,
+                _account: &'a AccountId,
+                job: crate::tui::control::ControlJob,
+                _progress: &'a crate::tui::control::ProgressSink,
+            ) -> crate::tui::Pending<'a, crate::tui::control::ControlResult> {
+                Box::pin(async move {
+                    match job {
+                        crate::tui::control::ControlJob::Status => {
+                            Err("status not provided by fetch/sync fixture".to_owned())
+                        }
+                        _ => panic!("unexpected control work in fetch/sync fixture"),
+                    }
+                })
             }
         }
         let source = Relabeled(
@@ -2039,7 +2340,7 @@ mod tests {
             app.rows.iter().map(Row::message_key).collect::<Vec<_>>(),
             old_rows
         );
-        assert_eq!(app.continuation, old_cursor);
+        assert_legacy_cursor_retained(app.continuation.as_ref(), old_cursor.as_ref());
         assert_eq!(app.open_key(), Some(&wanted));
         assert!(
             matches!(&app.screen, Screen::Message(view) if view.layout == old_layout && matches!(&view.body, Body::Rendered(body) if body.body.as_str() == "current body"))
@@ -2070,7 +2371,15 @@ mod tests {
         assert_eq!(*source.requests.borrow(), [100]);
         assert_eq!(app.rows[0].message_key(), key("acct_a", "fresh"));
         assert!(app.rows.iter().all(|row| row.account == account("acct_a")));
-        assert_ne!(app.continuation, old_cursor);
+        assert_eq!(app.scope, ViewScope::Account(account("acct_a")));
+        let former_page_end = old_rows.last().expect("previous page end");
+        load_page(&mut app, source);
+        assert!(
+            app.rows
+                .iter()
+                .any(|row| &row.message_key() == former_page_end),
+            "fresh continuation includes the row displaced by the new head instead of skipping it"
+        );
         assert_eq!(app.open_key(), Some(&wanted));
         assert_eq!(app.sync[0].state, SyncState::Synced(43));
         assert!(matches!(app.sync[1].state, SyncState::Failed(_)));

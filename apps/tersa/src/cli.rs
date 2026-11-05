@@ -15,11 +15,14 @@ tersa — a privacy-first Gmail client for the terminal
 Usage:
   tersa                           Open the full-screen interface
   tersa account add               Sign in with Google and add an account
+  tersa account upgrade <account> Explicitly request Modify access for an existing account
+  tersa account reconnect <account>
+                                  Reconnect with the account's stored capability
   tersa account list              List added accounts
   tersa account remove <account>  Revoke access and delete local data
   tersa account reset <account> [--yes]
                                   Clear local mail and download recent mail again
-  tersa sync [<account>]          Fetch recent mail (all accounts by default)
+  tersa sync [<account>]          Sync bounded cached History and one command pass (all accounts by default)
   tersa inbox [<account>] [--limit <n>]
                                   Print cached recent mail
   tersa doctor                    Check configuration and storage
@@ -32,6 +35,8 @@ pub enum Command {
     Version,
     AccountAdd,
     AccountList,
+    AccountUpgrade(String),
+    AccountReconnect(String),
     AccountRemove(String),
     AccountReset { account: String, yes: bool },
     Sync(Option<String>),
@@ -56,6 +61,16 @@ pub fn parse<I: IntoIterator<Item = OsString>>(arguments: I) -> Result<Command, 
         ["--version" | "-V" | "version"] => Ok(Command::Version),
         ["account", "add"] => Ok(Command::AccountAdd),
         ["account", "list"] => Ok(Command::AccountList),
+        ["account", "upgrade", account]
+            if !account.trim().is_empty() && !account.starts_with('-') =>
+        {
+            Ok(Command::AccountUpgrade((*account).to_owned()))
+        }
+        ["account", "reconnect", account]
+            if !account.trim().is_empty() && !account.starts_with('-') =>
+        {
+            Ok(Command::AccountReconnect((*account).to_owned()))
+        }
         ["account", "remove", account] => Ok(Command::AccountRemove((*account).to_owned())),
         ["account", "reset", rest @ ..] => parse_reset(rest),
         ["sync"] => Ok(Command::Sync(None)),
@@ -187,6 +202,29 @@ mod tests {
             vec!["account", "reset", "--yes=true", "a"],
         ] {
             assert!(run(&words).is_err(), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn selected_consent_commands_require_one_nonempty_existing_selector() {
+        assert_eq!(
+            run(&["account", "upgrade", "acct_1"]),
+            Ok(Command::AccountUpgrade("acct_1".to_owned()))
+        );
+        assert_eq!(
+            run(&["account", "reconnect", "person@example.test"]),
+            Ok(Command::AccountReconnect("person@example.test".to_owned()))
+        );
+        for verb in ["upgrade", "reconnect"] {
+            for args in [
+                vec!["account", verb],
+                vec!["account", verb, ""],
+                vec!["account", verb, "  "],
+                vec!["account", verb, "--yes"],
+                vec!["account", verb, "a", "b"],
+            ] {
+                assert!(run(&args).is_err());
+            }
         }
     }
 

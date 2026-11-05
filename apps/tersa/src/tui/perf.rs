@@ -234,6 +234,21 @@ impl Drop for AccountsFixture {
 fn idle_workers(app: &mut super::app::App, wait_for_start: bool) -> super::worker::Workers {
     struct Idle(std::sync::mpsc::Sender<()>);
     impl super::Remote for Idle {
+        fn control<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            job: super::control::ControlJob,
+            _progress: &'a super::control::ProgressSink,
+        ) -> super::Pending<'a, super::control::ControlResult> {
+            Box::pin(async move {
+                match job {
+                    super::control::ControlJob::Status => {
+                        Err("status not provided by idle benchmark".to_owned())
+                    }
+                    _ => panic!("unexpected control in benchmark"),
+                }
+            })
+        }
         fn fetch<'a>(&'a self, _: &'a AccountId, _: &'a MessageId) -> super::Pending<'a, Vec<u8>> {
             Box::pin(std::future::pending())
         }
