@@ -140,7 +140,6 @@ fn prune(
 ) -> Result<(), Error> {
     let mut statement = transaction.prepare("SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) BETWEEN 1 AND 256 THEN message_id END, CASE WHEN typeof(received_at) = 'integer' AND received_at >= 0 THEN received_at END FROM messages ORDER BY received_at DESC,message_id ASC LIMIT 6197").map_err(sql_error)?;
     let mut rows = statement.query([]).map_err(sql_error)?;
-    let mut keep = HashSet::new();
     let mut remove = Vec::new();
     let mut count = 0;
     while let Some(row) = rows.next().map_err(sql_error)? {
@@ -150,9 +149,7 @@ fn prune(
         let id = MessageId::new(row.get::<_, String>(0).map_err(sql_error)?)
             .map_err(|_error| Error::Corrupt)?;
         let _: i64 = row.get(1).map_err(sql_error)?;
-        if count < 100 || pins.contains(&id) {
-            keep.insert(id);
-        } else {
+        if count >= 100 && !pins.contains(&id) {
             remove.push(id);
         }
         count += 1;
@@ -164,6 +161,14 @@ fn prune(
             .execute("DELETE FROM messages WHERE message_id = ?1", [id.as_str()])
             .map_err(sql_error)?;
     }
+    prune_provider(transaction, account, pins)
+}
+
+pub(crate) fn prune_provider(
+    transaction: &Transaction<'_>,
+    account: &AccountId,
+    pins: &HashSet<MessageId>,
+) -> Result<(), Error> {
     let mut statement = transaction.prepare("SELECT CASE WHEN typeof(message_id) = 'text' AND length(CAST(message_id AS BLOB)) BETWEEN 1 AND 256 THEN message_id END FROM provider_messages LIMIT 6197").map_err(sql_error)?;
     let mut rows = statement.query([]).map_err(sql_error)?;
     let mut remove = Vec::new();
@@ -175,7 +180,7 @@ fn prune(
         count += 1;
         let id = MessageId::new(row.get::<_, String>(0).map_err(sql_error)?)
             .map_err(|_error| Error::Corrupt)?;
-        if !keep.contains(&id) && !pins.contains(&id) {
+        if !pins.contains(&id) && !is_cached(transaction, &id)? {
             remove.push(id);
         }
     }
