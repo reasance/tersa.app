@@ -12,10 +12,13 @@
 #![forbid(unsafe_code)]
 
 mod cache_reset;
+mod coordination;
 mod flows;
 mod gate;
+mod grants;
 mod installation;
 mod loopback;
+mod online;
 mod session;
 mod session_cache;
 

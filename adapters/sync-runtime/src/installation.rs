@@ -105,9 +105,8 @@ pub struct Installation {
     registry: SqlCipherRegistry,
     registry_writable: bool,
     allocation: Mutex<()>,
-    /// Accounts whose database this process has opened with the full
-    /// integrity scan. Later opens skip it: it reads the whole database, and
-    /// stores are opened for every download, sync, and token refresh.
+    /// Successful Full scans in this installation handle, including provisioning.
+    /// Display Skip opens never satisfy the normal first-Full requirement.
     scanned: Mutex<HashSet<AccountId>>,
 }
 
@@ -295,9 +294,9 @@ impl Installation {
     /// No writable reopen, key export or second vault unlock is necessary.
     ///
     /// This is not a read-only capability for every `Installation` method. Add
-    /// and remove are unsupported; generic [`Self::open_store`]/[`Self::account_email`]
-    /// remain create-capable and MUST NOT be used for preview. Use
-    /// [`Self::account_email_existing`].
+    /// and remove are unsupported. General writer opens can upgrade recognized
+    /// formats and recover coordination files, so preview must use the strictly
+    /// read-only [`Self::account_email_existing`].
     /// The caller retains the same installation lock across preview and reset.
     ///
     /// # Errors
@@ -394,7 +393,11 @@ impl Installation {
         Ok(self.registry.find_by_tag(&tag)?)
     }
 
-    /// Opens a registered account's encrypted store.
+    /// Opens a registered account's existing encrypted store without provisioning.
+    ///
+    /// The first successful open runs a Full scan; later opens through this
+    /// installation handle use Skip. A successful provisioning Full scan also
+    /// satisfies that requirement. Ownership and metadata checks always run.
     ///
     /// # Errors
     ///
@@ -407,7 +410,16 @@ impl Installation {
         if !self.registry.accounts()?.contains(account) {
             return Err(InstallationError::UnknownAccount);
         }
-        self.open_store_unchecked(account)
+        let scan = if self.scanned_accounts().contains(account) {
+            IntegrityScan::Skip
+        } else {
+            IntegrityScan::Full
+        };
+        let store = self.open_existing_store(account, scan)?;
+        if scan == IntegrityScan::Full {
+            self.scanned_accounts().insert(account.clone());
+        }
+        Ok(store)
     }
 
     /// Existing-only maintenance. No ordinary opener, directory provisioning,
@@ -476,10 +488,12 @@ impl Installation {
         self.account_dir(account).join(MAIL_FILE)
     }
 
-    /// Opens a registered account's store without the integrity scan, for
-    /// the interface's first read: the first frame does not wait for a scan
-    /// whose cost grows with the cache. The first [`Self::open_store`] of the
-    /// session still runs it, and `SQLCipher` authenticates every page read.
+    /// Opens a registered account's existing store for interface reads.
+    ///
+    /// Requests Skip for ordinary reopens without recording a successful Full
+    /// scan. The first normal open still scans. Recognized legacy migration or
+    /// coordination recovery may require Full validation inside the store.
+    /// Missing or unclaimed occupied databases are never bootstrapped.
     ///
     /// # Errors
     ///
@@ -491,12 +505,11 @@ impl Installation {
         if !self.registry.accounts()?.contains(account) {
             return Err(InstallationError::UnknownAccount);
         }
-        self.open_store_with(account, IntegrityScan::Skip)
+        self.open_existing_store(account, IntegrityScan::Skip)
     }
 
-    /// The account's stored Gmail address, read through the display open so
-    /// showing it never waits for an integrity scan. An account that has not
-    /// completed a sync yet has no stored address.
+    /// The account's stored Gmail address through the display scan policy.
+    /// An account that has not completed a sync yet has no stored address.
     ///
     /// # Errors
     ///
@@ -541,7 +554,8 @@ impl Installation {
         Ok(())
     }
 
-    /// The scanned set holds no invariant a panic could break; recover it.
+    // This optimization records only completed Full opens. No partially updated
+    // invariant depends on the set, so poisoning can recover its retained entries.
     fn scanned_accounts(&self) -> std::sync::MutexGuard<'_, HashSet<AccountId>> {
         self.scanned
             .lock()
@@ -553,21 +567,13 @@ impl Installation {
         self.data_dir.join(ACCOUNTS_DIR).join(hex(&digest))
     }
 
-    /// Opens the account's store, scanning its database the first time in
-    /// this process.
+    /// Provisions a new, not-yet-registered account store.
     fn open_store_unchecked(
         &self,
         account: &AccountId,
     ) -> Result<SqlCipherMailboxStore, InstallationError> {
-        let scan = if self.scanned_accounts().contains(account) {
-            IntegrityScan::Skip
-        } else {
-            IntegrityScan::Full
-        };
-        let store = self.open_store_with(account, scan)?;
-        if scan == IntegrityScan::Full {
-            self.scanned_accounts().insert(account.clone());
-        }
+        let store = self.open_store_with(account, IntegrityScan::Full)?;
+        self.scanned_accounts().insert(account.clone());
         Ok(store)
     }
 
@@ -580,6 +586,24 @@ impl Installation {
         ensure_private_dir(&directory)?;
         let key = derive_account_key(&self.root, account, AccountKeyPurpose::SqlCipherDatabaseV1)?;
         Ok(SqlCipherMailboxStore::open_with_scan(
+            account.clone(),
+            directory.join(MAIL_FILE),
+            DatabaseKey::from_zeroizing(key.into_bytes()),
+            scan,
+        )?)
+    }
+
+    // The strict existing-only writer rejects absent files and unclaimed schemas.
+    // Unlike open_existing, it cannot bootstrap an empty occupied database.
+    fn open_existing_store(
+        &self,
+        account: &AccountId,
+        scan: IntegrityScan,
+    ) -> Result<SqlCipherMailboxStore, InstallationError> {
+        let directory = self.account_dir(account);
+        existing_private_directory(&directory)?;
+        let key = derive_account_key(&self.root, account, AccountKeyPurpose::SqlCipherDatabaseV1)?;
+        Ok(SqlCipherMailboxStore::open_existing_owned_with_scan(
             account.clone(),
             directory.join(MAIL_FILE),
             DatabaseKey::from_zeroizing(key.into_bytes()),
@@ -613,6 +637,61 @@ impl Installation {
         store.store_broker_subject(&account, subject.as_str())?;
         drop(store);
         self.registry.register(&account, &tag)?;
+        Ok(account)
+    }
+
+    pub(crate) fn connect_capability(
+        &self,
+        subject: &ValidatedSubject,
+        token: &Zeroizing<String>,
+        capability: tersa_application::AccountCapability,
+    ) -> Result<AccountId, tersa_token_broker_core::CapabilityGrantStoreError> {
+        use tersa_store_sqlcipher::StoreCredential;
+        use tersa_token_broker_core::CapabilityGrantStoreError as Error;
+        let _guard = self
+            .allocation
+            .lock()
+            .map_err(|_error| Error::Unavailable)?;
+        self.require_registry_write()
+            .map_err(|_error| Error::Unavailable)?;
+        let tag = registry_dedup_tag(&self.root, subject.as_str().as_bytes())
+            .map_err(|_error| Error::Unavailable)?;
+        if self
+            .registry
+            .find_by_tag(&tag)
+            .map_err(|_error| Error::Unavailable)?
+            .is_some()
+        {
+            return Err(Error::AlreadyConnected);
+        }
+        if token.is_empty() || token.len() > 1024 {
+            return Err(Error::Invalid);
+        }
+        if !self.has_capacity().map_err(|_error| Error::Unavailable)? {
+            return Err(Error::Unavailable);
+        }
+        let account = new_account_id().map_err(|_error| Error::Unavailable)?;
+        let store = self
+            .open_store_unchecked(&account)
+            .map_err(|_error| Error::Unavailable)?;
+        store
+            .store_broker_subject(&account, subject.as_str())
+            .map_err(|_error| Error::Unavailable)?;
+        // Register a controlled ReadOnly/Missing binding first. If the final CAS
+        // fails it remains known and can only be finished by selected reconnect.
+        self.registry
+            .register(&account, &tag)
+            .map_err(|_error| Error::Unavailable)?;
+        let expected = store
+            .load_credential_snapshot(&account)
+            .map_err(|_error| Error::Unavailable)?;
+        store
+            .replace_credential_snapshot(
+                &expected,
+                capability,
+                &StoreCredential::Active(token.clone()),
+            )
+            .map_err(|_error| Error::Unavailable)?;
         Ok(account)
     }
 
@@ -702,7 +781,7 @@ impl RefreshTokenStore for InstallationTokens {
             .account_for_subject_or_register(subject)
             .map_err(|_error| RefreshTokenStoreError::Unavailable)?;
         self.0
-            .open_store_unchecked(&account)
+            .open_store(&account)
             .and_then(|store| Ok(store.store_refresh_token(&account, token)?))
             .map_err(|_error| RefreshTokenStoreError::Unavailable)
     }
@@ -720,7 +799,7 @@ impl RefreshTokenStore for InstallationTokens {
         };
         let store = self
             .0
-            .open_store_unchecked(&account)
+            .open_store(&account)
             .map_err(|_error| RefreshTokenStoreError::Unavailable)?;
         store
             .load_refresh_token(&account)
@@ -739,7 +818,7 @@ impl RefreshTokenStore for InstallationTokens {
             return Ok(());
         };
         self.0
-            .open_store_unchecked(&account)
+            .open_store(&account)
             .and_then(|store| Ok(store.clear_refresh_token(&account)?))
             .map_err(|_error| RefreshTokenStoreError::Unavailable)
     }
@@ -901,6 +980,154 @@ mod tests {
         assert!(
             installation.scanned_accounts().is_empty(),
             "a re-added account is scanned again"
+        );
+    }
+
+    const SCAN_BODY_LEN: usize = 8 * 1024 * 1024;
+
+    fn checkpointed_scan_fixture(
+        dir: &TempDir,
+    ) -> (AccountId, tersa_application::mailbox::MessageId, PathBuf) {
+        use tersa_application::mailbox::{
+            HeaderText, MailboxStore, Message, MessageContent, MessageEnvelope, MessageId,
+            ThreadId, UnixTimestampMillis,
+        };
+        let setup = Arc::new(Installation::open(&dir.0, root()).expect("setup"));
+        InstallationTokens(Arc::clone(&setup))
+            .store(
+                &subject("scan-subject"),
+                &Zeroizing::new("synthetic-token".to_owned()),
+            )
+            .expect("register");
+        let account = setup
+            .account_for_subject("scan-subject")
+            .expect("lookup")
+            .expect("registered");
+        let id = MessageId::new("large-cached-body").expect("message id");
+        let envelope = MessageEnvelope::new(
+            id.clone(),
+            ThreadId::new("thread").expect("thread"),
+            HeaderText::new("sender").expect("sender"),
+            HeaderText::new("subject").expect("subject"),
+            HeaderText::new("preview").expect("preview"),
+            UnixTimestampMillis::new(1).expect("timestamp"),
+            true,
+        );
+        // Exceed SQLite's automatic WAL checkpoint threshold using a real
+        // bounded cache write, without SQL or a test-only checkpoint port.
+        let message = Message::new(
+            envelope,
+            MessageContent::new(vec![b'x'; SCAN_BODY_LEN]).expect("body"),
+        );
+        let store = setup.open_store(&account).expect("setup store");
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("executor");
+        executor
+            .block_on(store.put_message(&account, &message))
+            .expect("cache body");
+        let path = setup.cache_path_for_test(&account);
+        assert!(
+            fs::metadata(&path).expect("main metadata").len() > SCAN_BODY_LEN as u64,
+            "the fixture must checkpoint its body into the main file"
+        );
+        drop(store);
+        drop(message);
+        drop(setup);
+        // No account connections remain. The healthy body read below verifies
+        // that the main file retains the message after sidecar removal.
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            fs::remove_file(sidecar).expect("remove checkpointed fixture sidecar");
+        }
+        (account, id, path)
+    }
+
+    #[test]
+    fn scan_policy_preserves_display_and_failed_open_boundaries() {
+        use tersa_application::mailbox::{MailboxReader, MailboxStoreError};
+
+        let dir = TempDir::new("scan-boundaries");
+        let _lock = InstallationLock::acquire(&dir.0).expect("installation lock");
+        let (account, id, path) = checkpointed_scan_fixture(&dir);
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("executor");
+        let installation = Installation::open(&dir.0, root()).expect("fresh scan cache");
+        let display = installation
+            .open_store_for_display(&account)
+            .expect("healthy display");
+        assert_eq!(
+            executor
+                .block_on(display.get_message(&account, &id))
+                .expect("healthy body")
+                .expect("cached body")
+                .into_content()
+                .into_bytes()
+                .len(),
+            SCAN_BODY_LEN
+        );
+        drop(display);
+        assert!(
+            installation.scanned_accounts().is_empty(),
+            "display never records Full"
+        );
+
+        // The middle of this large file is an overflow body page, outside the
+        // ownership/metadata reads. Both policies still authenticate pages read.
+        let original = fs::read(&path).expect("encrypted fixture bytes");
+        let mut damaged = original.clone();
+        let offset = damaged.len() / 2;
+        damaged[offset] ^= 0xff;
+        fs::write(&path, &damaged).expect("damage unused encrypted page");
+        drop(
+            installation
+                .open_store_for_display(&account)
+                .expect("display uses Skip"),
+        );
+        assert!(matches!(
+            installation.open_store(&account),
+            Err(InstallationError::Store(MailboxStoreError::Corrupted))
+        ));
+        assert!(
+            installation.scanned_accounts().is_empty(),
+            "failed Full never records success"
+        );
+
+        fs::write(&path, original).expect("restore healthy page");
+        drop(
+            installation
+                .open_store(&account)
+                .expect("first successful Full"),
+        );
+        assert!(installation.scanned_accounts().contains(&account));
+        fs::write(&path, damaged).expect("repeat damage after successful Full");
+        let skipped = installation
+            .open_store(&account)
+            .expect("subsequent normal open uses Skip");
+        assert!(
+            executor
+                .block_on(skipped.get_message(&account, &id))
+                .is_err(),
+            "reading the damaged body still fails authentication"
+        );
+        drop(skipped);
+        let fresh = Installation::open(&dir.0, root()).expect("independent scan cache");
+        assert!(
+            matches!(
+                fresh.open_store(&account),
+                Err(InstallationError::Store(MailboxStoreError::Corrupted))
+            ),
+            "a new installation handle still requires Full"
+        );
+        drop(fresh);
+        installation
+            .remove_account(&account)
+            .expect("remove synthetic account");
+        assert!(
+            installation.scanned_accounts().is_empty(),
+            "removal forgets scan history"
         );
     }
 

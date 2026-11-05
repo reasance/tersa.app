@@ -8,47 +8,38 @@ use core::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::coordination::Accounts;
+use crate::online::{Broker, Online};
 use tersa_application::identity::AccountProfile;
 use tersa_application::mailbox::{
     AccountId, MessageId, PageSize, RemoteMailbox, RemoteMailboxError, StoreLimit,
 };
-use tersa_application::oauth::{MonotonicClock, SystemMonotonicClock, SystemWallClock};
+use tersa_application::oauth::{MonotonicClock, SystemMonotonicClock};
 use tersa_application::sync::{SyncFailureSource, SyncPolicy, SyncReport};
+use tersa_application::{
+    AccountCapability, lifecycle::AccountLifecycleStore, profile::UpgradeBinding,
+    token::AccountSubject,
+};
 use tersa_gmail_rest::GmailTokenTransport;
-use tersa_token_broker_core::{BrokerCore, BrokerError, BrokerToken, GetRandomEntropy};
+use tersa_token_broker_core::{AuthorizationIntent, BrokerError, CapabilityBrokerToken};
 use zeroize::Zeroizing;
 
 use crate::cache_reset::{CacheResetOutcome, CacheResetPreconditionError, reset_cache_using};
 use crate::gate::{GatedFetchError, GatedSyncError, gated_fetch, gated_sync};
-use crate::installation::{
-    Installation, InstallationError, InstallationHasher, InstallationTokens,
-};
+use crate::installation::{Installation, InstallationError, InstallationHasher};
 use crate::loopback::{Loopback, LoopbackError};
 use crate::session::{GmailSession, GmailSessionError, SessionEmailAddress, SharedSession};
 use crate::session_cache::{Origin, SessionCache, SystemCacheClock};
 
 /// How long the browser sign-in may take.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const SESSION_TTL: Duration = Duration::from_secs(10 * 60);
-/// How long a flow waits for another refresh of the same token, in total
-/// about the length of one slow token request.
-const BUSY_WAIT: Duration = Duration::from_millis(100);
-const BUSY_RETRIES: u8 = 50;
 /// A cached access token is replaced this long before it expires.
 const TOKEN_MARGIN: Duration = Duration::from_secs(60);
-
-type Broker = BrokerCore<
-    GmailTokenTransport,
-    InstallationTokens,
-    SharedMonotonicClock,
-    SystemWallClock,
-    GetRandomEntropy,
->;
 
 /// [`SystemMonotonicClock`] is not `Clone`; the token service clones its
 /// clock into each pending session, so share one origin through an `Arc`.
 #[derive(Clone, Debug)]
-struct SharedMonotonicClock(Arc<SystemMonotonicClock>);
+pub(crate) struct SharedMonotonicClock(pub(crate) Arc<SystemMonotonicClock>);
 
 impl MonotonicClock for SharedMonotonicClock {
     fn now(&self) -> Duration {
@@ -106,7 +97,7 @@ impl fmt::Display for FlowError {
             Self::AccountLimit => formatter.write_str("the maximum number of accounts is reached"),
             Self::Loopback(error) => write!(formatter, "{error}"),
             Self::Token(BrokerError::ConsentRevoked | BrokerError::MissingRefreshToken) => {
-                formatter.write_str("access was revoked; remove and add the account again")
+                formatter.write_str("access was revoked; reconnect the selected account")
             }
             Self::Token(error) => write!(formatter, "{error}"),
             Self::UnknownAccount => formatter.write_str("no such account"),
@@ -132,8 +123,8 @@ impl From<InstallationError> for FlowError {
 pub struct AddedAccount {
     /// The local account identifier.
     pub account: AccountId,
-    /// Whether this Google account was already registered (its credential
-    /// was replaced).
+    /// Whether this Google account was already registered. New Connect now
+    /// refuses duplicates; this compatibility field is false on success.
     pub already_present: bool,
     /// The first sync, which may fail without undoing the add.
     pub first_sync: Result<SyncReport, FlowError>,
@@ -151,7 +142,13 @@ pub enum Revocation {
 /// The account flows over one unlocked installation.
 pub struct Runtime {
     installation: Arc<Installation>,
-    broker: Broker,
+    online: Option<Online>,
+    // Match the broker's eight pending-session ceiling across isolated brokers.
+    authorizations: tokio::sync::Semaphore,
+    // Subject is unknown until exchange. Serialize only Connect completion so
+    // an empty-snapshot cleanup cannot race another Connect registering it.
+    connections: tokio::sync::Mutex<()>,
+    pub(crate) operations: Accounts,
     hasher: InstallationHasher,
     /// One Gmail session per account, reused until shortly before its access
     /// token expires.
@@ -173,25 +170,36 @@ impl Runtime {
     /// stack.
     pub fn new(installation: Arc<Installation>, client: OAuthClient) -> Result<Self, FlowError> {
         let transport = GmailTokenTransport::new().map_err(|_error| FlowError::Configuration)?;
-        let broker = BrokerCore::new(
-            client.client_id,
-            client.client_secret,
-            SESSION_TTL,
-            (
-                transport,
-                InstallationTokens(Arc::clone(&installation)),
-                SharedMonotonicClock(Arc::new(SystemMonotonicClock::new())),
-                SystemWallClock,
-                GetRandomEntropy,
-            ),
-        )
-        .map_err(|_error| FlowError::Configuration)?;
-        Ok(Self {
+        let online = Online::new(client, transport);
+        // Validate configuration before exposing an online runtime.
+        let _ = online.broker(&installation)?;
+        let mut runtime = Self::local(installation);
+        runtime.online = Some(online);
+        Ok(runtime)
+    }
+
+    /// Builds a local runtime without requiring OAuth configuration or usable credentials.
+    ///
+    /// The caller retains the installation lock. Local operations share the same
+    /// account coordination as online work; network operations return Configuration.
+    #[must_use]
+    pub fn local(installation: Arc<Installation>) -> Self {
+        Self {
             hasher: InstallationHasher(Arc::clone(&installation)),
             installation,
-            broker,
+            online: None,
+            authorizations: tokio::sync::Semaphore::new(8),
+            connections: tokio::sync::Mutex::new(()),
+            operations: Accounts::default(),
             sessions: SessionCache::new(SystemCacheClock, TOKEN_MARGIN),
-        })
+        }
+    }
+
+    fn broker(&self) -> Result<Broker, FlowError> {
+        self.online
+            .as_ref()
+            .ok_or(FlowError::Configuration)?
+            .broker(&self.installation)
     }
 
     /// The installation this runtime serves.
@@ -214,14 +222,21 @@ impl Runtime {
         open_browser: F,
     ) -> Result<AddedAccount, FlowError> {
         self.installation.require_registry_write()?;
+        let _authorization = self
+            .authorizations
+            .try_acquire()
+            .map_err(|_error| FlowError::Token(BrokerError::Busy))?;
         if !self.installation.has_capacity()? {
             return Err(FlowError::AccountLimit);
         }
-        let before = self.installation.accounts()?;
+        let broker = self.broker()?;
         let loopback = Loopback::bind().await.map_err(FlowError::Loopback)?;
-        let pending = self
-            .broker
-            .begin_authorization(&loopback.redirect_uri())
+        let pending = broker
+            .begin_capability_authorization(
+                &loopback.redirect_uri(),
+                AccountCapability::ReadOnly,
+                AuthorizationIntent::Connect,
+            )
             .map_err(FlowError::Token)?;
         let expected_state = pending
             .authorization_url()
@@ -235,27 +250,201 @@ impl Runtime {
             .await
             .map_err(FlowError::Loopback)?;
         let token = self
-            .broker
-            .complete_authorization(pending.session_handle(), &callback)
+            .complete_new(&broker, pending.session_handle(), &callback)
+            .await?;
+        let account = token.account_id().clone();
+        let operation = match self.operations.get(&account) {
+            Ok(operation) => operation,
+            Err(error) => {
+                return Ok(AddedAccount {
+                    account,
+                    already_present: false,
+                    first_sync: Err(error),
+                });
+            }
+        };
+        let _permit = operation.permit.lock().await;
+        // Registration was new, so generation zero is the original publication
+        // expectation. A worker may already have refreshed/removed/upgraded it
+        // after registry publication; never relabel this old token as newer.
+        if let Err(error) = operation.validate(0) {
+            return Ok(AddedAccount {
+                account,
+                already_present: false,
+                first_sync: Err(error),
+            });
+        }
+        self.invalidate_known(&account, &operation);
+        Ok(self.connected_account(token, false).await)
+    }
+
+    async fn complete_new(
+        &self,
+        broker: &Broker,
+        handle: &str,
+        callback: &str,
+    ) -> Result<CapabilityBrokerToken, FlowError> {
+        let _connection = self.connections.lock().await;
+        broker
+            .complete_capability_authorization(handle, callback)
+            .await
+            .map_err(FlowError::Token)
+    }
+
+    /// Requests explicit Modify consent for the selected existing account.
+    ///
+    /// # Errors
+    /// Sign-in, changed account/generation, or storage failures preserve the old
+    /// grant. A committed grant is reported separately from a failed first sync.
+    pub async fn upgrade_account<F: FnOnce(&str)>(
+        &self,
+        account: &AccountId,
+        open_browser: F,
+    ) -> Result<AddedAccount, FlowError> {
+        self.authorize_existing(account, Some(AccountCapability::Modify), open_browser)
+            .await
+    }
+
+    /// Reconnects the selected account while preserving its stored capability.
+    ///
+    /// # Errors
+    /// Returns the same non-destructive authorization failures as `upgrade_account`.
+    pub async fn reconnect_account<F: FnOnce(&str)>(
+        &self,
+        account: &AccountId,
+        open_browser: F,
+    ) -> Result<AddedAccount, FlowError> {
+        self.authorize_existing(account, None, open_browser).await
+    }
+
+    async fn authorize_existing<F: FnOnce(&str)>(
+        &self,
+        account: &AccountId,
+        requested: Option<AccountCapability>,
+        open_browser: F,
+    ) -> Result<AddedAccount, FlowError> {
+        self.installation.require_registry_write()?;
+        let _authorization = self
+            .authorizations
+            .try_acquire()
+            .map_err(|_error| FlowError::Token(BrokerError::Busy))?;
+        let broker = self.broker()?;
+        let operation = self.operations.get(account)?;
+        let loopback = Loopback::bind().await.map_err(FlowError::Loopback)?;
+        let (generation, pending) = {
+            let _permit = operation.permit.lock().await;
+            self.prepare_existing(&broker, account, requested, &loopback.redirect_uri())?
+        };
+        let state = pending
+            .authorization_url()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+            .ok_or(FlowError::Configuration)?;
+        open_browser(pending.authorization_url().as_str());
+        let callback = loopback
+            .wait_for_callback(SIGN_IN_TIMEOUT, &state)
+            .await
+            .map_err(FlowError::Loopback)?;
+        let _permit = operation.permit.lock().await;
+        let token = self
+            .complete_existing(
+                &broker,
+                account,
+                generation,
+                pending.session_handle(),
+                &callback,
+            )
+            .await?;
+        Ok(self.connected_account(token, true).await)
+    }
+
+    // Grant persistence has already succeeded and the caller holds its account
+    // permit. All subsequent session/sync failures belong to first_sync.
+    async fn connected_account(
+        &self,
+        token: CapabilityBrokerToken,
+        already_present: bool,
+    ) -> AddedAccount {
+        let account = token.account_id().clone();
+        let first_sync = match self.operations.get(&account) {
+            Ok(operation) => match GmailSession::from_capability(token, operation.generation()) {
+                Ok(session) => self.sync_with_session(&account, session).await,
+                Err(error) => Err(FlowError::Session(error)),
+            },
+            Err(error) => Err(error),
+        };
+        AddedAccount {
+            account,
+            already_present,
+            first_sync,
+        }
+    }
+
+    // Capture the selected binding and exact request BEFORE browser launch.
+    // Caller holds the account permit; begin loads the original opaque snapshot.
+    fn prepare_existing(
+        &self,
+        broker: &Broker,
+        account: &AccountId,
+        requested: Option<AccountCapability>,
+        redirect: &str,
+    ) -> Result<(u64, tersa_token_broker_core::PendingAuthorization), FlowError> {
+        let store = self.installation.open_store(account)?;
+        let snapshot = store
+            .load_credential_snapshot(account)
+            .map_err(|_error| FlowError::Token(BrokerError::PersistenceFailed))?;
+        let subject = AccountSubject::from_broker_validated(Zeroizing::new(
+            snapshot
+                .subject()
+                .ok_or(FlowError::UnknownAccount)?
+                .to_owned(),
+        ))
+        .map_err(|_error| FlowError::Token(BrokerError::IdentityUnverified))?;
+        let intent = AuthorizationIntent::Upgrade(UpgradeBinding::new(account.clone(), subject));
+        let pending = broker
+            .begin_capability_authorization(
+                redirect,
+                requested.unwrap_or(snapshot.capability()),
+                intent,
+            )
+            .map_err(FlowError::Token)?;
+        Ok((self.operations.get(account)?.generation(), pending))
+    }
+
+    // Caller holds the account permit. Kept separate from the browser wait so
+    // controlled transports can exercise the actual production completion boundary.
+    async fn complete_existing(
+        &self,
+        broker: &Broker,
+        account: &AccountId,
+        generation: u64,
+        handle: &str,
+        callback: &str,
+    ) -> Result<CapabilityBrokerToken, FlowError> {
+        let operation = self.operations.get(account)?;
+        operation.validate(generation)?;
+        let token = broker
+            .complete_capability_authorization(handle, callback)
             .await
             .map_err(FlowError::Token)?;
-        let account = self
-            .installation
-            .account_for_subject(token.subject())?
-            .ok_or(FlowError::UnknownAccount)?;
-        let first_sync = match GmailSession::new(
-            account.clone(),
-            token.access_token(),
-            Zeroizing::new(token.subject().to_owned()),
-        ) {
-            Ok(session) => self.sync_with_session(&account, session).await,
-            Err(error) => Err(FlowError::Session(error)),
-        };
-        Ok(AddedAccount {
-            already_present: before.contains(&account),
-            account,
-            first_sync,
-        })
+        self.invalidate_known(account, &operation);
+        Ok(token)
+    }
+
+    pub(crate) fn invalidate(&self, account: &AccountId) -> Result<(), FlowError> {
+        let operation = self.operations.get(account)?;
+        self.invalidate_known(account, &operation);
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_known(
+        &self,
+        account: &AccountId,
+        operation: &crate::coordination::AccountOperation,
+    ) {
+        operation.invalidate();
+        self.sessions.forget(account);
     }
 
     /// Refreshes the account's access token and runs a bounded sync.
@@ -265,6 +454,15 @@ impl Runtime {
     /// Returns a [`FlowError`] for an unknown account, a token failure, or a
     /// gate or sync failure.
     pub async fn sync_account(&self, account: &AccountId) -> Result<SyncReport, FlowError> {
+        let operation = self.operations.get(account)?;
+        let _permit = operation.permit.lock().await;
+        self.sync_under_permit(account).await
+    }
+
+    pub(crate) async fn sync_under_permit(
+        &self,
+        account: &AccountId,
+    ) -> Result<SyncReport, FlowError> {
         self.with_session(account, |session| self.sync_with_session(account, session))
             .await
     }
@@ -272,9 +470,8 @@ impl Runtime {
     /// Clears one existing cache, closes its connection, then syncs that account.
     ///
     /// Requires a configured runtime, a caller-held installation lock for the
-    /// WHOLE operation, and no concurrent UI/worker/store work for this
-    /// installation, including work through other runtimes or cloned handles.
-    /// The exclusive receiver prevents overlap through this runtime. Cached
+    /// WHOLE operation. Work through other runtimes or cloned store handles
+    /// must not overlap. Shared-runtime operations use the account permit. Cached
     /// sessions contain HTTP/token state, not account-store connections.
     ///
     /// Clear itself preserves credentials/identity/recovery. Resync is exactly
@@ -286,7 +483,8 @@ impl Runtime {
     /// during sync leaves that committed clear (and any normal sync progress)
     /// in place. No SQL transaction or clear connection spans the network wait.
     ///
-    /// Exclusive access is checked by Rust, not a new maintenance permit:
+    /// The compatibility receiver still prevents overlapping borrows; shared
+    /// callers can use `reset_account_cache` with account serialization:
     ///
     /// ```compile_fail
     /// use tersa_sync_runtime::Runtime;
@@ -308,7 +506,23 @@ impl Runtime {
         &'a mut self,
         account: &'a AccountId,
     ) -> Result<CacheResetOutcome, CacheResetPreconditionError> {
-        reset_cache_using(self, account, Self::sync_account).await
+        self.reset_account_cache(account).await
+    }
+
+    /// Clears and resynchronizes one account through shared runtime coordination.
+    ///
+    /// The caller holds the installation lock. Independent account operations
+    /// and cached reads remain available. The permit spans clear and resync;
+    /// no account permit is recursively acquired by the sync phase.
+    ///
+    /// # Errors
+    /// Refusal leaves the cache intact. After clear commits, sync failure is
+    /// returned separately as `CacheResetOutcome::ResyncFailed`.
+    pub async fn reset_account_cache<'a>(
+        &'a self,
+        account: &'a AccountId,
+    ) -> Result<CacheResetOutcome, CacheResetPreconditionError> {
+        reset_cache_using(self, account, Self::sync_under_permit).await
     }
 
     /// Runs `work` with the account's session; see [`retry_rejected`].
@@ -319,25 +533,15 @@ impl Runtime {
     {
         retry_rejected(
             || self.session(account),
-            |used: &SharedSession| self.sessions.forget_if(account, |cached| cached.is(used)),
+            |used: &SharedSession| {
+                self.sessions.forget_if(account, |cached| cached.is(used));
+                if let Ok(operation) = self.operations.get(account) {
+                    operation.invalidate();
+                }
+            },
             work,
         )
         .await
-    }
-
-    /// Refreshes an access token. The broker refreshes one account's token at
-    /// a time, so a sync and a download that ask together take turns.
-    async fn access_token(&self, subject: &str) -> Result<BrokerToken, FlowError> {
-        let mut attempts = 0;
-        loop {
-            match self.broker.refresh_access_token(subject).await {
-                Err(BrokerError::Busy) if attempts < BUSY_RETRIES => {
-                    attempts += 1;
-                    tokio::time::sleep(BUSY_WAIT).await;
-                }
-                result => return result.map_err(FlowError::Token),
-            }
-        }
     }
 
     /// Revokes the grant at Google (best effort), then deletes the account's
@@ -349,15 +553,31 @@ impl Runtime {
     /// fails.
     pub async fn remove_account(&self, account: &AccountId) -> Result<Revocation, FlowError> {
         self.installation.require_registry_write()?;
+        let operation = self.operations.get(account)?;
+        let _permit = operation.permit.lock().await;
+        let broker = self.broker()?;
         let subject = self.subject_of(account)?;
-        let revocation = match self.broker.revoke_provider_grant(&subject).await {
+        let store = self.installation.open_store(account)?;
+        // Pending commands refuse HERE, before any provider revocation.
+        store
+            .mark_disconnect_started(account)
+            .await
+            .map_err(InstallationError::Store)?;
+        self.invalidate_known(account, &operation);
+        let revocation = match broker.revoke_capability_grant(account, &subject).await {
             Ok(()) => Revocation::Confirmed,
-            Err(_error) => Revocation::Unconfirmed,
+            Err(BrokerError::RevokeUnconfirmed) => {
+                store
+                    .mark_revoke_unconfirmed(account)
+                    .await
+                    .map_err(InstallationError::Store)?;
+                Revocation::Unconfirmed
+            }
+            Err(error) => return Err(FlowError::Token(error)),
         };
-        // Deleting the stored token is part of the local removal; a failure
-        // here is superseded by deleting the whole account directory.
-        let _ = self.broker.delete_stored_tokens(&subject);
-        self.sessions.forget(account);
+        // The call explicitly requests local cleanup even after an uncertain revoke.
+        // Until that succeeds its durable marker remains available for recovery.
+        drop(store);
         self.installation.remove_account(account)?;
         Ok(revocation)
     }
@@ -374,6 +594,8 @@ impl Runtime {
         account: &AccountId,
         message_id: &MessageId,
     ) -> Result<Vec<u8>, FlowError> {
+        let operation = self.operations.get(account)?;
+        let _permit = operation.permit.lock().await;
         self.with_session(account, |session| async move {
             let store = self.installation.open_store(account)?;
             gated_fetch(account, session, &self.hasher, store, message_id)
@@ -387,12 +609,19 @@ impl Runtime {
     /// The account's Gmail session, refreshing its access token only when
     /// none is cached or the cached one is about to expire.
     async fn session(&self, account: &AccountId) -> Result<(SharedSession, Origin), FlowError> {
-        self.sessions
+        self.subject_of(account)?;
+        let result = self
+            .sessions
             .get_or_refresh(account, || async {
                 self.new_session(account).await.map_err(Arc::new)
             })
             .await
-            .map_err(FlowError::Refresh)
+            .map_err(FlowError::Refresh)?;
+        if !self.session_is_current(account, &result.0)? {
+            self.invalidate(account)?;
+            return Err(FlowError::Token(BrokerError::GrantChanged));
+        }
+        Ok(result)
     }
 
     /// Refreshes the account's access token into a new session, with the
@@ -401,18 +630,51 @@ impl Runtime {
         &self,
         account: &AccountId,
     ) -> Result<(SharedSession, Duration), FlowError> {
+        let operation = self.operations.get(account)?;
         let subject = self.subject_of(account)?;
-        let token = self.access_token(&subject).await?;
-        let session = GmailSession::new(
-            account.clone(),
-            token.access_token(),
-            Zeroizing::new(token.subject().to_owned()),
+        let token = match self
+            .broker()?
+            .refresh_capability_grant(account, &subject)
+            .await
+        {
+            Ok(token) => token,
+            Err(error) => {
+                // Rejected current authority cannot be reused, even if a refresh
+                // persisted a revocation-only rotation before returning failure.
+                self.invalidate_known(account, &operation);
+                return Err(FlowError::Token(error));
+            }
+        };
+        let lifetime = Duration::from_secs(token.token().expires_in_seconds());
+        // A successful refresh may rotate credentials; advance even if the
+        // provider omitted rotation, conservatively fencing old completions.
+        self.invalidate_known(account, &operation);
+        let session = GmailSession::from_capability(token, operation.generation())
+            .map_err(FlowError::Session)?;
+        Ok((SharedSession::new(session), lifetime))
+    }
+
+    // P7b dispatch must call this under the same account permit, then check
+    // the recorded identity through its AccountFence before any provider write.
+    pub(crate) fn session_is_current(
+        &self,
+        account: &AccountId,
+        session: &SharedSession,
+    ) -> Result<bool, FlowError> {
+        let snapshot = self
+            .installation
+            .open_store(account)?
+            .load_credential_snapshot(account)
+            .map_err(|_error| FlowError::Token(BrokerError::PersistenceFailed))?;
+        Ok(
+            session.generation() == self.operations.get(account)?.generation()
+                && snapshot.subject() == Some(session.subject().as_str())
+                && snapshot.capability() == session.capability()
+                && matches!(
+                    snapshot.credential(),
+                    tersa_store_sqlcipher::StoreCredential::Active(_)
+                ),
         )
-        .map_err(FlowError::Session)?;
-        Ok((
-            SharedSession::new(session),
-            Duration::from_secs(token.expires_in_seconds()),
-        ))
     }
 
     fn subject_of(&self, account: &AccountId) -> Result<Zeroizing<String>, FlowError> {
@@ -658,3 +920,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "capability_tests.rs"]
+mod capability_tests;

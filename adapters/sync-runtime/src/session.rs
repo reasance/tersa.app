@@ -14,7 +14,9 @@ use tersa_application::mailbox::{
     PageToken, RemoteMailbox, RemoteMailboxError,
 };
 use tersa_application::token::{AccountSubject, BrokerSubjectError};
+use tersa_application::{AccountCapability, scope::AcceptedScope};
 use tersa_gmail_rest::GmailMailbox;
+use tersa_token_broker_core::CapabilityBrokerToken;
 use zeroize::Zeroizing;
 
 /// Reports why a [`GmailSession`] could not be built.
@@ -46,6 +48,8 @@ impl std::error::Error for GmailSessionError {}
 pub struct GmailSession {
     mailbox: GmailMailbox,
     subject: AccountSubject,
+    accepted_scope: Option<AcceptedScope>,
+    generation: u64,
 }
 
 impl GmailSession {
@@ -68,7 +72,39 @@ impl GmailSession {
             AccountSubject::from_broker_validated(subject).map_err(GmailSessionError::Subject)?;
         let mailbox = GmailMailbox::new(account, access_token.as_str().to_owned())
             .map_err(GmailSessionError::Mailbox)?;
-        Ok(Self { mailbox, subject })
+        Ok(Self {
+            mailbox,
+            subject,
+            accepted_scope: None,
+            generation: 0,
+        })
+    }
+    pub(crate) fn from_capability(
+        token: CapabilityBrokerToken,
+        generation: u64,
+    ) -> Result<Self, GmailSessionError> {
+        let (account, token, accepted_scope) = token.into_parts();
+        let mut session = Self::new(
+            account,
+            token.access_token(),
+            Zeroizing::new(token.subject().to_owned()),
+        )?;
+        session.accepted_scope = Some(accepted_scope);
+        session.generation = generation;
+        Ok(session)
+    }
+
+    /// Returns complete broker-accepted evidence, absent for legacy constructors.
+    #[must_use]
+    pub fn accepted_scope(&self) -> Option<AcceptedScope> {
+        self.accepted_scope
+    }
+
+    /// Returns the accepted capability; legacy sessions carry only `ReadOnly` authority.
+    #[must_use]
+    pub fn capability(&self) -> AccountCapability {
+        self.accepted_scope
+            .map_or(AccountCapability::ReadOnly, AcceptedScope::capability)
     }
 }
 
@@ -120,6 +156,21 @@ impl SharedSession {
     #[must_use]
     pub fn is(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+    /// Returns original accepted scope evidence, absent for legacy sessions.
+    #[must_use]
+    pub fn accepted_scope(&self) -> Option<AcceptedScope> {
+        self.0.accepted_scope()
+    }
+
+    /// Returns accepted capability, never promoting a legacy constructor.
+    #[must_use]
+    pub fn capability(&self) -> AccountCapability {
+        self.0.capability()
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.0.generation
     }
 }
 
@@ -198,6 +249,11 @@ mod tests {
             AccountProfile::subject(&session).as_str(),
             "112233445566778899001"
         );
+        assert_eq!(
+            session.capability(),
+            tersa_application::AccountCapability::ReadOnly
+        );
+        assert_eq!(session.accepted_scope(), None);
         let rendered = format!("{session:?}");
         assert!(!rendered.contains("112233445566778899001"));
         assert!(!rendered.contains("ya29.test-access-token"));
