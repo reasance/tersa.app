@@ -32,6 +32,7 @@ use std::sync::{Mutex, MutexGuard};
 use tersa_application::oauth::{AuthorizationSession, MonotonicClock};
 use zeroize::Zeroizing;
 
+use crate::broker::AuthorizationIntent;
 use crate::error::BrokerError;
 use crate::handle::SessionHandle;
 use crate::ports::SessionHandleEntropy;
@@ -103,7 +104,12 @@ impl fmt::Debug for HandleKey {
 
 /// The bounded pending-session set, keyed by zeroizing opaque handle text.
 pub(crate) struct SessionRegistry<C> {
-    sessions: Mutex<HashMap<HandleKey, AuthorizationSession<C>>>,
+    sessions: Mutex<HashMap<HandleKey, PendingSession<C>>>,
+}
+
+struct PendingSession<C> {
+    session: AuthorizationSession<C>,
+    intent: Option<AuthorizationIntent>,
 }
 
 impl<C> SessionRegistry<C> {
@@ -132,11 +138,40 @@ impl<C: MonotonicClock> SessionRegistry<C> {
         session: AuthorizationSession<C>,
         entropy: &E,
     ) -> Result<SessionHandle, BrokerError> {
+        self.insert_pending(
+            PendingSession {
+                session,
+                intent: None,
+            },
+            entropy,
+        )
+    }
+
+    pub(crate) fn insert_capability<E: SessionHandleEntropy>(
+        &self,
+        session: AuthorizationSession<C>,
+        intent: AuthorizationIntent,
+        entropy: &E,
+    ) -> Result<SessionHandle, BrokerError> {
+        self.insert_pending(
+            PendingSession {
+                session,
+                intent: Some(intent),
+            },
+            entropy,
+        )
+    }
+
+    fn insert_pending<E: SessionHandleEntropy>(
+        &self,
+        pending: PendingSession<C>,
+        entropy: &E,
+    ) -> Result<SessionHandle, BrokerError> {
         let mut guard = self.lock_sessions()?;
         // Deterministic reaping: `expire` consumes and zeroizes an expired
         // session and reports `NotExpired` for a live one. A removed entry's
         // `HandleKey` is zeroized with it.
-        guard.retain(|_handle, session| session.expire().is_err());
+        guard.retain(|_handle, pending| pending.session.expire().is_err());
         if guard.len() >= MAX_PENDING_SESSIONS {
             return Err(BrokerError::Busy);
         }
@@ -146,7 +181,7 @@ impl<C: MonotonicClock> SessionRegistry<C> {
             // The key copies the handle text into zeroizing storage; on a
             // collision the un-inserted copy is dropped — and wiped.
             if let Entry::Vacant(entry) = guard.entry(HandleKey::new(handle.as_str())) {
-                entry.insert(session);
+                entry.insert(pending);
                 return Ok(handle);
             }
             attempts += 1;
@@ -172,9 +207,26 @@ impl<C: MonotonicClock> SessionRegistry<C> {
         &self,
         handle: &SessionHandle,
     ) -> Result<AuthorizationSession<C>, BrokerError> {
-        self.lock_sessions()?
+        let pending = self
+            .lock_sessions()?
             .remove(handle.as_str())
-            .ok_or(BrokerError::SessionUnknown)
+            .ok_or(BrokerError::SessionUnknown)?;
+        if pending.intent.is_some() {
+            return Err(BrokerError::InvalidInput);
+        }
+        Ok(pending.session)
+    }
+
+    pub(crate) fn claim_capability(
+        &self,
+        handle: &SessionHandle,
+    ) -> Result<(AuthorizationSession<C>, AuthorizationIntent), BrokerError> {
+        let pending = self
+            .lock_sessions()?
+            .remove(handle.as_str())
+            .ok_or(BrokerError::SessionUnknown)?;
+        let intent = pending.intent.ok_or(BrokerError::InvalidInput)?;
+        Ok((pending.session, intent))
     }
 
     /// Locks the registry, failing closed on poison.
@@ -186,7 +238,7 @@ impl<C: MonotonicClock> SessionRegistry<C> {
     /// handle copy) before the error propagates.
     fn lock_sessions(
         &self,
-    ) -> Result<MutexGuard<'_, HashMap<HandleKey, AuthorizationSession<C>>>, BrokerError> {
+    ) -> Result<MutexGuard<'_, HashMap<HandleKey, PendingSession<C>>>, BrokerError> {
         self.sessions.lock().map_err(|poisoned| {
             poisoned.into_inner().clear();
             BrokerError::Unavailable

@@ -56,6 +56,7 @@
 #![forbid(unsafe_code)]
 
 mod broker;
+mod capability_store;
 mod error;
 mod handle;
 mod permits;
@@ -63,7 +64,13 @@ mod ports;
 mod registry;
 mod subject;
 
+#[doc(inline)]
+pub use broker::{AuthorizationIntent, CapabilityBrokerToken};
 pub use broker::{BrokerCore, BrokerToken, PendingAuthorization};
+#[doc(inline)]
+pub use capability_store::{
+    CapabilityGrantStore, CapabilityGrantStoreError, GrantCredential, StoredCapabilityGrant,
+};
 pub use error::BrokerError;
 pub use handle::{SESSION_HANDLE_BYTES, SessionHandle};
 pub use ports::{

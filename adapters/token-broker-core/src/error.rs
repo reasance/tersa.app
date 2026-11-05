@@ -39,6 +39,14 @@ pub enum BrokerError {
     /// expired, or a prior callback already consumed it. Every callback
     /// attempt is terminal, so this is the only answer a replay ever gets.
     SessionUnknown,
+    /// The selected existing account/subject binding is unknown; replacement never registers it.
+    AccountUnknown,
+    /// Connect found a known subject; explicitly select that account for reconnect/Upgrade.
+    AccountAlreadyConnected,
+    /// An atomic stored-grant precondition changed; no stale replacement was applied.
+    GrantChanged,
+    /// A capability flow received incomplete legacy scope evidence, never Modify authority.
+    ScopeEvidenceUnavailable,
     /// The provider rejected the request or the authorization attempt with an
     /// error other than a refresh-time `invalid_grant` (which is
     /// [`Self::ConsentRevoked`]) or an exchange-time `invalid_grant` (which
@@ -58,7 +66,8 @@ pub enum BrokerError {
     /// A provider response did not parse into a complete, bounded token
     /// response (including an out-of-bound access token or expiry).
     MalformedResponse,
-    /// The granted scope set omitted Gmail read access. On exchange nothing
+    /// Scope evidence did not satisfy the bound requested mailbox capability.
+    /// For legacy readonly this includes omitted Gmail read access. On exchange nothing
     /// was persisted and nothing was revoked: the under-scoped outcome has
     /// no validated identity, so no subject-keyed snapshot is possible and
     /// no grant-wide revoke is safe. The fail-safe contract is deliberately
@@ -75,12 +84,12 @@ pub enum BrokerError {
     /// `id_token` failed freshness validation against the wall clock.
     /// Non-destructive: any stored credential is retained for a retry.
     IdentityUnverified,
-    /// A refresh succeeded but re-validated to a DIFFERENT subject than the
-    /// one the credential was stored under. The stored token is retained; the
-    /// minted access token is dropped without being exposed.
+    /// A capability completion or refresh identified a different subject/account
+    /// than the selected binding. The stored token is retained; minted access
+    /// is dropped without being exposed.
     IdentityMismatch,
     /// No usable refresh token exists: the exchange granted no refresh token
-    /// (the stranded grant was revoked best-effort, but only when a
+    /// (legacy completion may revoke the stranded grant best-effort only when a
     /// definitive empty store snapshot licensed the grant-wide revoke), or
     /// none is stored for the subject. Re-connect is required.
     MissingRefreshToken,
@@ -119,11 +128,17 @@ impl fmt::Display for BrokerError {
             Self::Unavailable => "a broker-internal resource is unavailable",
             Self::Busy => "a bounded broker resource is momentarily exhausted",
             Self::SessionUnknown => "the authorization session is unknown, expired, or consumed",
+            Self::AccountUnknown => "the selected account is unknown",
+            Self::AccountAlreadyConnected => {
+                "the account is already known; use selected-account reconnect"
+            }
+            Self::GrantChanged => "the stored grant changed during the operation",
+            Self::ScopeEvidenceUnavailable => "complete capability scope evidence is unavailable",
             Self::ProviderRejected => "the OAuth provider rejected the request",
             Self::AuthorizationCodeRejected => "the authorization code was rejected; sign in again",
             Self::Transport => "the provider endpoint could not be reached",
             Self::MalformedResponse => "the provider returned an unusable response",
-            Self::InsufficientScope => "the grant omitted Gmail read access",
+            Self::InsufficientScope => "the grant does not match the required mailbox capability",
             Self::IdentityUnverified => "the account identity could not be verified",
             Self::IdentityMismatch => "the credential no longer belongs to the requested account",
             Self::MissingRefreshToken => "no refresh token is available; re-connect is required",
