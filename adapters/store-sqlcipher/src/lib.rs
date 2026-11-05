@@ -12,7 +12,16 @@
 
 #![deny(unsafe_code)]
 
+mod credentials;
+mod schema_v3;
+
+#[doc(inline)]
+pub use credentials::{CredentialSnapshot, CredentialStoreError, StoreCredential};
+
 mod store {
+    use crate::{
+        CredentialSnapshot, CredentialStoreError, StoreCredential, credentials, schema_v3,
+    };
     use std::collections::HashSet;
     use std::ffi::{OsStr, OsString};
     use std::fmt;
@@ -22,6 +31,7 @@ mod store {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::Duration;
+    use tersa_domain::account::AccountCapability;
 
     use rusqlite::config::DbConfig;
     use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, TransactionBehavior, params};
@@ -43,14 +53,11 @@ mod store {
 
     // Fixed ownership marker for this product account-store schema.
     const APPLICATION_ID: i64 = 0x5453_4D31;
-    // The schema carries a shipped-store upgrade path: `MIGRATION` creates a
-    // fresh store on the current version, and a store found on the previous
-    // version upgrades in one transaction on the next writable open. A store
-    // whose version or objects match neither the current nor the previous
-    // schema opens as `Corrupted` and is never rewritten here.
-    const VERSION: i64 = 2;
-    // The previous shipped schema version, accepted read-only and upgraded on
-    // the next writable open.
+    // Fresh stores and recognized owned v1/v2 stores converge to v3.
+    // Old versions retain their exact canonical layouts for readonly access.
+    // Foreign/unknown/noncanonical stores are never migrated or repaired.
+    const VERSION: i64 = 3;
+    const SCHEMA_VERSION_2: i64 = 2;
     const SCHEMA_VERSION_1: i64 = 1;
     // Derivation version of the stored account-identity hash. A row written by a
     // different algorithm reads as incompatible (fail closed), never a first
@@ -60,7 +67,8 @@ mod store {
     // hash, so a scheme change can never produce a false match. Pre-release with no
     // shipped stores, so a v1 dev store reads `Corrupted` and is re-bootstrapped.
     const IDENTITY_ALGO_VERSION: i64 = 2;
-    const CANONICAL_SCHEMA_OBJECT_COUNT: usize = 6;
+    // Six inherited objects plus ten dormant T4 tables and three indexes.
+    const CANONICAL_SCHEMA_OBJECT_COUNT: usize = 19;
     const MAX_SCHEMA_KIND_LEN: i64 = 16;
     const MAX_SCHEMA_NAME_LEN: i64 = 256;
     const MAX_SCHEMA_SQL_LEN: i64 = 16 * 1_024;
@@ -99,8 +107,8 @@ mod store {
         /// Run `PRAGMA integrity_check` and `PRAGMA cipher_integrity_check`,
         /// which read the whole database, so their cost grows with the cache.
         Full,
-        /// Skip both scans, for a database this process already scanned.
-        /// Every other check still runs, and `SQLCipher` still authenticates
+        /// Skip page-integrity and foreign-key scans for a database already scanned.
+        /// Ownership and bounded singleton metadata checks still run, and `SQLCipher` still authenticates
         /// each page when it is read, so a damaged page fails the read.
         Skip,
     }
@@ -421,7 +429,7 @@ mod store {
         /// Opens only an existing, claimed account database for cache reset.
         ///
         /// Never creates a missing file or claims an empty schema. Uses the
-        /// current supported open checks and the existing v1 email upgrade.
+        /// current supported checks and the atomic v1/v2-to-v3 upgrade.
         /// Opening does not authorize a clear: eligibility is rechecked in
         /// [`Self::clear_cached_mail`]'s immediate transaction.
         ///
@@ -454,9 +462,10 @@ mod store {
             .map_err(Into::into)
         }
 
-        /// Atomically clears only messages/bodies and successful-sync freshness.
+        /// Atomically clears cached mail, T4 cache metadata and sync freshness.
         ///
         /// Keeps identity, binding, subject, token, email and recovery state.
+        /// Refuses retained command/undo bodies until pin-aware P5c paths exist.
         /// Requires an existing current identity and required account metadata,
         /// without pending disconnect recovery. This is not account purge.
         /// Callers hold the installation lock; no network work belongs here.
@@ -479,6 +488,7 @@ mod store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(store_error)?;
             validate_cache_reset_account(&transaction, account)?;
+            clear_triage_cache(&transaction)?;
             transaction
                 .execute("DELETE FROM messages", [])
                 .map_err(store_error)?;
@@ -741,11 +751,112 @@ mod store {
             operation(&mut connection)
         }
 
+        /// Loads one consistent, bounded owning-account credential snapshot.
+        ///
+        /// Reads never provision another account. A missing subject denotes an
+        /// unfinished binding; replacement requires a bound subject. Historical
+        /// credentials over 1,024 bytes remain stored but typed access fails.
+        ///
+        /// # Errors
+        /// Returns closed unknown-account, invalid-value or storage failures.
+        pub fn load_credential_snapshot(
+            &self,
+            account: &AccountId,
+        ) -> Result<CredentialSnapshot, CredentialStoreError> {
+            if &self.account != account {
+                return Err(CredentialStoreError::UnknownAccount);
+            }
+            let mut connection = self
+                .connection
+                .lock()
+                .map_err(|_error| CredentialStoreError::Storage)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(|_error| CredentialStoreError::Storage)?;
+            let snapshot = credentials::read(&transaction, account, 1024)?;
+            transaction
+                .commit()
+                .map_err(|_error| CredentialStoreError::Storage)?;
+            Ok(snapshot)
+        }
+
+        /// Atomically replaces capability and credential for the exact expected snapshot.
+        ///
+        /// The entire binding, purpose, credential and recorded identity are
+        /// compared under the writer lock. This cannot change subject, provision
+        /// an account or implement a delayed token-only overwrite. Runtime owns
+        /// account serialization and access-session invalidation after success.
+        /// Use Missing to delete a matched credential while retaining capability.
+        ///
+        /// # Errors
+        /// Returns Conflict for stale state, `UnknownAccount` for another owner,
+        /// Invalid for unbound/unsupported values, or opaque Storage on rollback.
+        pub fn replace_credential_snapshot(
+            &self,
+            expected: &CredentialSnapshot,
+            capability: AccountCapability,
+            credential: &StoreCredential,
+        ) -> Result<(), CredentialStoreError> {
+            if expected.account_id() != &self.account {
+                return Err(CredentialStoreError::UnknownAccount);
+            }
+            if expected.subject().is_none() {
+                return Err(CredentialStoreError::Invalid);
+            }
+            let (purpose, token) = credential.parts()?;
+            if purpose == 0 && capability != expected.capability() {
+                return Err(CredentialStoreError::Invalid);
+            }
+            let mut connection = self
+                .connection
+                .lock()
+                .map_err(|_error| CredentialStoreError::Storage)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_error| CredentialStoreError::Storage)?;
+            let actual = credentials::read(&transaction, &self.account, 1024)?;
+            if &actual != expected {
+                return Err(CredentialStoreError::Conflict);
+            }
+            let changed = transaction.execute(
+                "UPDATE account_binding SET refresh_token = ?1, capability = ?2, credential_purpose = ?3 WHERE singleton = 1 AND account_id = ?4",
+                params![token, credentials::capability_code(capability), purpose, self.account.as_str()],
+            ).map_err(|_error| CredentialStoreError::Storage)?;
+            if changed != 1 {
+                return Err(CredentialStoreError::Invalid);
+            }
+            // Re-read the actual complete pair before commit, including effects
+            // from SQLite constraints; no successful token-only intermediate API.
+            let saved = credentials::read(&transaction, &self.account, 1024)?;
+            if saved.capability() != capability || saved.credential() != credential {
+                return Err(CredentialStoreError::Invalid);
+            }
+            transaction
+                .commit()
+                .map_err(|_error| CredentialStoreError::Storage)
+        }
+
+        /// Deletes exactly the matched credential, preserving account and capability.
+        ///
+        /// # Errors
+        /// Returns the same closed stale/invalid/storage errors as replacement.
+        pub fn delete_credential_snapshot(
+            &self,
+            expected: &CredentialSnapshot,
+        ) -> Result<(), CredentialStoreError> {
+            self.replace_credential_snapshot(
+                expected,
+                expected.capability(),
+                &StoreCredential::Missing,
+            )
+        }
+
         /// Stores the account's broker routing subject in the binding row.
         ///
         /// The subject is an encrypted account-identifying broker routing
         /// key: it is never logged or displayed, and it is not an OAuth
-        /// credential. Error values never echo the subject. Exactly one
+        /// credential. Once bound, only the same subject can be stored again.
+        /// Error values never echo the subject. Exactly one
         /// binding row must match the exact account, otherwise the store is
         /// corrupt.
         ///
@@ -766,7 +877,7 @@ mod store {
             self.with_connection(|connection| {
                 let changed = connection
                     .execute(
-                        "UPDATE account_binding SET broker_subject = ?1 WHERE singleton = 1 AND account_id = ?2",
+                        "UPDATE account_binding SET broker_subject = ?1 WHERE singleton = 1 AND account_id = ?2 AND (broker_subject IS NULL OR broker_subject = ?1)",
                         params![subject, account.as_str()],
                     )
                     .map_err(store_error)?;
@@ -797,7 +908,7 @@ mod store {
             self.checked_account(account)?;
             self.with_connection(|connection| {
                 let row = connection.query_row(
-                    "SELECT typeof(broker_subject), CASE WHEN typeof(broker_subject) = 'text' THEN broker_subject END, CASE WHEN typeof(account_id) = 'text' THEN account_id END FROM account_binding WHERE singleton = 1",
+                    "SELECT typeof(broker_subject), CASE WHEN typeof(broker_subject) = 'text' AND length(CAST(broker_subject AS BLOB)) <= 255 THEN broker_subject END, CASE WHEN typeof(account_id) = 'text' AND length(CAST(account_id AS BLOB)) <= 256 THEN account_id END FROM account_binding WHERE singleton = 1",
                     [],
                     |row| {
                         let subject_type: String = row.get(0)?;
@@ -890,7 +1001,7 @@ mod store {
                     return Err(MailboxStoreError::Corrupted);
                 }
                 let row = connection.query_row(
-                    "SELECT typeof(email_address), CASE WHEN typeof(email_address) = 'text' THEN email_address END, CASE WHEN typeof(account_id) = 'text' THEN account_id END FROM account_binding WHERE singleton = 1",
+                    "SELECT typeof(email_address), CASE WHEN typeof(email_address) = 'text' AND length(CAST(email_address AS BLOB)) <= 320 THEN email_address END, CASE WHEN typeof(account_id) = 'text' AND length(CAST(account_id AS BLOB)) <= 256 THEN account_id END FROM account_binding WHERE singleton = 1",
                     [],
                     |row| {
                         let address_type: String = row.get(0)?;
@@ -925,7 +1036,7 @@ mod store {
         /// Stores the account's OAuth refresh token in the binding row.
         ///
         /// The token is protected only by the database encryption and is never
-        /// logged. It must be 1..=4096 bytes of printable non-space ASCII.
+        /// logged. It must be 1..=1024 bytes of printable non-space ASCII.
         ///
         /// # Errors
         ///
@@ -938,7 +1049,7 @@ mod store {
             token: &str,
         ) -> Result<(), MailboxStoreError> {
             self.checked_account(account)?;
-            if !is_valid_refresh_token(token) {
+            if token.len() > 1024 || !is_valid_refresh_token(token) {
                 return Err(MailboxStoreError::Storage);
             }
             self.update_refresh_token(account, Some(token))
@@ -961,64 +1072,45 @@ mod store {
             token: Option<&str>,
         ) -> Result<(), MailboxStoreError> {
             self.with_connection(|connection| {
-                let changed = connection
-                    .execute(
-                        "UPDATE account_binding SET refresh_token = ?1 WHERE singleton = 1 AND account_id = ?2",
-                        params![token, account.as_str()],
-                    )
+                let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(store_error)?;
-                (changed == 1)
-                    .then_some(())
-                    .ok_or(MailboxStoreError::Corrupted)
+                let current = credentials::read(&transaction, account, 1024).map_err(legacy_credential_error)?;
+                assert_legacy_credential(&current)?;
+                let changed = transaction.execute(
+                    "UPDATE account_binding SET refresh_token = ?1, credential_purpose = ?2 WHERE singleton = 1 AND account_id = ?3 AND capability = 0 AND credential_purpose IN (0,1)",
+                    params![token, i64::from(token.is_some()), account.as_str()],
+                ).map_err(store_error)?;
+                if changed != 1 { return Err(MailboxStoreError::Corrupted); }
+                transaction.commit().map_err(store_error)
             })
         }
 
-        /// Loads the account's OAuth refresh token.
+        /// Loads only a legacy `ReadOnly` Active/Missing credential.
         ///
-        /// A SQL NULL token returns `None`; a missing or mismatched binding row,
-        /// a non-text token, or text violating the stored shape is corruption.
+        /// Unsupported occupied Modify or revocation-only state is an error,
+        /// never absence. Historical token bytes remain stored, but this usable view also
+        /// enforces the 1,024-byte broker bound.
         ///
         /// # Errors
-        ///
-        /// Returns storage for an account mismatch or backend failure and
-        /// corruption for a missing or mismatched binding row or an invalid
-        /// persisted token.
+        /// Returns opaque corruption for unsupported state or invalid values,
+        /// and storage for account mismatch/backend failure.
         pub fn load_refresh_token(
             &self,
             account: &AccountId,
         ) -> Result<Option<Zeroizing<String>>, MailboxStoreError> {
             self.checked_account(account)?;
             self.with_connection(|connection| {
-                let row = connection.query_row(
-                    "SELECT typeof(refresh_token), CASE WHEN typeof(refresh_token) = 'text' THEN refresh_token END, CASE WHEN typeof(account_id) = 'text' THEN account_id END FROM account_binding WHERE singleton = 1",
-                    [],
-                    |row| {
-                        let token_type: String = row.get(0)?;
-                        let token: Option<String> = row.get(1)?;
-                        let binding: Option<String> = row.get(2)?;
-                        Ok((token_type, token.map(Zeroizing::new), binding))
-                    },
-                );
-                let (token_type, token, binding) = match row {
-                    Ok(values) => values,
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
-                        return Err(MailboxStoreError::Corrupted);
-                    }
-                    Err(error) => return Err(store_error(error)),
-                };
-                if binding.as_deref() != Some(account.as_str()) {
-                    return Err(MailboxStoreError::Corrupted);
-                }
-                match token_type.as_str() {
-                    "null" => Ok(None),
-                    "text" => {
-                        let token = token.ok_or(MailboxStoreError::Corrupted)?;
-                        if !is_valid_refresh_token(&token) {
-                            return Err(MailboxStoreError::Corrupted);
-                        }
-                        Ok(Some(token))
-                    }
-                    _ => Err(MailboxStoreError::Corrupted),
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Deferred)
+                    .map_err(store_error)?;
+                let current = credentials::read(&transaction, account, 1024)
+                    .map_err(legacy_credential_error)?;
+                assert_legacy_credential(&current)?;
+                transaction.commit().map_err(store_error)?;
+                match current.credential {
+                    StoreCredential::Missing => Ok(None),
+                    StoreCredential::Active(value) => Ok(Some(value)),
+                    StoreCredential::RevocationOnly(_) => Err(MailboxStoreError::Corrupted),
                 }
             })
         }
@@ -1087,6 +1179,7 @@ mod store {
                         return Err(MailboxStoreError::Storage);
                     }
                 }
+                refuse_command_evidence(&transaction)?;
                 transaction.execute(
                     "DELETE FROM messages WHERE message_id NOT IN (SELECT message_id FROM messages ORDER BY received_at DESC, message_id ASC LIMIT ?1)",
                     params![i64::from(keep_limit.get())],
@@ -1166,6 +1259,7 @@ mod store {
                     .map_err(store_error)?;
                 assert_identity_matches_expected(&transaction, account, expected)?;
                 if clear_mailbox {
+                    clear_triage_cache(&transaction)?;
                     transaction
                         .execute("DELETE FROM messages", [])
                         .map_err(store_error)?;
@@ -1262,6 +1356,7 @@ mod store {
                 let transaction = connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(store_error)?;
+                clear_triage_cache(&transaction)?;
                 transaction
                     .execute("DELETE FROM messages", [])
                     .map_err(store_error)?;
@@ -1277,7 +1372,7 @@ mod store {
                     .map_err(store_error)?;
                 let cleared = transaction
                     .execute(
-                        "UPDATE account_binding SET broker_subject = NULL, refresh_token = NULL WHERE singleton = 1 AND account_id = ?1",
+                        "UPDATE account_binding SET broker_subject = NULL, refresh_token = NULL, credential_purpose = 0, capability = 0 WHERE singleton = 1 AND account_id = ?1",
                         params![account.as_str()],
                     )
                     .map_err(store_error)?;
@@ -3109,8 +3204,8 @@ mod store {
     /// length` projection) is `Err(`[`MailboxStoreError::Corrupted`]`)` — never a
     /// silent "no identity yet", matching the store's rule that a present-but-
     /// unreadable identity always fails closed.
-    fn read_recorded_identity(
-        transaction: &Transaction<'_>,
+    pub(super) fn read_recorded_identity(
+        transaction: &Connection,
         account: &AccountId,
     ) -> Result<Option<[u8; 32]>, MailboxStoreError> {
         let row = transaction.query_row(
@@ -3202,7 +3297,9 @@ mod store {
             return Err(OpenFailure::Corrupted);
         }
         configure_owned_storage(connection)?;
-        upgrade_schema_v1(connection)?;
+        if !fresh {
+            upgrade_schema(connection, account)?;
+        }
         Ok(fresh)
     }
 
@@ -3217,6 +3314,9 @@ mod store {
             .execute_batch(MIGRATION_V2_ACCOUNT_EMAIL)
             .map_err(classify_open)?;
         transaction
+            .execute_batch(schema_v3::MIGRATION)
+            .map_err(classify_open)?;
+        transaction
             .execute(
                 "INSERT INTO account_binding (singleton, account_id) VALUES (1, ?1)",
                 params![account.as_str()],
@@ -3228,6 +3328,7 @@ mod store {
         transaction
             .pragma_update(None, "user_version", VERSION)
             .map_err(classify_open)?;
+        validate_identity(&transaction, account)?;
         transaction.commit().map_err(classify_open)
     }
 
@@ -3237,41 +3338,36 @@ mod store {
             .map_err(classify_open)
     }
 
-    // Upgrades a shipped version-1 store to the current schema: it adds the
-    // account email column and bumps the stored version in one
-    // `BEGIN IMMEDIATE` transaction, so a crash can never leave a
-    // half-upgraded store behind. A store already on the current version is
-    // left alone; the caller validated the old schema before this runs and
-    // the current one after.
-    fn upgrade_schema_v1(connection: &Connection) -> Result<(), OpenFailure> {
-        let user_version: i64 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
+    // All recognized upgrades, including email, share one writer transaction.
+    fn upgrade_schema(connection: &Connection, account: &AccountId) -> Result<(), OpenFailure> {
+        let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
             .map_err(classify_open)?;
-        if user_version != SCHEMA_VERSION_1 {
-            return Ok(());
+        validate_identity(&transaction, account)?;
+        let version: i64 = transaction
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(classify_open)?;
+        if matches!(version, SCHEMA_VERSION_1 | SCHEMA_VERSION_2) {
+            // Changing a legacy format authenticates all old pages before any
+            // DDL, even when a caller requested Skip for ordinary reopens.
+            validate_health(&transaction, IntegrityScan::Full)?;
+            schema_v3::validate_migration_rows(&transaction, account, version)
+                .map_err(classify_open)?;
         }
-        connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(classify_open)?;
-        let outcome = (|| {
-            connection
+        if version == SCHEMA_VERSION_1 {
+            transaction
                 .execute_batch(MIGRATION_V2_ACCOUNT_EMAIL)
                 .map_err(classify_open)?;
-            connection
+        }
+        if matches!(version, SCHEMA_VERSION_1 | SCHEMA_VERSION_2) {
+            transaction
+                .execute_batch(schema_v3::MIGRATION)
+                .map_err(classify_open)?;
+            transaction
                 .pragma_update(None, "user_version", VERSION)
                 .map_err(classify_open)?;
-            let schema = schema(connection).map_err(classify_open)?;
-            (schema == canonical_schema())
-                .then_some(())
-                .ok_or(OpenFailure::Corrupted)
-        })();
-        match outcome {
-            Ok(()) => connection.execute_batch("COMMIT").map_err(classify_open),
-            Err(error) => {
-                let _ = connection.execute_batch("ROLLBACK");
-                Err(error)
-            }
+            validate_identity(&transaction, account)?;
         }
+        transaction.commit().map_err(classify_open)
     }
 
     fn configure_read_only(
@@ -3377,13 +3473,13 @@ mod store {
         if fresh {
             return Ok(true);
         }
-        // A shipped store is either the current version or the previous one,
-        // each with exactly its own canonical objects. A newer version, a
-        // foreign application id, or a mismatched object set fails closed and
+        // Each supported version has exactly its own canonical objects. A newer
+        // version, foreign application id or mismatched object set fails closed and
         // is never rewritten here.
         let expected = match user_version {
             VERSION => canonical_schema(),
             SCHEMA_VERSION_1 => canonical_schema_v1(),
+            SCHEMA_VERSION_2 => canonical_schema_v2(),
             _ => return Err(OpenFailure::Corrupted),
         };
         if application_id != APPLICATION_ID || schema != expected {
@@ -3399,6 +3495,7 @@ mod store {
         if AccountId::new(owner).ok().as_ref() != Some(account) {
             return Err(OpenFailure::Corrupted);
         }
+        schema_v3::validate_metadata(connection, user_version).map_err(classify_open)?;
         Ok(false)
     }
 
@@ -3424,10 +3521,13 @@ mod store {
         let journal: String = connection
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .map_err(classify_open)?;
-        let foreign_key_failure = connection
-            .prepare("PRAGMA foreign_key_check")
-            .and_then(|mut statement| statement.query([])?.next().map(|row| row.is_some()))
-            .map_err(classify_open)?;
+        let foreign_key_failure = match scan {
+            IntegrityScan::Full => connection
+                .prepare("PRAGMA foreign_key_check")
+                .and_then(|mut statement| statement.query([])?.next().map(|row| row.is_some()))
+                .map_err(classify_open)?,
+            IntegrityScan::Skip => false,
+        };
         let (integrity, cipher_failure) = match scan {
             IntegrityScan::Full => (
                 connection
@@ -3571,6 +3671,18 @@ mod store {
         Ok(objects)
     }
     fn canonical_schema() -> Vec<(String, String, String)> {
+        let mut objects = canonical_schema_v2();
+        let binding = objects
+            .iter_mut()
+            .find(|(_, name, _)| name == "account_binding")
+            .expect("canonical binding");
+        binding.2.pop();
+        binding.2.push_str(", capability INTEGER NOT NULL DEFAULT 0 CHECK (capability IN (0, 1)), credential_purpose INTEGER NOT NULL DEFAULT 0 CHECK (credential_purpose IN (0, 1, 2)))");
+        objects.extend(schema_v3::canonical_objects());
+        objects.sort_unstable();
+        objects
+    }
+    fn canonical_schema_v2() -> Vec<(String, String, String)> {
         canonical_objects(normalize(
             "CREATE TABLE account_binding ( singleton INTEGER PRIMARY KEY CHECK (singleton = 1), account_id TEXT NOT NULL, broker_subject TEXT NULL CHECK (broker_subject IS NULL OR (length(CAST(broker_subject AS BLOB)) BETWEEN 1 AND 255)), refresh_token TEXT NULL CHECK (refresh_token IS NULL OR (length(CAST(refresh_token AS BLOB)) BETWEEN 1 AND 4096)) , email_address TEXT NULL CHECK (email_address IS NULL OR (length(CAST(email_address AS BLOB)) BETWEEN 3 AND 320)))",
         ))
@@ -3629,6 +3741,45 @@ mod store {
             .collect::<Vec<_>>()
             .join(" ")
     }
+    fn legacy_credential_error(error: CredentialStoreError) -> MailboxStoreError {
+        match error {
+            CredentialStoreError::Storage => MailboxStoreError::Storage,
+            _ => MailboxStoreError::Corrupted,
+        }
+    }
+
+    fn assert_legacy_credential(snapshot: &CredentialSnapshot) -> Result<(), MailboxStoreError> {
+        if snapshot.capability() != AccountCapability::ReadOnly {
+            return Err(MailboxStoreError::Corrupted);
+        }
+        match snapshot.credential() {
+            StoreCredential::Missing => Ok(()),
+            StoreCredential::Active(value) if is_valid_refresh_token(value) => Ok(()),
+            _ => Err(MailboxStoreError::Corrupted),
+        }
+    }
+
+    // Until the pin-aware P5c methods land, legacy destructive paths refuse
+    // retained command/undo bodies. They must never silently erase evidence.
+    fn refuse_command_evidence(connection: &Connection) -> Result<(), MailboxStoreError> {
+        let occupied: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mailbox_commands) OR EXISTS(SELECT 1 FROM mailbox_undo)", [], |r| r.get(0)
+        ).map_err(store_error)?;
+        if occupied {
+            Err(MailboxStoreError::Storage)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn clear_triage_cache(connection: &Connection) -> Result<(), MailboxStoreError> {
+        refuse_command_evidence(connection)?;
+        connection.execute_batch(
+            "DELETE FROM terminal_commands; DELETE FROM provider_memberships; DELETE FROM provider_messages;
+             DELETE FROM provider_labels; UPDATE mailbox_checkpoint SET history_cursor = NULL, recovery_required = 0, catalog_known = 0;"
+        ).map_err(store_error)
+    }
+
     // A broker subject is 1..=255 bytes of printable non-space ASCII. This
     // matches the `account_binding.broker_subject` column CHECK bound and
     // keeps the routing key free of whitespace and control bytes.
@@ -3699,6 +3850,8 @@ mod store {
         use std::time::Instant;
 
         use super::*;
+
+        include!("p5a_tests.rs");
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -6804,8 +6957,8 @@ mod store {
         }
 
         #[test]
-        fn fresh_stores_create_the_version_two_schema_with_no_email() {
-            let (_database, store) = open("fresh-version-two");
+        fn fresh_stores_create_the_version_three_schema_with_no_email() {
+            let (_database, store) = open("fresh-version-three");
             let (application_id, user_version, objects) = schema_state(&store);
             assert_eq!((application_id, user_version), (APPLICATION_ID, VERSION));
             assert_eq!(objects, canonical_schema());
@@ -8102,7 +8255,7 @@ mod store {
                     CacheResetError::Ineligible,
                 ),
                 (
-                    "UPDATE account_binding SET refresh_token = NULL",
+                    "UPDATE account_binding SET refresh_token = NULL, credential_purpose = 0",
                     CacheResetError::Ineligible,
                 ),
                 (
@@ -8327,7 +8480,7 @@ mod store {
                 .lock()
                 .unwrap()
                 .execute_batch(
-                    "PRAGMA user_version = 2; UPDATE account_binding SET account_id = 'account-b';",
+                    "PRAGMA user_version = 3; UPDATE account_binding SET account_id = 'account-b';",
                 )
                 .unwrap();
             assert_eq!(
