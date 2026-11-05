@@ -805,7 +805,8 @@ mod tests {
             let mut fixture = Fixture::new();
             let a = fixture.accounts[0].clone();
             let installation = Arc::clone(fixture.runtime.installation());
-            let store = if condition == 1 {
+            // Construct missing/mismatched initial bindings without rewriting an immutable subject.
+            let store = if matches!(condition, 1 | 4) {
                 replace_fixture_store(&installation, &a, false)
             } else {
                 installation.open_store(&a).expect("store")
