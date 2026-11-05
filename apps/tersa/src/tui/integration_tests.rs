@@ -25,7 +25,7 @@ use tersa_sync_runtime::{CommandIntent, InstallationLock};
 
 const WAIT: Duration = Duration::from_secs(5);
 use crate::test_support::LocalFixture as Fixture;
-fn components(fixture: &Fixture) -> (impl MailSource, Workers) {
+pub(super) fn components(fixture: &Fixture) -> (impl MailSource, Workers) {
     let context = crate::commands::Context {
         paths: crate::config::Paths {
             config_dir: fixture.path.join("config"),
@@ -38,7 +38,7 @@ fn components(fixture: &Fixture) -> (impl MailSource, Workers) {
             .expect("offline components");
     (source, Workers::start(remotes).expect("workers"))
 }
-fn message(id: &str, at: i64) -> MessageEnvelope {
+pub(super) fn message(id: &str, at: i64) -> MessageEnvelope {
     MessageEnvelope::new(
         MessageId::new(id).expect("id"),
         ThreadId::new("thread").expect("thread"),

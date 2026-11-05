@@ -73,6 +73,21 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, now_millis: i64) {
     if app.help {
         draw_help(frame, frame.area());
     }
+    super::triage::draw(frame, app);
+}
+
+fn filter_caption(app: &App) -> String {
+    use tersa_sync_runtime::CachedMailboxFilter;
+    match &app.filter {
+        CachedMailboxFilter::Recent => "Recent (all cached)".to_owned(),
+        CachedMailboxFilter::Inbox => "Observed Inbox".to_owned(),
+        CachedMailboxFilter::Trash => "Observed Trash".to_owned(),
+        CachedMailboxFilter::Spam => "Observed Spam".to_owned(),
+        CachedMailboxFilter::UserLabel(label) => format!(
+            "Observed User label [{}]",
+            tersa_presentation::triage::render_identifier(label.id().as_str())
+        ),
+    }
 }
 
 fn draw_top(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
@@ -190,11 +205,17 @@ fn draw_bottom(frame: &mut Frame<'_>, area: Rect, app: &App) {
         (None, Screen::Inbox) if app.filtered() => {
             "j/k move   enter open   / search again   esc all messages   ? help".to_owned()
         }
-        (None, Screen::Inbox) => "j/k move   enter open   / search   q quit   ? help".to_owned(),
+        (None, Screen::Inbox) => "j/k move · enter open · m actions · F filters · Q queue · L labels · A account · ? help".to_owned(),
         (None, Screen::Message(_)) => {
             "j/k scroll   n/p next/previous   H html/plain   q back   ? help".to_owned()
         }
     };
+    let selection = if app.triage.batch.is_empty() {
+        String::new()
+    } else {
+        format!("{} selected · ", app.triage.batch.len())
+    };
+    let text = format!("{selection}{} · {text}", filter_caption(app));
     let line = Line::styled(
         format!(" {}", truncate(&text, usize::from(area.width))),
         dim(),
@@ -270,6 +291,7 @@ fn draw_inbox(frame: &mut Frame<'_>, area: Rect, app: &App, now_millis: i64) {
                 total,
                 now_millis,
                 tag.as_deref(),
+                app.triage.batch.contains(&row.message_key()),
             )
         })
         .collect();
@@ -288,10 +310,11 @@ fn inbox_line(
     total: usize,
     now_millis: i64,
     tag: Option<&str>,
+    batched: bool,
 ) -> Line<'static> {
     let sender_width = (total / 4).clamp(10, 24);
     let date = dates::short(row.received_at_millis, now_millis);
-    let fixed = 2 + DATE_WIDTH + 2 + tag.map_or(0, |_| TAG_COLUMN) + sender_width + 2;
+    let fixed = 6 + DATE_WIDTH + 2 + tag.map_or(0, |_| TAG_COLUMN) + sender_width + 2;
     let remaining = total.saturating_sub(fixed);
     let subject = truncate(row.subject.as_str(), remaining);
     let preview_room = remaining.saturating_sub(width(&subject) + 3);
@@ -308,6 +331,18 @@ fn inbox_line(
     };
     let mut spans = vec![
         Span::styled(marker, weight),
+        Span::raw(if batched { "✓ " } else { "  " }),
+        Span::raw(
+            if row
+                .triage
+                .as_ref()
+                .is_some_and(|doc| !doc.pending.is_empty())
+            {
+                "◷ "
+            } else {
+                "  "
+            },
+        ),
         Span::styled(format!("{date:>DATE_WIDTH$}  "), dim()),
     ];
     if let Some(label) = tag {
@@ -552,7 +587,15 @@ fn human_size(bytes: usize) -> String {
     format!("{value} {}", UNITS[unit])
 }
 
-const HELP: [(&str, &str); 17] = [
+const HELP: [(&str, &str); 25] = [
+    ("m / i", "desired actions / observed + pending"),
+    ("◷", "pending desired intent; i shows detail"),
+    ("F", "Recent / observed folder / User label"),
+    ("Q / L / A", "queue / labels / account controls"),
+    ("v / V / X", "select / select shown / clear batch"),
+    ("", "Batch ≤1,000; search/view/reload clears"),
+    ("", "? unknown, × missing; Recent includes both"),
+    ("", "Modals: j/k, enter; Esc cancels"),
     ("tab / shift-tab", "All/account views (2+)"),
     ("", "Switch: inbox; clear search"),
     ("j / k, ↓ / ↑", "move or scroll"),

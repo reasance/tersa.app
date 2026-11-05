@@ -34,9 +34,12 @@ pub(super) async fn run(
             )
             .await
         }
-        ControlJob::Undo { resume } => {
+        ControlJob::Undo {
+            expected_source,
+            resume,
+        } => {
             let outcome = runtime
-                .admit_undo(account)
+                .admit_undo_for(account, &expected_source)
                 .await
                 .map_err(|error| error.to_string())?;
             changed(
@@ -80,10 +83,7 @@ pub(super) async fn run(
             .await
         }
         ControlJob::AuthorizeRetry { stamp, resume } => {
-            let receipt = runtime
-                .authorize_command_retry(account, &stamp)
-                .await
-                .map_err(|error| error.to_string())?;
+            let receipt = retry_receipt(runtime, account, &stamp).await?;
             changed(
                 runtime,
                 account,
@@ -195,4 +195,37 @@ async fn authorize(
         legacy_sync,
         history,
     })
+}
+
+async fn retry_receipt(
+    runtime: &Runtime,
+    account: &AccountId,
+    stamp: &tersa_application::command::CommandStamp,
+) -> Result<tersa_application::command::RetryAuthorization, String> {
+    // A saved unused ticket can survive an offline follow-up. Reuse
+    // only the exact selected store revision, never silently select a
+    // newer command or authorize an additional ticket.
+    let current = runtime
+        .command_lookup(account, stamp.key().command_id())
+        .await
+        .map_err(|error| error.to_string())?;
+    let receipt = match current {
+        Some(tersa_application::command::RetainedCommand::Full(snapshot))
+            if snapshot.stamp() == stamp =>
+        {
+            match snapshot.retry_authorization() {
+                Some(ticket) => ticket.clone(),
+                None => runtime
+                    .authorize_command_retry(account, stamp)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            }
+        }
+        _ => {
+            return Err(
+                "The selected command changed; reload queue status before retrying.".to_owned(),
+            );
+        }
+    };
+    Ok(receipt)
 }

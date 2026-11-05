@@ -13,8 +13,8 @@ pub const USAGE: &str = "\
 tersa — a privacy-first Gmail client for the terminal
 
 Usage:
-  tersa                           Open the full-screen interface
-  tersa account add               Sign in with Google and add an account
+  tersa                           Open cached Recent mail and keyboard triage (m/F/Q/L/A; ? for help)
+  tersa account add               Sign in with Google and add a ReadOnly account
   tersa account upgrade <account> Explicitly request Modify access for an existing account
   tersa account reconnect <account>
                                   Reconnect with the account's stored capability
