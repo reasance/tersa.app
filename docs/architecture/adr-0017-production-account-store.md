@@ -7,7 +7,7 @@ one at https://mozilla.org/MPL/2.0/.
 # ADR 0017: Production account store
 
 - Status: Accepted
-- T4 v3 prerequisite contract: source implementation pending
+- T4 v3 schema: implemented on candidate `771bacbf19766ffa3d4cbb29b981489607283c89`; live Modify acceptance is separate and has not been run
 - Amended by: [ADR 0031](adr-0031-tui-only-pivot.md): portable store for macOS and Linux
 - Date: 2026-07-16
 
@@ -25,10 +25,20 @@ bound to one local account, and reject unknown schema ownership.
 access, and uses WAL, foreign keys, in-memory temporary storage, secure
 deletion, a bounded busy timeout, canonical schema validation, `SQLite` and `SQLCipher` integrity
 checks, and no-follow opening of the canonicalized database leaf.
-(Amended in T2c: the `integrity_check` and `cipher_integrity_check` scans read
-the whole database, so they run on the first open of each database in a
-process. Later opens and the interface's first read skip them; every other open
-check still runs, and SQLCipher authenticates each page it reads.)
+`IntegrityScan::Full` runs `PRAGMA integrity_check`, `PRAGMA cipher_integrity_check`,
+and `PRAGMA foreign_key_check`. `IntegrityScan::Skip` omits all three walks.
+Every open still sets and requires foreign-key enforcement (`PRAGMA foreign_keys = 1`),
+together with the temp-store, secure-delete, and WAL checks. Enforcement does
+not walk existing rows. `Skip`, including a writable display open from
+`Installation::open_store_for_display`, can leave a damaged unread page or an
+existing orphan row latent until a `Full` scan or until a later access reads
+that page or validates that relationship. SQLCipher still authenticates each
+page it reads. Bounded singleton metadata validation still runs on `Skip`.
+A recognized v1 or v2 migration runs `Full` before it changes format, even
+when the caller requested `Skip`.
+`Installation::open_store` runs `Full` on the first successful open of that
+account through the installation handle and `Skip` afterward.
+`open_store_for_display` always requests `Skip` and does not record a `Full` scan.
 An existing file is first inspected through an immutable read-only SQLite URI,
 so rollback-journal recovery cannot modify it before ownership is established.
 An empty candidate with any SQLite sidecar is rejected rather than claimed.
@@ -50,10 +60,16 @@ PRAGMA would otherwise use.
 The adapter also implements the envelope-only `MailboxReader` port through
 `SqlCipherMailboxReader::open_read_only`. This type opens only an existing
 regular main database with existing regular `-wal` and `-shm` sidecars, uses
-SQLite read-only/no-mutex/no-follow flags, and has no complete-message-body or
-mutation capability. It performs exact key, owner, schema, SQLCipher, integrity,
-account, bounded-decode, and pre/post pathname-identity checks inside a live
-read transaction. It disables and verifies checkpoint-on-close and exposes no
+SQLite read-only/no-mutex/no-follow flags, and has no mutation capability.
+It can read a complete cached message. Its open uses `IntegrityScan::Full`, including
+`foreign_key_check`, plus exact key, owner, schema, account, bounded-decode,
+and pre/post pathname-identity checks. A later read transaction on that reader
+uses `Skip` for the three whole-database scans and still rechecks identity,
+canonical schema, foreign-key enforcement, and bounded metadata. That reader
+is not the writable display opener. Production inbox and message display use
+`open_store_for_display` (`Skip`). `Installation::account_email_existing` uses
+this readonly reader, so that address read does run `Full`.
+The reader disables and verifies checkpoint-on-close and exposes no
 creation, claim, migration, repair, checkpoint, or journal-mode operation. It
 does not use `immutable=1` or a private copy. `MessageEnvelope` still contains
 the existing body-derived preview; callers must treat that preview as sensitive content.
@@ -71,10 +87,12 @@ Later orchestration must poll it on a bounded blocking executor; it must not be
 run on a latency-sensitive async executor thread. Each write is one SQLCipher
 transaction, and a dropped unpolled future has no effect.
 
-The implemented account schema is v2: the v1 singleton binding, messages with
-nullable RFC 5322 content, identity and lifecycle rows, plus the nullable account
-email added by `0002_account_email.sql`. Writable opens transactionally upgrade
-recognized v1 to v2; readonly v1 opens do not migrate. The separate registry is
+The implemented account schema is v3. It includes the v1 singleton binding,
+messages with nullable RFC 5322 content, identity and lifecycle rows, the
+nullable account email from `0002_account_email.sql`, and the complete v3
+triage objects. Writable opens upgrade a recognized v1 or v2 store to v3 in
+one transaction, including the email upgrade when it is still required.
+Readonly opens of v1, v2, and v3 do not migrate. The separate registry is
 schema v1 and the identity-hash algorithm is version 2. Only an exactly empty
 database may be claimed. Ownership,
 version, schema, integrity, missing identity rows, invalid SQLite types or
@@ -120,10 +138,10 @@ before the post-read identity check fails closed.
 
 ## T4 account schema v3 prerequisite contract
 
-This T4 prerequisite design follows
-[ADR 0027](adr-0027-gmail-modify-history-and-mailbox-commands.md); source
-implementation is pending. It describes no current migration or command
-implementation. `tersa-store-sqlcipher` remains the sole schema and
+This section is the v3 store contract implemented with
+[ADR 0027](adr-0027-gmail-modify-history-and-mailbox-commands.md). Live Modify
+acceptance is a separate record and is not claimed here.
+`tersa-store-sqlcipher` remains the sole schema and
 transaction owner; runtime composition does not issue SQL or migrate stores.
 
 Recognized owned v1/v2 account stores migrate to v3 in **one writer transaction**:
@@ -158,7 +176,7 @@ identity-fence checks, including the filesystem residuals described above.
 Baseline binaries reject v3; source rollback does not restore readability.
 There is no implicit downgrade, reset, quarantine, key export or plaintext copy.
 
-The store supplies these atomic boundaries for the planned ports:
+The store supplies these atomic boundaries:
 
 - Read token plus capability consistently. Bind upgrade to the existing account
   and expected immutable subject; replace token plus capability together, with
@@ -224,8 +242,9 @@ Identity replacement also refuses destructive
 change while nonterminal evidence exists. A guarded successful cache clear
 removes cursor, terminal summaries, undo and cached membership while retaining
 registration, capability, grant, identity and disconnect recovery. Guarded
-removal/purge deletes all T4 rows in its account-local transaction. These future
-extensions do not claim the baseline reset already has these guards. History
+removal/purge deletes all T4 rows in its account-local transaction. These
+guards are part of the v3 store and the existing-only reset path. They were
+not v2 reset behavior. History
 RecoveryRequired offers later explicit retry or guarded cache reset after all
 nonterminal commands are cancelled, settled or abandoned. Reset clears cursor
 and captures a new baseline; failures/budget exhaustion never cause automatic

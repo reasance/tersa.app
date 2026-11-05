@@ -52,16 +52,23 @@ the full candidate binding, method, harness corrections and limits. This is
 sampled evidence, not exhaustive isolation proof; live cache reset was not
 exercised and retains automated coverage as its evidence. The review accepted
 these observations for the table's bounded manual condition.
-Capability upgrade, account-local FTS, drafts/outbox, app lock and T4–T8 remain
-planned; this source delivery does not complete the entire ADR or MVP.
+Account-local FTS, drafts/outbox, app lock and T5–T8 remain planned. T4
+source delivery is recorded below and does not complete the entire ADR or MVP.
 
-## T4 prerequisite status
+## T4 source status
 
 The [execution plan](development/t4-execution-plan.md) and
 [ADR 0027](architecture/adr-0027-gmail-modify-history-and-mailbox-commands.md)
-define the T4 prerequisite contract and source sequence. Source implementation
-and separately authorized live Modify acceptance remain pending. T3 acceptance
-above is unchanged.
+record the implemented triage contract: History sync, the closed command set,
+user labels, durable queue, conditional Undo, and explicit recovery. Source
+slices through pull request 170 are merged on candidate `771bacb` (tree
+`e6caedd`). T4 is not complete. The
+[live protocol](development/t4-live-acceptance-protocol.md) is candidate-bound,
+and the [report](development/t4-live-acceptance-report.md) lists every live
+case as not run. There are no live observations. T3 acceptance above is
+unchanged and is not T4 Modify acceptance. The table's done-when condition,
+offline actions reconciling after reconnect, has not been observed on a real
+mailbox.
 
 ## Initial performance budgets
 

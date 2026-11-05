@@ -59,9 +59,9 @@ unlock, passphrase, or Google credentials.
 | Bidirectional-text, invisible-character, and homoglyph spoofing | Bidi embeddings, overrides, isolates, and marks; zero-width and invisible formatting characters; and Tag-block characters are removed; the message view shows each address next to its display name, and the inbox list shows the address instead of a display name that contains `@` or its fullwidth or small forms | Homoglyphs and confusable scripts remain a residual |
 | Malicious HTML, tracking pixels | HTML converted to text with size and depth limits; no remote resource is ever fetched; links listed and opened only on explicit keypress after showing the URL | Conversion implemented (T2a): linear, capped, no fetch. Opening links is not implemented yet |
 | Malicious attachment or decompression bomb | Fetch on demand, size limits, sanitized filenames, never auto-opened | Planned (T5–T6) |
-| Sync replay or ambiguous triage writes | Record-atomic History prefix/cursor, durable desired state and pre-dispatch evidence, per-item reconciliation, bounded redispatch and lifecycle guards | T4 prerequisite contract below; source implementation pending |
+| Sync replay or ambiguous triage writes | Record-atomic History prefix/cursor, durable desired state and pre-dispatch evidence, per-item reconciliation, bounded redispatch and lifecycle guards | Implemented in source; see the T4 controls below. Live Modify acceptance has not been run |
 | Duplicate send | Client-generated Message-ID and reconciled outbox | Planned (T5), outside T4 |
-| Cross-account access | `(AccountId, MessageId)` routing, per-account database/key/session, application-level 200-row unified query, independent sync workers, fresh scoped views and stale-result rejection | Implemented in source with automated isolation tests. Independent Grok 4.7 review accepted the bounded sampled macOS manual gate for `06a7e0f`; see the [redacted report](../development/t3-live-acceptance-2026-11-04.md). Six samples do not establish exhaustive isolation |
+| Cross-account access | `(AccountId, MessageId)` routing, per-account database/key/session, merged query pages of at most 200 rows (a full page probes 201 source rows), independent sync workers, fresh scoped views and stale-result rejection | Implemented in source with automated isolation tests. Independent Grok 4.7 review accepted the bounded sampled macOS manual gate for `06a7e0f`; see the [redacted report](../development/t3-live-acceptance-2026-11-04.md). Six samples do not establish exhaustive isolation. The 200-row figure is one merged page, and paging continues |
 | Accidental cache reset or unsafe preview | Exact account resolution; existing-only private lock/readonly registry and profile; unreadable peers fail email resolution; completed `yes` line or explicit `--yes`; same lock/installation through transactional clear and bounded sync | Implemented. Missing/unclaimed/unsafe state is not provisioned or repaired. A committed clear can be followed by failed sync and partial new cache; the command fails nonzero and distinguishes that phase |
 | Worker shutdown releases secrets or storage owners prematurely | Restore terminal, signal all workers, cancel owned futures, retain and join native-call owners before releasing installation lock | Implemented. Native calls can delay exit beyond the cooperative grace period; no forced abort. Already-dispatched DNS may finish detached without store state |
 | Composition temp-file exposure | Owner-only directory, removal after editor exit | Plaintext exists on disk while the editor runs; editor swap/backup files are outside tersa's control |
@@ -87,27 +87,29 @@ advisory coordination between cooperating processes, not a defense against
 compromised same-user code replacing paths. An owner-only coordination lock may
 be created and existing SQLite SHM bookkeeping may change during preview.
 
-Capability upgrade, account-local FTS, drafts/outbox, app lock and later roadmap
-milestones remain planned. Source review, automated fixtures and CI alone do
-not establish live acceptance. Independent Grok 4.7 review accepted closure of
+Account-local FTS, drafts/outbox, app lock and T5–T8 remain planned. Capability
+upgrade and the T4 triage controls are implemented in source. Live Modify
+acceptance has not been run. Source review, automated fixtures and CI do not
+establish that live acceptance. Independent Grok 4.7 review accepted closure of
 the bounded sampled two-real-account macOS isolation/offline manual gate for
 `06a7e0f`, as recorded in the [redacted report](../development/t3-live-acceptance-2026-11-04.md).
-This does not establish exhaustive security proof, live cache-reset validation,
-full ADR/MVP completion or release readiness.
+That T3 gate does not establish exhaustive security proof, live cache-reset
+validation, T4 Modify acceptance, full ADR/MVP completion or release readiness.
 
 ## T4 threat controls and residuals
 
-The following is the T4 prerequisite contract; source implementation and live
-acceptance remain pending. Its exact contract/budgets are in
+The following controls are implemented in source. Live acceptance has not been
+run. The contract and budgets are in
 [ADR 0027](../architecture/adr-0027-gmail-modify-history-and-mailbox-commands.md),
-its migration ownership in
+migration ownership in
 [ADR 0017](../architecture/adr-0017-production-account-store.md#t4-account-schema-v3-prerequisite-contract)
-and its sensitive-state inventory in [data flow](data-flow.md#t4-persistence-and-deletion).
-T3 acceptance and the implemented reset limits above remain unchanged.
+and the sensitive-state inventory in [data flow](data-flow.md#t4-persistence-and-deletion).
+T3 acceptance and the reset limits above remain unchanged. The
+[live report](../development/t4-live-acceptance-report.md) has no Modify observations.
 
-| Threat | Planned T4 control | Residual / failure behavior |
+| Threat | T4 control | Residual / failure behavior |
 | --- | --- | --- |
-| Consent confusion, implicit promotion or wrong-account upgrade | Immutable requested capability and selected-account/expected-subject intent; atomic token/capability commit; account permit and generation fences; duplicate Connect cannot overwrite a grant | Absent scope inherits only the bound request/stored capability; explicit insufficient/cross-capability responses provide no usable access. Refresh never promotes ReadOnly. Current readonly APIs remain compatible during staging. |
+| Consent confusion, implicit promotion or wrong-account upgrade | Immutable requested capability and selected-account/expected-subject intent; atomic token/capability commit; account permit and generation fences; duplicate Connect cannot overwrite a grant. Add requests ReadOnly; Modify requires a selected upgrade | Absent scope inherits only the bound request/stored capability; explicit insufficient/cross-capability responses provide no usable access. Refresh never promotes ReadOnly. ReadOnly accounts keep the readonly path. |
 | Stale credential or action after upgrade | Persisted Modify plus current Modify-accepted access/generation required for mutation; invalidate sessions under account permit | Generation is process-local, not a schema column. Restart drops sessions and durable Dispatching is Ambiguous. No SQL transaction/mutex spans HTTP. Broker subject permits/sole custody remain; stale completions fail closed. Same-user code is still inside the custody boundary. |
 | Malformed/oversized History or skipped progress | Canonical 1-32 digit IDs, one complete record/data/cursor transaction, 500 records/page, 4 pages/2,000 records, 1,000 unique IDs/record, local 10,000-reference/page processing budget and 2 MiB JSON cap | Reserve whole-record metadata within 1,000 lookups/cycle. Local truncation returns contiguous whole-record progress and an explicit local indicator, never a provider token/response-head checkpoint. Invalid envelopes fail before application; over-limit/undecidable record stays unapplied. No-progress RecoveryRequired permits explicit retry or guarded reset after pending resolution/abandon; never automatic non-404 fallback. |
 | Expired History erases intent or misses concurrent changes | Capture baseline before bounded snapshot; metadata/baseline commit together; keep pending evidence and independently reconcile it | Only absent cursor/History-cursor 404 takes fallback. Truncated keep-100 is valid recent-cache coverage; snapshot absence never settles commands. Optional 25 bodies follow commit and may fail separately. |
@@ -117,7 +119,7 @@ T3 acceptance and the implemented reset limits above remain unchanged.
 | Recovery has no legal exit or abandonment falsely claims success | Complete/fully resolved Partial (including TargetMissing, even with zero successes) are terminal; only Complete message-state qualifies for undo. Ambiguous/NeedsAttention allow fresh-reconciliation Retry or explicit Abandon | Retry authorizes at most one guarded dispatch without resetting automatic budgets; satisfied state settles without mutation and failed reconciliation stays NeedsAttention. Abandon warns Gmail may already have applied the operation and automatic recovery stops; retain terminal Abandoned before releasing FIFO/pins/quota/reset/remove guards. No retry/requeue of abandoned IDs; no success/rollback claim. |
 | Scope permits unintended API operations | Separate Modify component, closed endpoint/payload and desired-field maps; readonly negative guards; no arbitrary system-label/path mutation | Provider scope is broader than the product surface. No classification labels, permanent message delete, mute, compose/send/draft/watch or dedicated trash/untrash route is exposed. |
 | Undo overwrites another device's changes, falsely claims offline eligibility or blocks itself | Last Complete message-state command only; admission refuses pre-existing nonterminal commands. Offline admission persists conditional compensation/expected post-state without mutation/eligibility claim. The admitted undo is Queued; do not reapply the admission gate to itself or later queued work at dispatch; FIFO prevents overtaking/self-deadlock | After reconnect and before any dispatch, fresh reconciliation validates the entire target set/required User labels and touched expected-post-state fields. Any mismatch refuses all compensation without writes; a pass restores touched pre-state only. Provider changes after comparison remain a no-CAS residual. No label-CRUD/Partial/Ambiguous undo, provider rollback or cross-account atomicity. |
-| Reset, removal, identity change or pruning destroys recovery | Every nonterminal command, including Queued, blocks reset/remove; cancel Queued, settle or explicitly abandon first; guard release requires terminal summary commit. Identity replacement refuses destructive change; pin pending/undo targets | Guarded reset clears cursor/terminal/undo/membership but preserves capability/grant/identity/recovery. Removal/purge deletes T4 rows only after guard. Abandon is explicit retained disposition, not silent cleanup. These protections are future T4 work, not current reset behavior. |
+| Reset, removal, identity change or pruning destroys recovery | Every nonterminal command, including Queued, blocks reset/remove; cancel Queued, settle or explicitly abandon first; guard release requires terminal summary commit. Identity replacement refuses destructive change; pin pending/undo targets | Guarded reset clears cursor/terminal/undo/membership but preserves capability/grant/identity/recovery. Removal/purge deletes T4 rows only after guard. Abandon is explicit retained disposition, not silent cleanup. These guards are the current reset and removal behavior. |
 | Format rollback destroys the only readable state | Owned v1/v2-to-v3 writer transaction with complete canonical set; readonly v1/v2/v3 do not migrate; registry v1/identity algorithm 2 unchanged | Old binaries reject v3. No implicit downgrade/reset/quarantine or plaintext backup. Existing SQLCipher path/sidecar/identity residuals remain. |
 
 Provider labels, local-read presentation and pending desired state stay distinct;
@@ -141,9 +143,12 @@ owner-only/no-follow checks. No plaintext sidecar, content/identity diagnostic,
 backup/export surface or app-lock behavior is introduced. External backups can
 retain sensitive encrypted records; logical deletion promises no secure erase
 or removal from backups. Source rollback cannot undo committed provider writes.
-Deterministic fixtures/CI prove bounded contracts, not live provider success;
-candidate-bound authorized macOS acceptance remains separate from Linux
-consent, release or exhaustive isolation proof.
+Deterministic fixtures and CI prove bounded contracts. They are not live
+provider success. CLI and TUI wiring is a separate source record. Candidate-bound
+macOS acceptance is specified in the
+[live protocol](../development/t4-live-acceptance-protocol.md) and has not been
+run. It would remain separate from Linux consent, release or exhaustive
+isolation proof.
 
 ## Explicit exclusions
 
