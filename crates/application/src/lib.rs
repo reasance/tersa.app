@@ -13,6 +13,8 @@ pub mod lifecycle;
 /// Shared inward mailbox ports and pagination contracts.
 pub mod mailbox;
 pub mod oauth;
+/// Shared bounded scope evidence and capability acceptance policy.
+pub mod scope;
 /// Bounded recent-snapshot mailbox synchronization and cache orchestration.
 pub mod sync;
 /// Portable token exchange and refresh lifecycle over a transport port.

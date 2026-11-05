@@ -16,24 +16,16 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
+use tersa_domain::account::AccountCapability;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::scope::{ScopeEvidence, requested_scope};
+
 // Rust guideline compliant 1.0.
 
-/// The Gmail scope requested by the flow, granting read-only access.
-pub const GMAIL_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
-
-/// The `OpenID` Connect scope requested alongside the Gmail scope.
-///
-/// Requested solely to obtain the immutable OIDC `sub` for the account-identity
-/// gate — never to display an address. `openid` does not touch the read-only
-/// posture, which is governed by the Gmail scope. See ADR-0023 Identity source.
-pub const OPENID_SCOPE: &str = "openid";
-
-/// The full space-separated scope string sent in the authorization request:
-/// `openid` (for the identity-gate `sub`) plus Gmail read-only.
-pub const REQUESTED_SCOPE: &str = "openid https://www.googleapis.com/auth/gmail.readonly";
+#[doc(inline)]
+pub use crate::scope::{GMAIL_READONLY_SCOPE, OPENID_SCOPE, REQUESTED_SCOPE};
 
 const GOOGLE_AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const SECRET_BYTES: usize = 32;
@@ -104,10 +96,11 @@ pub struct AuthorizationConfig {
     client_id: String,
     redirect_uri: Url,
     lifetime: Duration,
+    requested_capability: AccountCapability,
 }
 
 impl AuthorizationConfig {
-    /// Creates a validated authorization configuration.
+    /// Creates a validated readonly compatibility authorization configuration.
     ///
     /// # Errors
     ///
@@ -118,6 +111,26 @@ impl AuthorizationConfig {
         client_id: T,
         redirect_uri: Url,
         lifetime: Duration,
+    ) -> Result<Self, OAuthError> {
+        Self::for_capability(
+            client_id,
+            redirect_uri,
+            lifetime,
+            AccountCapability::ReadOnly,
+        )
+    }
+
+    /// Creates an authorization attempt with an explicitly selected immutable capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OAuthError::InvalidConfiguration`] under the same conditions as
+    /// [`Self::new`]. No existing grant is changed by constructing this value.
+    pub fn for_capability<T: Into<String>>(
+        client_id: T,
+        redirect_uri: Url,
+        lifetime: Duration,
+        requested_capability: AccountCapability,
     ) -> Result<Self, OAuthError> {
         let client_id = client_id.into();
         let has_credentials =
@@ -135,6 +148,7 @@ impl AuthorizationConfig {
             client_id,
             redirect_uri,
             lifetime,
+            requested_capability,
         })
     }
 
@@ -142,6 +156,12 @@ impl AuthorizationConfig {
     #[must_use]
     pub fn redirect_uri(&self) -> &Url {
         &self.redirect_uri
+    }
+
+    /// Returns the capability this configuration will bind at begin.
+    #[must_use]
+    pub fn requested_capability(&self) -> AccountCapability {
+        self.requested_capability
     }
 }
 
@@ -162,6 +182,11 @@ impl<C> fmt::Debug for PreparedAuthorization<C> {
 }
 
 impl<C> PreparedAuthorization<C> {
+    /// Returns the capability immutably bound to the prepared session.
+    #[must_use]
+    pub fn requested_capability(&self) -> AccountCapability {
+        self.session.requested_capability
+    }
     /// Returns the authorization URL intended for the system browser.
     #[must_use]
     pub fn authorization_url(&self) -> &Url {
@@ -183,6 +208,7 @@ pub struct AuthorizationSession<C> {
     state: Zeroizing<Vec<u8>>,
     verifier: Zeroizing<String>,
     consumed: bool,
+    requested_capability: AccountCapability,
 }
 
 impl<C> fmt::Debug for AuthorizationSession<C> {
@@ -195,11 +221,17 @@ impl<C> fmt::Debug for AuthorizationSession<C> {
             .field("state", &"[REDACTED]")
             .field("verifier", &"[REDACTED]")
             .field("consumed", &self.consumed)
+            .field("requested_capability", &self.requested_capability)
             .finish()
     }
 }
 
 impl<C: MonotonicClock> AuthorizationSession<C> {
+    /// Returns the capability bound at begin, with no setter or finish override.
+    #[must_use]
+    pub fn requested_capability(&self) -> AccountCapability {
+        self.requested_capability
+    }
     /// Returns the exact registered redirect URI.
     #[must_use]
     pub fn redirect_uri(&self) -> &Url {
@@ -283,16 +315,18 @@ impl<C: MonotonicClock> AuthorizationSession<C> {
             (None, None) => Err(OAuthError::MissingParameter("code")),
             (Some(code), None) if code.is_empty() => Err(OAuthError::MissingParameter("code")),
             (Some(code), None) => {
-                if parameters.get("scope").is_some_and(|scope| {
-                    !scope
-                        .split_ascii_whitespace()
-                        .any(|granted| granted == GMAIL_READONLY_SCOPE)
-                }) {
-                    return Err(OAuthError::InsufficientScope);
-                }
+                let scope_evidence = ScopeEvidence::from_scope_field(
+                    parameters.get("scope").map(|scope| scope.as_str()),
+                )
+                .map_err(|_error| OAuthError::InvalidScopeEvidence)?;
+                scope_evidence
+                    .validate_for(self.requested_capability)
+                    .map_err(|_reason| OAuthError::InsufficientScope)?;
                 Ok(AuthorizationGrant {
                     code: code.clone(),
                     verifier: Zeroizing::new(std::mem::take(&mut *self.verifier)),
+                    requested_capability: self.requested_capability,
+                    scope_evidence,
                 })
             }
         }
@@ -314,9 +348,22 @@ impl<C: MonotonicClock> AuthorizationSession<C> {
 pub struct AuthorizationGrant {
     code: Zeroizing<String>,
     verifier: Zeroizing<String>,
+    requested_capability: AccountCapability,
+    scope_evidence: ScopeEvidence,
 }
 
 impl AuthorizationGrant {
+    /// Returns the capability bound at begin and validated at the callback.
+    #[must_use]
+    pub fn requested_capability(&self) -> AccountCapability {
+        self.requested_capability
+    }
+
+    /// Returns callback scope provenance without any raw scope text.
+    #[must_use]
+    pub fn scope_evidence(&self) -> ScopeEvidence {
+        self.scope_evidence
+    }
     /// Returns the authorization code without transferring ownership.
     #[must_use]
     pub fn code(&self) -> &str {
@@ -334,6 +381,8 @@ impl fmt::Debug for AuthorizationGrant {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AuthorizationGrant")
+            .field("requested_capability", &self.requested_capability)
+            .field("scope_evidence", &self.scope_evidence)
             .field("code", &"[REDACTED]")
             .field("verifier", &"[REDACTED]")
             .finish()
@@ -356,8 +405,10 @@ pub enum OAuthError {
     ConflictingCallback,
     /// The provider returned an OAuth error.
     ProviderRejected,
-    /// The provider granted a scope set that omits Gmail read access.
+    /// The explicit scopes do not satisfy the bound requested capability.
     InsufficientScope,
+    /// The callback scope field exceeds the defensive parser bounds.
+    InvalidScopeEvidence,
     /// The callback redirect does not exactly match the configured redirect.
     RedirectMismatch,
     /// The returned state does not match the pending session.
@@ -379,7 +430,8 @@ impl fmt::Display for OAuthError {
             Self::DuplicateParameter => "the OAuth callback contains duplicate parameters",
             Self::ConflictingCallback => "the OAuth callback contains conflicting outcomes",
             Self::ProviderRejected => "the OAuth provider rejected the request",
-            Self::InsufficientScope => "the OAuth grant omitted Gmail read access",
+            Self::InsufficientScope => "the OAuth grant does not match the requested capability",
+            Self::InvalidScopeEvidence => "the OAuth scope field exceeds its bounds",
             Self::RedirectMismatch => "the OAuth redirect does not match",
             Self::StateMismatch => "the OAuth state does not match",
             Self::Expired => "the OAuth request expired",
@@ -432,7 +484,7 @@ fn prepare_with_secrets<C: MonotonicClock>(
         .append_pair("response_type", "code")
         .append_pair("client_id", &config.client_id)
         .append_pair("redirect_uri", config.redirect_uri.as_str())
-        .append_pair("scope", REQUESTED_SCOPE)
+        .append_pair("scope", requested_scope(config.requested_capability))
         .append_pair("state", &state)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
@@ -452,6 +504,7 @@ fn prepare_with_secrets<C: MonotonicClock>(
             state: Zeroizing::new(state.as_bytes().to_vec()),
             verifier,
             consumed: false,
+            requested_capability: config.requested_capability,
         },
     })
 }
@@ -644,32 +697,74 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_explicit_callback_scope_without_gmail_read_access() {
-        let prepared = make_prepared(31);
-        let mut callback = make_callback(prepared.authorization_url(), "under-scoped-code");
-        callback
-            .query_pairs_mut()
-            .append_pair("scope", OPENID_SCOPE);
-        let (_, mut session) = prepared.into_parts();
-        assert!(matches!(
-            session.finish(&callback),
-            Err(OAuthError::InsufficientScope)
-        ));
-        assert!(matches!(
-            session.finish(&callback),
-            Err(OAuthError::AlreadyConsumed)
-        ));
-
-        let prepared = make_prepared(32);
-        let mut callback = make_callback(prepared.authorization_url(), "fully-scoped-code");
-        callback
-            .query_pairs_mut()
-            .append_pair("scope", REQUESTED_SCOPE);
-        let (_, mut session) = prepared.into_parts();
-        assert_eq!(
-            session.finish(&callback).unwrap().code(),
-            "fully-scoped-code"
-        );
+    fn callback_scope_policy_is_bound_to_the_prepared_capability() {
+        // Contract: exact request scopes, absence vs explicit empty, both mismatch
+        // directions and forbidden grants. Regression: mutable capability or a
+        // readonly boolean admits a broadened/under-scoped callback.
+        use crate::scope::{
+            FULL_MAIL_SCOPE, GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE, MODIFY_REQUESTED_SCOPE,
+            ScopeEvidence,
+        };
+        use tersa_domain::account::AccountCapability::{Modify, ReadOnly};
+        let both = format!("{GMAIL_READONLY_SCOPE} {GMAIL_MODIFY_SCOPE}");
+        let send = format!("{GMAIL_READONLY_SCOPE} {GMAIL_SEND_SCOPE}");
+        let full = format!("{GMAIL_MODIFY_SCOPE} {FULL_MAIL_SCOPE}");
+        for (capability, returned, accepted) in [
+            (ReadOnly, None, true),
+            (Modify, None, true),
+            (ReadOnly, Some(REQUESTED_SCOPE), true),
+            (Modify, Some(MODIFY_REQUESTED_SCOPE), true),
+            (Modify, Some(both.as_str()), true),
+            (ReadOnly, Some(""), false),
+            (Modify, Some(""), false),
+            (ReadOnly, Some(OPENID_SCOPE), false),
+            (Modify, Some(GMAIL_READONLY_SCOPE), false),
+            (ReadOnly, Some(GMAIL_MODIFY_SCOPE), false),
+            (ReadOnly, Some(both.as_str()), false),
+            (ReadOnly, Some(send.as_str()), false),
+            (Modify, Some(full.as_str()), false),
+        ] {
+            let config = AuthorizationConfig::for_capability(
+                "public-test-client",
+                Url::parse("app.tersa.oauth.test:/oauth/callback").unwrap(),
+                Duration::from_secs(60),
+                capability,
+            )
+            .unwrap();
+            let prepared =
+                prepare_with_secrets(config, TestClock::default(), &[31; 32], &[32; 32]).unwrap();
+            let request: BTreeMap<_, _> = prepared.authorization_url().query_pairs().collect();
+            assert_eq!(
+                request.get("scope").unwrap(),
+                match capability {
+                    ReadOnly => REQUESTED_SCOPE,
+                    Modify => MODIFY_REQUESTED_SCOPE,
+                }
+            );
+            assert_eq!(prepared.requested_capability(), capability);
+            let mut callback = make_callback(prepared.authorization_url(), "capability-code");
+            if let Some(scope) = returned {
+                callback.query_pairs_mut().append_pair("scope", scope);
+            }
+            let (_, mut session) = prepared.into_parts();
+            assert_eq!(session.requested_capability(), capability);
+            let result = session.finish(&callback);
+            if accepted {
+                let grant = result.unwrap();
+                assert_eq!(grant.requested_capability(), capability);
+                assert_eq!(
+                    matches!(grant.scope_evidence(), ScopeEvidence::Absent),
+                    returned.is_none()
+                );
+                assert_eq!(grant.code(), "capability-code");
+            } else {
+                assert!(matches!(result, Err(OAuthError::InsufficientScope)));
+            }
+            assert!(matches!(
+                session.finish(&callback),
+                Err(OAuthError::AlreadyConsumed)
+            ));
+        }
     }
 
     #[test]
