@@ -39,6 +39,8 @@ use tersa_domain::mailbox::{
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+use self::json_object::Object;
+
 const BASE_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 const JSON_LIMIT: usize = 2 * 1024 * 1024;
 const RAW_ENCODED_LIMIT: usize = MessageContent::MAX_LEN.div_ceil(3) * 4;
@@ -113,7 +115,8 @@ impl GmailMailbox {
     /// [`RemoteMailboxError::InvalidResponse`] for a missing or invalid
     /// profile address.
     pub async fn email_address(&self) -> Result<AccountEmail, RemoteMailboxError> {
-        let profile: GmailProfile = self.request_json(profile_request()?, JSON_LIMIT).await?;
+        let Object(profile): GmailProfile =
+            self.request_json(profile_request()?, JSON_LIMIT).await?;
         AccountEmail::new(profile.email_address)
             .map_err(|_error| RemoteMailboxError::InvalidResponse)
     }
@@ -196,7 +199,7 @@ impl RemoteMailbox for GmailMailbox {
     ) -> BoxFuture<'a, Result<Page<MessageEnvelope>, RemoteMailboxError>> {
         Box::pin(async move {
             self.checked_account(account)?;
-            let list: GmailList = self
+            let Object(list): GmailList = self
                 .request_json(list_request(size, page_token)?, JSON_LIMIT)
                 .await?;
             if list.messages.len() > usize::from(size.get()) {
@@ -208,7 +211,7 @@ impl RemoteMailbox for GmailMailbox {
                 .transpose()
                 .map_err(|_error| RemoteMailboxError::InvalidResponse)?;
             let mut envelopes = Vec::with_capacity(list.messages.len());
-            for listed in list.messages {
+            for Object(listed) in list.messages {
                 let id = MessageId::new(listed.id)
                     .map_err(|_error| RemoteMailboxError::InvalidResponse)?;
                 let listed_thread = ThreadId::new(listed.thread_id)
@@ -246,7 +249,7 @@ impl RemoteMailbox for GmailMailbox {
                 )
                 .await?;
             let content = {
-                let raw: GmailRaw<'_> = serde_json::from_slice(&body)
+                let Object(raw): GmailRaw<'_> = serde_json::from_slice(&body)
                     .map_err(|_error| RemoteMailboxError::InvalidResponse)?;
                 if raw.id != message_id.as_str() || raw.thread_id != envelope.thread_id().as_str() {
                     return Err(RemoteMailboxError::InvalidResponse);
@@ -506,24 +509,27 @@ fn profile_request() -> Result<Request, RemoteMailboxError> {
     )
 }
 
+type GmailList = Object<GmailListFields>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GmailList {
+struct GmailListFields {
     #[serde(default)]
     messages: Vec<ListedMessage>,
     next_page_token: Option<String>,
 }
 
+type ListedMessage = Object<ListedMessageFields>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ListedMessage {
+struct ListedMessageFields {
     id: String,
     thread_id: String,
 }
 
+type GmailMetadata = Object<GmailMetadataFields>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GmailMetadata {
+struct GmailMetadataFields {
     id: String,
     thread_id: String,
     internal_date: String,
@@ -537,30 +543,34 @@ struct GmailMetadata {
 
 /// Borrows the base64 text from the response body: it has no JSON escapes,
 /// so the largest field is never copied before it is decoded.
+type GmailRaw<'a> = Object<GmailRawFields<'a>>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GmailRaw<'a> {
+struct GmailRawFields<'a> {
     id: String,
     thread_id: String,
     #[serde(borrow)]
     raw: Cow<'a, str>,
 }
 
+type Payload = Object<PayloadFields>;
 #[derive(Default, Deserialize)]
-struct Payload {
+struct PayloadFields {
     #[serde(default)]
     headers: Vec<Header>,
 }
 
+type Header = Object<HeaderFields>;
 #[derive(Deserialize)]
-struct Header {
+struct HeaderFields {
     name: String,
     value: String,
 }
 
+type GmailProfile = Object<GmailProfileFields>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GmailProfile {
+struct GmailProfileFields {
     email_address: String,
 }
 
@@ -568,6 +578,7 @@ fn envelope_from(
     message: GmailMetadata,
     expected_id: &MessageId,
 ) -> Result<MessageEnvelope, RemoteMailboxError> {
+    let Object(message) = message;
     if message.id != expected_id.as_str() {
         return Err(RemoteMailboxError::InvalidResponse);
     }
@@ -580,7 +591,7 @@ fn envelope_from(
         .and_then(|value| {
             UnixTimestampMillis::new(value).map_err(|_error| RemoteMailboxError::InvalidResponse)
         })?;
-    let (from, subject) = headers(message.payload.headers)?;
+    let (from, subject) = headers(message.payload.0.headers)?;
     Ok(MessageEnvelope::new(
         expected_id.clone(),
         thread,
@@ -595,7 +606,7 @@ fn envelope_from(
 fn headers(headers: Vec<Header>) -> Result<(String, String), RemoteMailboxError> {
     let mut from = None;
     let mut subject = None;
-    for header in headers {
+    for Object(header) in headers {
         if header.name.eq_ignore_ascii_case("from") {
             if from.replace(header.value).is_some() {
                 return Err(RemoteMailboxError::InvalidResponse);
@@ -665,23 +676,24 @@ fn map_forbidden(bytes: &[u8]) -> RemoteMailboxError {
 fn error_reasons(bytes: &[u8]) -> Vec<String> {
     #[derive(Deserialize)]
     struct ErrorBody {
-        error: ErrorDetail,
+        error: Object<ErrorDetail>,
     }
     #[derive(Deserialize)]
     struct ErrorDetail {
         #[serde(default)]
-        errors: Vec<ErrorReason>,
+        errors: Vec<Object<ErrorReason>>,
     }
     #[derive(Deserialize)]
     struct ErrorReason {
         reason: String,
     }
-    serde_json::from_slice::<ErrorBody>(bytes)
-        .map(|body| {
+    serde_json::from_slice::<Object<ErrorBody>>(bytes)
+        .map(|Object(body)| {
             body.error
+                .0
                 .errors
                 .into_iter()
-                .map(|error| error.reason)
+                .map(|Object(error)| error.reason)
                 .collect()
         })
         .unwrap_or_default()
@@ -921,7 +933,7 @@ fn parse_token_response(
         #[serde(default, deserialize_with = "deserialize_optional_zeroizing")]
         id_token: Option<Zeroizing<String>>,
     }
-    let parsed = serde_json::from_slice::<TokenResponseBody>(bytes)
+    let Object(parsed) = serde_json::from_slice::<Object<TokenResponseBody>>(bytes)
         .map_err(|_error| TokenTransportError::MalformedResponse)?;
     let evidence =
         ScopeEvidence::from_scope_field(parsed.scope.as_ref().map(|value| value.as_str()))
@@ -995,7 +1007,7 @@ fn parse_id_token_claims(id_token: &str) -> Result<IdTokenClaims, TokenTransport
     decode_b64url_segment(header)?;
     decode_b64url_segment(signature)?;
     let payload_bytes = decode_b64url_segment(payload)?;
-    let payload = serde_json::from_slice::<IdTokenPayload>(&payload_bytes)
+    let Object(payload) = serde_json::from_slice::<Object<IdTokenPayload>>(&payload_bytes)
         .map_err(|_error| TokenTransportError::MalformedResponse)?;
     let audiences = match payload.aud {
         Audience::One(audience) => vec![audience],
@@ -1033,8 +1045,8 @@ fn map_error_response(bytes: &[u8]) -> TokenTransportError {
     struct TokenErrorBody {
         error: String,
     }
-    match serde_json::from_slice::<TokenErrorBody>(bytes) {
-        Ok(body) if body.error == "invalid_grant" => TokenTransportError::InvalidGrant,
+    match serde_json::from_slice::<Object<TokenErrorBody>>(bytes) {
+        Ok(Object(body)) if body.error == "invalid_grant" => TokenTransportError::InvalidGrant,
         Ok(_body) => TokenTransportError::ProviderRejected,
         Err(_error) => TokenTransportError::MalformedResponse,
     }
@@ -1055,9 +1067,9 @@ fn map_revoke_error_response(bytes: &[u8]) -> TokenTransportError {
     struct RevokeErrorBody {
         error: String,
     }
-    match serde_json::from_slice::<RevokeErrorBody>(bytes) {
-        Ok(body) if body.error == "invalid_token" => TokenTransportError::InvalidToken,
-        Ok(body) if body.error == "invalid_grant" => TokenTransportError::InvalidGrant,
+    match serde_json::from_slice::<Object<RevokeErrorBody>>(bytes) {
+        Ok(Object(body)) if body.error == "invalid_token" => TokenTransportError::InvalidToken,
+        Ok(Object(body)) if body.error == "invalid_grant" => TokenTransportError::InvalidGrant,
         Ok(_body) => TokenTransportError::ProviderRejected,
         Err(_error) => TokenTransportError::MalformedResponse,
     }
@@ -1067,6 +1079,7 @@ fn map_revoke_error_response(bytes: &[u8]) -> TokenTransportError {
 
 #[cfg(test)]
 mod tests {
+    mod object_shape_tests;
     mod t4_tests;
 
     use std::collections::VecDeque;

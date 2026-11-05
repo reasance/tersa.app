@@ -2,13 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Requires real JSON objects at label, Modify rejection and ACK boundaries.
+//! Requires real JSON objects at provider resource and error boundaries.
 
 use serde::Deserialize;
 use std::fmt;
 
 // Force actual JSON objects at each resource boundary. Derive alone also
-// accepts positional sequences for structs, which cannot prove provider rejection.
+// accepts positional sequences for structs, which cannot prove provider facts.
+#[derive(Default)]
 pub(super) struct Object<T>(pub(super) T);
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
