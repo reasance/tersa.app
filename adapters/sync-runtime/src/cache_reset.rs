@@ -54,10 +54,10 @@ impl fmt::Debug for CacheResetOutcome {
     }
 }
 
-// The sole test seam is the sync delegate. Production always supplies the
-// unchanged sync_account; real installation/open/clear/drop work is shared.
+// The sync delegate runs under the already-held account permit. Production
+// uses sync_under_permit; real installation/open/clear/drop work is shared.
 pub(crate) async fn reset_cache_using<'a, F, Fut>(
-    runtime: &'a mut Runtime,
+    runtime: &'a Runtime,
     account: &'a AccountId,
     sync: F,
 ) -> Result<CacheResetOutcome, CacheResetPreconditionError>
@@ -65,7 +65,13 @@ where
     F: FnOnce(&'a Runtime, &'a AccountId) -> Fut,
     Fut: Future<Output = Result<SyncReport, FlowError>>,
 {
+    let operation = runtime
+        .operations
+        .get(account)
+        .map_err(|_error| CacheResetPreconditionError::Installation)?;
+    let _permit = operation.permit.lock().await;
     runtime.installation().clear_cache_for_reset(account)?;
+    runtime.invalidate_known(account, &operation);
     Ok(match sync(runtime, account).await {
         Ok(report) => CacheResetOutcome::Resynced(report),
         Err(error) => CacheResetOutcome::ResyncFailed(error),
@@ -557,7 +563,7 @@ mod tests {
         let read_log = Arc::clone(&reads);
         let body_log = Arc::clone(&bodies);
         let outcome = drive(reset_cache_using(
-            &mut runtime,
+            &runtime,
             &a,
             |runtime, account| async move {
                 assert!(Arc::ptr_eq(&preview, runtime.installation()));
@@ -638,7 +644,7 @@ mod tests {
         let path = preview.cache_path_for_test(&a);
         fs::remove_file(&path).expect("simulate lost store after preview");
         let before = files(path.parent().expect("account directory"));
-        let mut runtime = Runtime::new(
+        let runtime = Runtime::new(
             preview,
             OAuthClient {
                 client_id: "test-client".to_owned(),
@@ -647,7 +653,7 @@ mod tests {
         )
         .expect("runtime");
         assert!(
-            drive(reset_cache_using(&mut runtime, &a, |_, _| async {
+            drive(reset_cache_using(&runtime, &a, |_, _| async {
                 panic!("a failed existing-only clear must not reach normal sync");
             }))
             .is_err()
@@ -664,7 +670,7 @@ mod tests {
 
     #[test]
     fn commits_and_closes_before_real_gated_bounded_sync_for_the_same_account() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let [a, b] = fixture.accounts.clone();
         let installation = Arc::clone(fixture.runtime.installation());
         let before_a = snapshot(&installation, &a);
@@ -676,7 +682,7 @@ mod tests {
         let body_log = Arc::clone(&bodies);
         let expected = a.clone();
         let outcome = drive(reset_cache_using(
-            &mut fixture.runtime,
+            &fixture.runtime,
             &a,
             |runtime, account| async move {
                 assert_eq!(account, &expected);
@@ -748,13 +754,13 @@ mod tests {
 
     #[test]
     fn post_commit_sync_failure_is_not_a_preclear_error_and_does_not_restore_mail() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let [a, b] = fixture.accounts.clone();
         let installation = Arc::clone(fixture.runtime.installation());
         let protected = snapshot(&installation, &a).protected;
         let before_b = snapshot(&installation, &b);
         let registry = installation.accounts().expect("registry");
-        let outcome = drive(reset_cache_using(&mut fixture.runtime, &a, |_, _| async {
+        let outcome = drive(reset_cache_using(&fixture.runtime, &a, |_, _| async {
             Err(FlowError::Token(BrokerError::Transport))
         }))
         .expect("clear committed");
@@ -769,13 +775,13 @@ mod tests {
 
     #[test]
     fn normal_revoked_token_behavior_is_not_undone_or_mislabeled_as_preclear_failure() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let a = fixture.accounts[0].clone();
         let installation = Arc::clone(fixture.runtime.installation());
         let before = snapshot(&installation, &a);
         let expected = a.clone();
         let outcome = drive(reset_cache_using(
-            &mut fixture.runtime,
+            &fixture.runtime,
             &a,
             |runtime, account| async move {
                 assert_eq!(account, &expected);
@@ -802,7 +808,7 @@ mod tests {
     #[test]
     fn known_metadata_preconditions_reject_without_sync_or_cache_deletion() {
         for condition in 0..5 {
-            let mut fixture = Fixture::new();
+            let fixture = Fixture::new();
             let a = fixture.accounts[0].clone();
             let installation = Arc::clone(fixture.runtime.installation());
             // Construct missing/mismatched initial bindings without rewriting an immutable subject.
@@ -824,7 +830,7 @@ mod tests {
             drop(store);
             let before = snapshot(&installation, &a);
             let called = Cell::new(false);
-            let result = drive(reset_cache_using(&mut fixture.runtime, &a, |_, _| {
+            let result = drive(reset_cache_using(&fixture.runtime, &a, |_, _| {
                 called.set(true);
                 async {
                     panic!("sync must not run");
@@ -863,7 +869,7 @@ mod tests {
     #[test]
     fn absent_unclaimed_and_corrupt_stores_are_never_created_claimed_or_repaired() {
         for condition in 0..4 {
-            let mut fixture = Fixture::new();
+            let fixture = Fixture::new();
             let a = fixture.accounts[0].clone();
             let installation = Arc::clone(fixture.runtime.installation());
             let path = installation.cache_path_for_test(&a);
@@ -890,7 +896,7 @@ mod tests {
             let before = directory.exists().then(|| files(&directory));
             let called = Cell::new(false);
             assert!(
-                drive(reset_cache_using(&mut fixture.runtime, &a, |_, _| {
+                drive(reset_cache_using(&fixture.runtime, &a, |_, _| {
                     called.set(true);
                     async {
                         panic!("sync must not run");
@@ -910,7 +916,7 @@ mod tests {
     #[test]
     fn invalid_account_directory_is_refused_without_permission_repair_or_cross_account_fallback() {
         for use_symlink in [false, true] {
-            let mut fixture = Fixture::new();
+            let fixture = Fixture::new();
             let [a, b] = fixture.accounts.clone();
             let installation = Arc::clone(fixture.runtime.installation());
             let b_before = snapshot(&installation, &b);
@@ -931,7 +937,7 @@ mod tests {
                     .expect("insecure mode");
             }
             assert!(matches!(
-                drive(reset_cache_using(&mut fixture.runtime, &a, |_, _| async {
+                drive(reset_cache_using(&fixture.runtime, &a, |_, _| async {
                     panic!("sync must not run");
                 })),
                 Err(CacheResetPreconditionError::Installation)
@@ -964,13 +970,13 @@ mod tests {
                 self.0.store(true, Ordering::SeqCst);
             }
         }
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let [a, b] = fixture.accounts.clone();
         let installation = Arc::clone(fixture.runtime.installation());
         let before = snapshot(&installation, &a);
         let before_b = snapshot(&installation, &b);
         let called = Cell::new(false);
-        let future = reset_cache_using(&mut fixture.runtime, &a, |_, _| {
+        let future = reset_cache_using(&fixture.runtime, &a, |_, _| {
             called.set(true);
             async {
                 panic!("unpolled");
@@ -981,14 +987,10 @@ mod tests {
         assert_eq!(snapshot(&installation, &a), before);
         let dropped = Arc::new(AtomicBool::new(false));
         let probe = Arc::clone(&dropped);
-        let mut future = Box::pin(reset_cache_using(
-            &mut fixture.runtime,
-            &a,
-            |_, _| async move {
-                let _guard = Dropped(probe);
-                std::future::pending().await
-            },
-        ));
+        let mut future = Box::pin(reset_cache_using(&fixture.runtime, &a, |_, _| async move {
+            let _guard = Dropped(probe);
+            std::future::pending().await
+        }));
         assert!(
             future
                 .as_mut()
@@ -1028,7 +1030,7 @@ mod tests {
 
     #[test]
     fn wrong_account_key_is_refused_without_sync_or_ciphertext_changes() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let a = fixture.accounts[0].clone();
         let installation = Arc::clone(fixture.runtime.installation());
         let store = replace_fixture_store(&installation, &a, true);
@@ -1038,7 +1040,7 @@ mod tests {
         let before = files(directory);
         let called = Cell::new(false);
         assert!(matches!(
-            drive(reset_cache_using(&mut fixture.runtime, &a, |_, _| {
+            drive(reset_cache_using(&fixture.runtime, &a, |_, _| {
                 called.set(true);
                 async {
                     panic!("no sync");
@@ -1062,12 +1064,12 @@ mod tests {
 
     #[test]
     fn failed_bounded_body_sync_can_leave_new_headers_but_never_restore_old_mail() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let a = fixture.accounts[0].clone();
         let installation = Arc::clone(fixture.runtime.installation());
         let protected = snapshot(&installation, &a).protected;
         let outcome = drive(reset_cache_using(
-            &mut fixture.runtime,
+            &fixture.runtime,
             &a,
             |runtime, account| async move {
                 let store = runtime
