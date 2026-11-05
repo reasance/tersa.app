@@ -791,7 +791,7 @@ mod p5b {
     // New cached/profile reads strengthen the constructor-only legacy path boundary.
     #[test]
     fn new_readonly_entrypoints_reject_replaced_main_or_missing_sidecar_without_repair() {
-        for operation in 0..4 {
+        for operation in 0..6 {
             for fault in 0..3 {
                 let (database, store) = setup("p5b-reader-path");
                 store
@@ -820,7 +820,9 @@ mod p5b {
                     0 => reader.cached_provider_state(&message_key("m1")).is_err(),
                     1 => reader.cached_label_catalog(&account()).is_err(),
                     2 => run(reader.read_metadata(&account())).is_err(),
-                    _ => run(reader.read_upgrade_binding(&account())).is_err(),
+                    3 => run(reader.read_upgrade_binding(&account())).is_err(),
+                    4 => reader.list_filtered_envelopes_after(&account(), &crate::CachedMailboxFilter::Recent, None, StoreLimit::new(1).unwrap()).is_err(),
+                    _ => reader.pending_commands(&bound()).is_err(),
                 };
                 assert!(failed, "operation {operation} fault {fault}");
                 assert_eq!(fs::read(database.path()).unwrap(), main);

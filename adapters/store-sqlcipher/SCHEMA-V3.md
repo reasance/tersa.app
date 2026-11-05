@@ -352,3 +352,48 @@ Abandon commit failure. No owner receipt is fabricated to claim persistence.
 P6 orchestration, P7 runtime composition, independent approval, full-host checks,
 provider freshness/provenance, process-local generation fencing and live account
 acceptance remain separate responsibilities and claims.
+
+
+## P7b cached triage read prerequisites
+
+`CachedMailboxFilter` is closed to Recent, Inbox, Trash, Spam and an account-bound
+User-label ID. `list_filtered_envelopes_after` is available on both the store and
+readonly reader. It applies complete observed membership in SQL before LIMIT,
+using the existing `received_at DESC, message_id ASC` keyset order. Pending desired
+intent and label names do not enter the predicate. Recent keeps all cached rows,
+including Unknown, Missing and known-empty provider metadata; only actual complete
+observed membership matches the other filters. Returned envelope unread display
+values retain their existing sticky local-read semantics.
+
+Pages are limited to 1 through 201 envelopes, supporting the existing 200-row
+unified query plus its continuation probe. Larger StoreLimits and foreign
+accounts/User labels fail through the existing closed mailbox errors. Envelope
+projections retain bounded type/byte checks, and each returned current-schema
+key's complete provider observation is validated within the existing 512-label
+bound. Unrelated candidate envelopes and memberships are not materialized. The
+existing ordering and primary-key indexes are used without adding a canonical
+object; sparse filters can require scanning more ordered index entries, so this
+is a materialization bound rather than a constant SQL-work or latency guarantee.
+Legacy v1/v2 readers return useful Recent pages and empty observed-filter pages:
+the old format has no observed membership, and these reads never migrate it.
+
+`pending_commands(&AccountFence)` is also available on both types. One readonly
+transaction checks actual ownership and the identity fence, then uses P5c's real
+bounded queue/item/field/observation/undo reconstruction for every nonterminal
+snapshot in FIFO order. It rejects overflow or accessed corruption rather than
+truncating: at most 32 nonterminal commands and 4,096 full target references are
+returned. Terminal summaries and the retained Complete undo source are excluded.
+Persisted Dispatching remains Dispatching; no recovery transition, usable token
+or access session is required. A valid identity-fenced legacy store has an empty
+queue; absent, foreign or invalid identity still fails the existing fence check.
+
+Both read surfaces use the existing cached-read transaction boundary, including
+readonly pre/post file identity, movement, permission, sidecar, schema and Skip
+health checks. They never select message bodies, perform a global integrity/FK
+walk, load credentials, alter command transitions or dispatch, or write data.
+Tests cover late matching pages and equal-time continuation, unavailable versus
+observed membership, exact User IDs/account routing, pending-intent exclusion,
+legacy non-mutation, damaged body-page avoidance, established readonly path
+faults, real admitted queues across reopen, uncertainty/terminal exclusion and
+full quota/relationship/fence failures. Runtime composition, host verification,
+independent approval and live/provider acceptance remain separate claims.
