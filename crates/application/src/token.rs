@@ -15,11 +15,20 @@
 use std::fmt;
 use std::time::Duration;
 
+use tersa_domain::account::AccountCapability;
 use url::Url;
 use zeroize::Zeroizing;
 
 use crate::mailbox::BoxFuture;
 use crate::oauth::{AuthorizationGrant, MonotonicClock};
+use crate::scope::{AcceptedScope, ScopeEvidence, ScopeRejection};
+
+mod capability;
+#[doc(inline)]
+pub use capability::{
+    CapabilityRefreshOutcome, RefreshRevocationHandle, StoredGrantSnapshot,
+    exchange_capability_grant, refresh_stored_grant,
+};
 
 // Rust guideline compliant 1.0.
 
@@ -114,6 +123,7 @@ pub struct ExchangeRequest {
     client_id: String,
     redirect_uri: Url,
     client_secret: Option<Zeroizing<String>>,
+    requested_capability: AccountCapability,
 }
 
 impl ExchangeRequest {
@@ -124,7 +134,14 @@ impl ExchangeRequest {
             client_id: config.client_id().to_owned(),
             redirect_uri: config.redirect_uri().clone(),
             client_secret: config.client_secret().cloned(),
+            requested_capability: grant.requested_capability(),
         }
+    }
+
+    /// Returns the capability bound to the validated authorization grant.
+    #[must_use]
+    pub fn requested_capability(&self) -> AccountCapability {
+        self.requested_capability
     }
 
     /// Returns the ordered parameters a transport encodes for the endpoint.
@@ -157,6 +174,7 @@ impl fmt::Debug for ExchangeRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ExchangeRequest")
+            .field("requested_capability", &self.requested_capability)
             .field("code", &"[REDACTED]")
             .field("code_verifier", &"[REDACTED]")
             .field("client_id", &self.client_id)
@@ -177,6 +195,7 @@ pub struct RefreshRequest {
     refresh_token: Zeroizing<String>,
     client_id: String,
     client_secret: Option<Zeroizing<String>>,
+    stored_capability: AccountCapability,
 }
 
 impl RefreshRequest {
@@ -185,7 +204,14 @@ impl RefreshRequest {
             refresh_token: refresh_token.clone(),
             client_id: config.client_id().to_owned(),
             client_secret: config.client_secret().cloned(),
+            stored_capability: AccountCapability::ReadOnly,
         }
+    }
+
+    /// Returns the trusted stored capability; refresh never asks to broaden it.
+    #[must_use]
+    pub fn stored_capability(&self) -> AccountCapability {
+        self.stored_capability
     }
 
     /// Returns the ordered parameters a transport encodes for the endpoint.
@@ -210,6 +236,7 @@ impl fmt::Debug for RefreshRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RefreshRequest")
+            .field("stored_capability", &self.stored_capability)
             .field("refresh_token", &"[REDACTED]")
             .field("client_id", &self.client_id)
             .field(
@@ -435,18 +462,22 @@ const MAX_SUBJECT_LEN: usize = 255;
 ///
 /// The transport parses the response body; this value never holds wire bytes
 /// or JSON. The optional refresh token models provider rotation. The optional
-/// identity claims are present when the response carried an `id_token`. The
-/// Gmail-scope verdict preserves only a boolean, never the provider scope text.
+/// identity claims are present when the response carried an `id_token`.
+/// Scope evidence preserves absence and explicit facts without provider text.
+/// The legacy boolean constructor records its limited provenance explicitly.
 pub struct TokenResponse {
     access_token: Zeroizing<String>,
     expires_in: Duration,
     rotated_refresh_token: Option<Zeroizing<String>>,
     id_token_claims: Option<IdTokenClaims>,
-    gmail_read_granted: bool,
+    scope_evidence: ScopeEvidence,
 }
 
 impl TokenResponse {
-    /// Creates a token response from its parsed fields.
+    /// Creates a readonly compatibility response with explicitly incomplete scope evidence.
+    ///
+    /// The boolean never counts as absent-field evidence and cannot authorize
+    /// any capability-aware exchange or refresh, including a readonly one.
     #[must_use]
     pub fn new(
         access_token: Zeroizing<String>,
@@ -460,8 +491,38 @@ impl TokenResponse {
             expires_in,
             rotated_refresh_token,
             id_token_claims,
-            gmail_read_granted,
+            scope_evidence: ScopeEvidence::LegacyReadOnly {
+                granted: gmail_read_granted,
+            },
         }
+    }
+
+    /// Creates a response retaining the complete parser's scope-field provenance.
+    ///
+    /// Producers must reduce the actual field through
+    /// [`ScopeEvidence::from_scope_field`]. This constructor performs no wire,
+    /// scope, identity, freshness or grant-authority validation by itself.
+    #[must_use]
+    pub fn with_scope_evidence(
+        access_token: Zeroizing<String>,
+        expires_in: Duration,
+        rotated_refresh_token: Option<Zeroizing<String>>,
+        id_token_claims: Option<IdTokenClaims>,
+        scope_evidence: ScopeEvidence,
+    ) -> Self {
+        Self {
+            access_token,
+            expires_in,
+            rotated_refresh_token,
+            id_token_claims,
+            scope_evidence,
+        }
+    }
+
+    /// Returns closed scope evidence, including any legacy producer limitation.
+    #[must_use]
+    pub fn scope_evidence(&self) -> ScopeEvidence {
+        self.scope_evidence
     }
 
     /// Returns the granted access token without transferring ownership.
@@ -485,13 +546,17 @@ impl TokenResponse {
         self.rotated_refresh_token.as_ref()
     }
 
-    /// Returns whether the explicit token response scope included Gmail read access.
+    /// Returns the readonly compatibility verdict, never Modify authorization.
+    ///
+    /// This lossy view must not be used in capability-aware flows.
     #[must_use]
     pub fn gmail_read_granted(&self) -> bool {
-        self.gmail_read_granted
+        self.scope_evidence.validate_readonly_compat().is_ok()
     }
 
-    /// Separates the response into its owned fields.
+    /// Separates readonly compatibility fields, intentionally losing scope provenance.
+    ///
+    /// Capability-aware processing must retain [`Self::scope_evidence`] instead.
     #[must_use]
     pub fn into_parts(
         self,
@@ -502,12 +567,13 @@ impl TokenResponse {
         Option<IdTokenClaims>,
         bool,
     ) {
+        let gmail_read_granted = self.gmail_read_granted();
         (
             self.access_token,
             self.expires_in,
             self.rotated_refresh_token,
             self.id_token_claims,
-            self.gmail_read_granted,
+            gmail_read_granted,
         )
     }
 }
@@ -526,7 +592,7 @@ impl fmt::Debug for TokenResponse {
                     .map(|_token| "[REDACTED]"),
             )
             .field("id_token_claims", &self.id_token_claims)
-            .field("gmail_read_granted", &self.gmail_read_granted)
+            .field("scope_evidence", &self.scope_evidence)
             .finish()
     }
 }
@@ -536,6 +602,9 @@ impl fmt::Debug for TokenResponse {
 /// Implementations own the wire encoding, the HTTP exchange, and response
 /// parsing; this layer supplies structured parameters and consumes parsed
 /// values only.
+/// Capability-aware producers must use [`TokenResponse::with_scope_evidence`]
+/// with the actual parsed field's presence. The boolean constructor is limited
+/// to readonly compatibility and fails closed in capability-aware operations.
 pub trait TokenTransport: fmt::Debug + Send + Sync {
     /// Exchanges an authorization-code request for a token response.
     ///
@@ -652,8 +721,12 @@ pub enum TokenError {
     AuthorizationCodeRejected,
     /// The endpoint response did not parse into a complete token response.
     MalformedResponse,
-    /// The token endpoint explicitly returned a grant without Gmail read access.
+    /// Explicit scope evidence does not satisfy the bound requested capability.
     InsufficientScope,
+    /// The transport or selected compatibility flow supplies no complete scope evidence.
+    ScopeEvidenceUnavailable,
+    /// A refresh response identifies a different subject than the trusted stored grant.
+    IdentityMismatch,
     /// The stored refresh token lost validity at the provider — consent was
     /// withdrawn or the token expired — and re-consent is required.
     ///
@@ -681,7 +754,11 @@ impl fmt::Display for TokenError {
             Self::ProviderRejected => "the token endpoint rejected the request",
             Self::AuthorizationCodeRejected => "the authorization code was rejected; sign in again",
             Self::MalformedResponse => "the token endpoint returned an incomplete response",
-            Self::InsufficientScope => "the token grant omitted Gmail read access",
+            Self::InsufficientScope => "the token grant does not match the required capability",
+            Self::ScopeEvidenceUnavailable => "complete capability scope evidence is unavailable",
+            Self::IdentityMismatch => {
+                "the refreshed account identity does not match the stored grant"
+            }
             Self::ConsentRevoked => "the granted consent was revoked and re-connect is required",
             Self::IdentityUnverified => "the token response carried no verified account identity",
         };
@@ -732,7 +809,7 @@ impl fmt::Debug for AccessToken {
 }
 
 /// Carries a granted access token, any rotated refresh token, the validated
-/// account subject, and the Gmail-scope verdict.
+/// account subject, accepted capability and scope provenance.
 ///
 /// A validated [`AccountSubject`] is MANDATORY to construct: a token op that
 /// yields an access token but no verified `sub` fails entirely
@@ -745,7 +822,7 @@ pub struct TokenSuccess {
     rotated_refresh_token: Option<Zeroizing<String>>,
     subject: AccountSubject,
     identity_expiry: IdentityExpiry,
-    gmail_read_granted: bool,
+    accepted_scope: AcceptedScope,
 }
 
 impl TokenSuccess {
@@ -754,7 +831,7 @@ impl TokenSuccess {
         expires_in: Duration,
         rotated_refresh_token: Option<Zeroizing<String>>,
         id_token_claims: Option<IdTokenClaims>,
-        gmail_read_granted: bool,
+        accepted_scope: AcceptedScope,
         now: Duration,
         config: &TokenClientConfig,
     ) -> Result<Self, TokenError> {
@@ -775,7 +852,7 @@ impl TokenSuccess {
             rotated_refresh_token,
             subject,
             identity_expiry,
-            gmail_read_granted,
+            accepted_scope,
         })
     }
 
@@ -807,10 +884,22 @@ impl TokenSuccess {
         self.rotated_refresh_token.as_ref()
     }
 
-    /// Returns whether the provider's explicit scope set included Gmail read access.
+    /// Returns the accepted capability, bound to request or trusted stored context.
+    #[must_use]
+    pub fn capability(&self) -> AccountCapability {
+        self.accepted_scope.capability()
+    }
+
+    /// Returns accepted scope provenance, including readonly compatibility limitations.
+    #[must_use]
+    pub fn accepted_scope(&self) -> AcceptedScope {
+        self.accepted_scope
+    }
+
+    /// Returns readable-token compatibility, never a separate Modify authority proof.
     #[must_use]
     pub fn gmail_read_granted(&self) -> bool {
-        self.gmail_read_granted
+        true
     }
 
     /// Separates the access token, any rotated refresh token, the subject, and the
@@ -830,7 +919,27 @@ impl TokenSuccess {
             self.rotated_refresh_token,
             self.subject,
             self.identity_expiry,
-            self.gmail_read_granted,
+            true,
+        )
+    }
+
+    /// Separates success while retaining accepted capability and scope provenance.
+    #[must_use]
+    pub fn into_capability_parts(
+        self,
+    ) -> (
+        AccessToken,
+        Option<Zeroizing<String>>,
+        AccountSubject,
+        IdentityExpiry,
+        AcceptedScope,
+    ) {
+        (
+            self.access_token,
+            self.rotated_refresh_token,
+            self.subject,
+            self.identity_expiry,
+            self.accepted_scope,
         )
     }
 }
@@ -879,23 +988,28 @@ fn scope_outcome_from_response(
     now: Duration,
     config: &TokenClientConfig,
 ) -> Result<TokenScopeOutcome, TokenError> {
-    let (access_token, expires_in, rotated_refresh_token, id_token_claims, gmail_read_granted) =
-        response.into_parts();
+    let TokenResponse {
+        access_token,
+        expires_in,
+        rotated_refresh_token,
+        id_token_claims,
+        scope_evidence,
+    } = response;
     if access_token.is_empty() {
         return Err(TokenError::MalformedResponse);
     }
-    if !gmail_read_granted {
+    let Ok(accepted_scope) = scope_evidence.validate_readonly_compat() else {
         return Ok(TokenScopeOutcome::InsufficientScope {
             access_token,
             rotated_refresh_token,
         });
-    }
+    };
     TokenSuccess::from_parts(
         access_token,
         expires_in,
         rotated_refresh_token,
         id_token_claims,
-        true,
+        accepted_scope,
         now,
         config,
     )
@@ -963,12 +1077,15 @@ impl fmt::Debug for TokenSuccess {
             )
             .field("subject", &self.subject)
             .field("identity_expiry", &self.identity_expiry)
-            .field("gmail_read_granted", &self.gmail_read_granted)
+            .field("accepted_scope", &self.accepted_scope)
             .finish()
     }
 }
 
 /// Exchanges a validated authorization grant for a token success.
+///
+/// This is a readonly compatibility API. Modify grants fail before transport;
+/// use [`exchange_capability_grant`] for capability-aware response processing.
 ///
 /// Builds the authorization-code request from the grant and client
 /// configuration, sends it through the transport, and interprets the outcome.
@@ -1009,6 +1126,9 @@ pub fn exchange_grant<'a, T: TokenTransport, C: MonotonicClock>(
 /// insufficient scope before validating `id_token` claims. A caller that will
 /// reject a first-time grant can therefore revoke it without persisting any
 /// credential, even if identity validation would also fail.
+/// This is readonly compatibility only; Modify grants fail before transport.
+/// Retention/revocation still requires the owning lifecycle's trusted identity
+/// context; this legacy result is not permission for unverified-grant cleanup.
 ///
 /// # Errors
 ///
@@ -1022,7 +1142,11 @@ pub fn exchange_grant_with_scope_outcome<'a, T: TokenTransport, C: MonotonicCloc
     clock: &'a C,
 ) -> BoxFuture<'a, Result<TokenScopeOutcome, TokenError>> {
     let request = ExchangeRequest::new(grant, config);
+    let requested_capability = grant.requested_capability();
     Box::pin(async move {
+        if requested_capability != AccountCapability::ReadOnly {
+            return Err(TokenError::ScopeEvidenceUnavailable);
+        }
         let response = transport
             .exchange(request)
             .await
@@ -1032,6 +1156,9 @@ pub fn exchange_grant_with_scope_outcome<'a, T: TokenTransport, C: MonotonicCloc
 }
 
 /// Refreshes an access token using the stored refresh token.
+///
+/// This is readonly compatibility only. Capability-aware refresh must use
+/// [`refresh_stored_grant`] with a trusted token/subject/capability snapshot.
 ///
 /// Builds the refresh-token request from the stored token and client
 /// configuration, sends it through the transport, and interprets the outcome.
@@ -1149,6 +1276,7 @@ mod tests {
     use crate::oauth::{
         AuthorizationConfig, AuthorizationGrant, MonotonicClock, prepare_authorization,
     };
+    use tersa_domain::account::AccountCapability;
 
     /// Drives an immediately-ready fake-transport future to completion.
     fn now_ready<T>(mut future: BoxFuture<'_, T>) -> T {
@@ -1189,6 +1317,9 @@ mod tests {
         rotated_refresh_token: Option<Zeroizing<String>>,
         id_token_claims: Option<IdTokenClaims>,
         recorded: Mutex<Vec<RecordedRequest>>,
+        scope_evidence: Option<crate::scope::ScopeEvidence>,
+        access_token: Zeroizing<String>,
+        expires_in: Duration,
     }
 
     const TEST_SUBJECT: &str = "test-subject-123";
@@ -1211,6 +1342,9 @@ mod tests {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter
                 .debug_struct("FakeTransport")
+                .field("scope_evidence", &self.scope_evidence)
+                .field("access_token", &"[REDACTED]")
+                .field("expires_in", &self.expires_in)
                 .field("error", &self.error)
                 .field(
                     "rotated_refresh_token",
@@ -1233,6 +1367,9 @@ mod tests {
                     .map(|token| Zeroizing::new(token.to_owned())),
                 id_token_claims: Some(valid_claims()),
                 recorded: Mutex::new(Vec::new()),
+                scope_evidence: None,
+                access_token: Zeroizing::new("fake-access-token".to_owned()),
+                expires_in: Duration::from_secs(3_600),
             }
         }
 
@@ -1242,6 +1379,9 @@ mod tests {
                 rotated_refresh_token: None,
                 id_token_claims: Some(valid_claims()),
                 recorded: Mutex::new(Vec::new()),
+                scope_evidence: None,
+                access_token: Zeroizing::new("fake-access-token".to_owned()),
+                expires_in: Duration::from_secs(3_600),
             }
         }
 
@@ -1250,16 +1390,31 @@ mod tests {
             self
         }
 
+        fn with_scope_evidence(mut self, evidence: crate::scope::ScopeEvidence) -> Self {
+            self.scope_evidence = Some(evidence);
+            self
+        }
+
         fn outcome(&self) -> Result<TokenResponse, TokenTransportError> {
             match self.error {
                 Some(error) => Err(error),
-                None => Ok(TokenResponse::new(
-                    Zeroizing::new("fake-access-token".to_owned()),
-                    Duration::from_secs(3_600),
-                    self.rotated_refresh_token.clone(),
-                    self.id_token_claims.clone(),
-                    true,
-                )),
+                None => Ok(if let Some(evidence) = self.scope_evidence {
+                    TokenResponse::with_scope_evidence(
+                        self.access_token.clone(),
+                        self.expires_in,
+                        self.rotated_refresh_token.clone(),
+                        self.id_token_claims.clone(),
+                        evidence,
+                    )
+                } else {
+                    TokenResponse::new(
+                        self.access_token.clone(),
+                        self.expires_in,
+                        self.rotated_refresh_token.clone(),
+                        self.id_token_claims.clone(),
+                        true,
+                    )
+                }),
             }
         }
     }
@@ -1313,10 +1468,18 @@ mod tests {
     }
 
     fn make_grant(code: &str) -> AuthorizationGrant {
-        let config = AuthorizationConfig::new(
+        make_capability_grant(code, tersa_domain::account::AccountCapability::ReadOnly)
+    }
+
+    fn make_capability_grant(
+        code: &str,
+        capability: tersa_domain::account::AccountCapability,
+    ) -> AuthorizationGrant {
+        let config = AuthorizationConfig::for_capability(
             "public-test-client",
             test_redirect(),
             Duration::from_secs(60),
+            capability,
         )
         .unwrap();
         let prepared = prepare_authorization(config, TestClock::default()).unwrap();
@@ -1332,6 +1495,246 @@ mod tests {
             .append_pair("code", code);
         let (_, mut session) = prepared.into_parts();
         session.finish(&callback).unwrap()
+    }
+
+    fn stored_grant(capability: AccountCapability) -> super::StoredGrantSnapshot {
+        super::StoredGrantSnapshot::new(
+            Zeroizing::new("stored-refresh-sentinel".to_owned()),
+            AccountSubject::from_broker_validated(Zeroizing::new(TEST_SUBJECT.to_owned())).unwrap(),
+            capability,
+        )
+        .unwrap()
+    }
+
+    // Contract: exchange derives capability from the grant, retaining full provenance.
+    // Regression: exchange drops request context or treats a Modify response as a boolean.
+    #[test]
+    fn capability_exchange_preserves_request_binding_and_scope_provenance() {
+        use crate::scope::{GMAIL_MODIFY_SCOPE, GMAIL_READONLY_SCOPE, ScopeEvidence};
+        let config = make_config(None);
+        let clock = TestClock::default();
+        let both = format!("{GMAIL_MODIFY_SCOPE} {GMAIL_READONLY_SCOPE}");
+        for (capability, field) in [
+            (AccountCapability::ReadOnly, None),
+            (AccountCapability::Modify, None),
+            (AccountCapability::Modify, Some(both.as_str())),
+        ] {
+            let grant = make_capability_grant("bound-code-sentinel", capability);
+            let evidence = ScopeEvidence::from_scope_field(field).unwrap();
+            let transport =
+                FakeTransport::success(Some("rotation-sentinel")).with_scope_evidence(evidence);
+            let success = now_ready(super::exchange_capability_grant(
+                &grant, &config, &transport, &clock,
+            ))
+            .unwrap();
+            assert_eq!(success.capability(), capability);
+            assert_eq!(success.accepted_scope().evidence(), evidence);
+            assert_eq!(success.subject().as_str(), TEST_SUBJECT);
+            let recorded = transport.recorded.lock().unwrap();
+            let RecordedRequest::Exchange(request) = &recorded[0] else {
+                panic!("expected exchange");
+            };
+            assert_eq!(request.requested_capability(), capability);
+            let (_, rotation, _, _, accepted) = success.into_capability_parts();
+            assert_eq!(accepted.capability(), capability);
+            assert_eq!(rotation.unwrap().as_str(), "rotation-sentinel");
+        }
+    }
+
+    // Contract: legacy evidence is incomplete for BOTH capabilities; old APIs stay readonly.
+    // Regression: a legacy true boolean is reinterpreted as absent scope or Modify authority.
+    #[test]
+    fn legacy_evidence_cannot_elevate_or_service_capability_flows() {
+        use crate::scope::ScopeEvidence;
+        let config = make_config(None);
+        let clock = TestClock::default();
+        for capability in [AccountCapability::ReadOnly, AccountCapability::Modify] {
+            let grant = make_capability_grant("legacy-code", capability);
+            let transport = FakeTransport::success(None);
+            assert!(matches!(
+                now_ready(super::exchange_capability_grant(
+                    &grant, &config, &transport, &clock
+                )),
+                Err(TokenError::ScopeEvidenceUnavailable)
+            ));
+            assert!(matches!(
+                now_ready(super::refresh_stored_grant(
+                    &stored_grant(capability),
+                    &config,
+                    &transport,
+                    &clock
+                )),
+                Err(TokenError::ScopeEvidenceUnavailable)
+            ));
+        }
+        let transport = FakeTransport::success(None);
+        let modify = make_capability_grant("modify-code", AccountCapability::Modify);
+        assert!(matches!(
+            now_ready(exchange_grant(&modify, &config, &transport, &clock)),
+            Err(TokenError::ScopeEvidenceUnavailable)
+        ));
+        assert!(transport.recorded.lock().unwrap().is_empty());
+        let readonly = now_ready(exchange_grant(
+            &make_grant("readonly-code"),
+            &config,
+            &transport,
+            &clock,
+        ))
+        .unwrap();
+        assert_eq!(readonly.capability(), AccountCapability::ReadOnly);
+        assert_eq!(
+            readonly.accepted_scope().evidence(),
+            ScopeEvidence::LegacyReadOnly { granted: true }
+        );
+    }
+
+    // Contract: rejected exchange scopes expose no grant; rejected refresh exposes only rotation.
+    // Regression: identity runs first, a readonly grant promotes, or rejected access escapes.
+    #[test]
+    fn scope_rejection_precedes_identity_and_retains_only_refresh_cleanup() {
+        use crate::scope::{
+            GMAIL_MODIFY_SCOPE, GMAIL_READONLY_SCOPE, ScopeEvidence, ScopeRejection,
+        };
+        let config = make_config(None);
+        let clock = TestClock::default();
+        let modify = make_capability_grant("modify-code", AccountCapability::Modify);
+        for explicit in [GMAIL_READONLY_SCOPE, ""] {
+            let reduced = FakeTransport::success(Some("discarded-rotation"))
+                .with_id_token_claims(None)
+                .with_scope_evidence(ScopeEvidence::from_scope_field(Some(explicit)).unwrap());
+            assert!(matches!(
+                now_ready(super::exchange_capability_grant(
+                    &modify, &config, &reduced, &clock
+                )),
+                Err(TokenError::InsufficientScope)
+            ));
+        }
+        let both = format!("{GMAIL_READONLY_SCOPE} {GMAIL_MODIFY_SCOPE}");
+        let mut broadened = FakeTransport::success(Some("revocation-rotation-sentinel"))
+            .with_id_token_claims(None)
+            .with_scope_evidence(ScopeEvidence::from_scope_field(Some(&both)).unwrap());
+        // Scope rejection needs no usable access or expiry; preserve valid rotation anyway.
+        broadened.access_token = Zeroizing::new(String::new());
+        broadened.expires_in = Duration::ZERO;
+        let stored = stored_grant(AccountCapability::ReadOnly);
+        let outcome = now_ready(super::refresh_stored_grant(
+            &stored, &config, &broadened, &clock,
+        ))
+        .unwrap();
+        let debug = format!("{outcome:?}");
+        let super::CapabilityRefreshOutcome::ScopeRejected { reason, rotation } = outcome else {
+            panic!("must reject broadened scope");
+        };
+        assert_eq!(reason, ScopeRejection::CapabilityMismatch);
+        assert_eq!(
+            rotation.unwrap().into_secret_for_revocation().as_str(),
+            "revocation-rotation-sentinel"
+        );
+        assert!(!debug.contains("revocation-rotation-sentinel"));
+        assert!(!debug.contains(TEST_SUBJECT));
+    }
+
+    // Contract: refresh inherits stored capability and refuses a different response subject.
+    // Regression: response-controlled promotion or rotation accepted for another account.
+    #[test]
+    fn refresh_uses_one_stored_snapshot_and_matches_its_subject() {
+        use crate::scope::ScopeEvidence;
+        let config = make_config(None);
+        let clock = TestClock::default();
+        for capability in [AccountCapability::ReadOnly, AccountCapability::Modify] {
+            let stored = stored_grant(capability);
+            let transport = FakeTransport::success(Some("rotation-sentinel"))
+                .with_scope_evidence(ScopeEvidence::Absent);
+            let outcome = now_ready(super::refresh_stored_grant(
+                &stored, &config, &transport, &clock,
+            ))
+            .unwrap();
+            let super::CapabilityRefreshOutcome::Granted(success) = outcome else {
+                panic!("absent scope inherits stored capability");
+            };
+            assert_eq!(success.capability(), capability);
+            assert_eq!(success.accepted_scope().evidence(), ScopeEvidence::Absent);
+            let recorded = transport.recorded.lock().unwrap();
+            let RecordedRequest::Refresh(request) = &recorded[0] else {
+                panic!("expected refresh");
+            };
+            assert_eq!(request.stored_capability(), capability);
+            assert_eq!(stored.capability(), capability);
+            assert_eq!(stored.subject().as_str(), TEST_SUBJECT);
+            assert!(!format!("{stored:?}").contains("stored-refresh-sentinel"));
+        }
+        let wrong_subject = IdTokenClaims::new(
+            Zeroizing::new("other-subject-sentinel".to_owned()),
+            vec!["public-test-client".to_owned()],
+            "https://accounts.google.com".to_owned(),
+            None,
+            TEST_IAT,
+            TEST_EXP,
+        );
+        let transport = FakeTransport::success(Some("must-not-persist"))
+            .with_scope_evidence(ScopeEvidence::Absent)
+            .with_id_token_claims(Some(wrong_subject));
+        assert!(matches!(
+            now_ready(super::refresh_stored_grant(
+                &stored_grant(AccountCapability::Modify),
+                &config,
+                &transport,
+                &clock
+            )),
+            Err(TokenError::IdentityMismatch)
+        ));
+    }
+
+    // Contract: capability APIs enforce token/rotation bounds before granting or retaining.
+    // Regression: an unsupported producer or rejected scope bypasses the credential cap.
+    #[test]
+    fn capability_responses_bound_grants_and_rejected_refresh_rotations() {
+        use crate::scope::{GMAIL_READONLY_SCOPE, ScopeEvidence};
+        let config = make_config(None);
+        let clock = TestClock::default();
+        let grant = make_capability_grant("bound-code", AccountCapability::Modify);
+        for (access, seconds, rotation) in [
+            ("x".repeat(4_097), 3_600, None),
+            ("x".to_owned(), 0, None),
+            ("x".to_owned(), 86_401, None),
+            ("x".to_owned(), 3_600, Some(String::new())),
+            ("x".to_owned(), 3_600, Some("r".repeat(1_025))),
+        ] {
+            let mut transport =
+                FakeTransport::success(None).with_scope_evidence(ScopeEvidence::Absent);
+            transport.access_token = Zeroizing::new(access);
+            transport.expires_in = Duration::from_secs(seconds);
+            transport.rotated_refresh_token = rotation.map(Zeroizing::new);
+            assert!(matches!(
+                now_ready(super::exchange_capability_grant(
+                    &grant, &config, &transport, &clock
+                )),
+                Err(TokenError::MalformedResponse)
+            ));
+        }
+        for invalid in [String::new(), "r".repeat(1_025)] {
+            assert!(matches!(
+                super::StoredGrantSnapshot::new(
+                    Zeroizing::new(invalid.clone()),
+                    AccountSubject::from_broker_validated(Zeroizing::new(TEST_SUBJECT.to_owned()))
+                        .unwrap(),
+                    AccountCapability::Modify
+                ),
+                Err(TokenError::MalformedResponse)
+            ));
+            let transport = FakeTransport::success(Some(&invalid)).with_scope_evidence(
+                ScopeEvidence::from_scope_field(Some(GMAIL_READONLY_SCOPE)).unwrap(),
+            );
+            assert!(matches!(
+                now_ready(super::refresh_stored_grant(
+                    &stored_grant(AccountCapability::Modify),
+                    &config,
+                    &transport,
+                    &clock
+                )),
+                Err(TokenError::MalformedResponse)
+            ));
+        }
     }
 
     #[test]
@@ -1801,6 +2204,16 @@ mod tests {
         assert_eq!(exchange_error, TokenError::AuthorizationCodeRejected);
         assert_ne!(exchange_error, TokenError::ConsentRevoked);
         assert_ne!(exchange_error, TokenError::ProviderRejected);
+        assert_eq!(
+            now_ready(super::exchange_capability_grant(
+                &grant,
+                &config,
+                &transport,
+                &TestClock::default()
+            ))
+            .unwrap_err(),
+            TokenError::AuthorizationCodeRejected
+        );
 
         // Refresh: the same answer is about the stored credential, so it stays
         // the destructive ConsentRevoked terminal.
@@ -1816,6 +2229,15 @@ mod tests {
             .unwrap_err(),
             TokenError::ConsentRevoked
         );
+        assert!(matches!(
+            now_ready(super::refresh_stored_grant(
+                &stored_grant(AccountCapability::ReadOnly),
+                &config,
+                &transport,
+                &TestClock::default()
+            )),
+            Err(TokenError::ConsentRevoked)
+        ));
     }
 
     #[test]
