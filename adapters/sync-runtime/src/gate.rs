@@ -125,7 +125,7 @@ impl std::error::Error for GatedFetchError {}
 /// (a livelock or tamper), never a reason to sync under an uncommitted identity.
 const MAX_GATE_ATTEMPTS: u8 = 4;
 
-async fn run_identity_gate<P, H, St>(
+pub(crate) async fn run_identity_gate<P, H, St>(
     account: &AccountId,
     profile: &P,
     hasher: &H,

@@ -10,17 +10,26 @@
 //! refresh token lives in the account's encrypted database.
 
 #![forbid(unsafe_code)]
+#![expect(
+    clippy::multiple_inherent_impl,
+    reason = "Runtime flow modules keep account-permit ownership and cached reads separate"
+)]
 
 mod cache_reset;
+mod commands;
+mod composition;
 mod coordination;
 mod flows;
 mod gate;
 mod grants;
+mod history;
 mod installation;
 mod loopback;
+mod mailbox_ports;
 mod online;
 mod session;
 mod session_cache;
+mod views;
 
 pub use cache_reset::{CacheResetOutcome, CacheResetPreconditionError};
 pub use flows::{
@@ -33,3 +42,16 @@ pub use installation::{
 };
 pub use loopback::{Loopback, LoopbackError};
 pub use session::{GmailSession, GmailSessionError, SharedSession};
+
+pub use composition::CompositionError;
+pub use history::{AccountHistoryReport, BodyPhaseReport};
+
+pub use commands::{
+    AccountCommandReport, AccountCommandStatus, CacheConvergenceReport, CommandIntent,
+    CredentialPurpose,
+};
+
+pub use views::{
+    CachedMailboxFilter, CachedViewContinuation, CachedViewPage, CachedViewRow, CachedViewScope,
+    PendingMessageProjection,
+};

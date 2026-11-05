@@ -8,6 +8,8 @@
 use core::fmt;
 use std::sync::Arc;
 
+use crate::mailbox_ports::{AccountMailbox, GoogleMailboxes, MailboxFactory};
+use std::time::{Duration, Instant, SystemTime};
 use tersa_application::identity::AccountProfile;
 use tersa_application::mailbox::{
     AccountEmail, AccountId, BoxFuture, Message, MessageEnvelope, MessageId, Page, PageSize,
@@ -15,7 +17,6 @@ use tersa_application::mailbox::{
 };
 use tersa_application::token::{AccountSubject, BrokerSubjectError};
 use tersa_application::{AccountCapability, scope::AcceptedScope};
-use tersa_gmail_rest::GmailMailbox;
 use tersa_token_broker_core::CapabilityBrokerToken;
 use zeroize::Zeroizing;
 
@@ -46,7 +47,9 @@ impl std::error::Error for GmailSessionError {}
 /// backed by one access token, so the checked identity and the written
 /// identity necessarily coincide.
 pub struct GmailSession {
-    mailbox: GmailMailbox,
+    mailbox: Arc<dyn AccountMailbox>,
+    access: Zeroizing<String>,
+    expiry: Option<(Instant, SystemTime)>,
     subject: AccountSubject,
     accepted_scope: Option<AcceptedScope>,
     generation: u64,
@@ -70,10 +73,13 @@ impl GmailSession {
     ) -> Result<Self, GmailSessionError> {
         let subject =
             AccountSubject::from_broker_validated(subject).map_err(GmailSessionError::Subject)?;
-        let mailbox = GmailMailbox::new(account, access_token.as_str().to_owned())
+        let mailbox = GoogleMailboxes
+            .read(account, access_token)
             .map_err(GmailSessionError::Mailbox)?;
         Ok(Self {
             mailbox,
+            access: access_token.clone(),
+            expiry: None,
             subject,
             accepted_scope: None,
             generation: 0,
@@ -82,15 +88,25 @@ impl GmailSession {
     pub(crate) fn from_capability(
         token: CapabilityBrokerToken,
         generation: u64,
+        factory: &dyn MailboxFactory,
     ) -> Result<Self, GmailSessionError> {
         let (account, token, accepted_scope) = token.into_parts();
-        let mut session = Self::new(
-            account,
-            token.access_token(),
-            Zeroizing::new(token.subject().to_owned()),
-        )?;
-        session.accepted_scope = Some(accepted_scope);
-        session.generation = generation;
+        let lifetime = Duration::from_secs(token.expires_in_seconds());
+        let session = Self {
+            mailbox: factory
+                .read(account, token.access_token())
+                .map_err(GmailSessionError::Mailbox)?,
+            subject: AccountSubject::from_broker_validated(Zeroizing::new(
+                token.subject().to_owned(),
+            ))
+            .map_err(GmailSessionError::Subject)?,
+            access: token.access_token().clone(),
+            accepted_scope: Some(accepted_scope),
+            generation,
+            expiry: Instant::now()
+                .checked_add(lifetime)
+                .zip(SystemTime::now().checked_add(lifetime)),
+        };
         Ok(session)
     }
 
@@ -167,6 +183,18 @@ impl SharedSession {
     #[must_use]
     pub fn capability(&self) -> AccountCapability {
         self.0.capability()
+    }
+
+    pub(crate) fn mailbox(&self) -> &dyn AccountMailbox {
+        self.0.mailbox.as_ref()
+    }
+    pub(crate) fn access(&self) -> &Zeroizing<String> {
+        &self.0.access
+    }
+    pub(crate) fn unexpired(&self) -> bool {
+        self.0
+            .expiry
+            .is_some_and(|(mono, wall)| Instant::now() < mono && SystemTime::now() < wall)
     }
 
     pub(crate) fn generation(&self) -> u64 {

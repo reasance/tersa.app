@@ -710,7 +710,7 @@ fn new_account_id() -> Result<AccountId, InstallationError> {
     AccountId::new(format!("acct_{}", hex(&bytes))).map_err(|_error| InstallationError::Directory)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
     bytes
