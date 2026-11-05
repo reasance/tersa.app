@@ -327,6 +327,7 @@ fn confirmed_requests_keep_the_same_arc_and_lock_and_dispatch_exactly_once() {
                 Ok(Completion::Resynced {
                     messages: 100,
                     bodies: 25,
+                    history: None,
                 })
             },
         );
@@ -507,7 +508,8 @@ fn input_failure_does_not_reset_and_yes_does_not_read_confirmation() {
             |_| Ok(fixture.open()),
             |_, _, _| Ok(Completion::Resynced {
                 messages: 0,
-                bodies: 0
+                bodies: 0,
+                history: None
             })
         )
         .is_ok()
@@ -558,7 +560,7 @@ fn all_three_phase_messages_and_hostile_text_are_truthful_and_terminal_safe() {
     assert!(error.contains("Partial new cache"));
     assert!(error.contains("remains registered"));
     assert!(error.contains("tersa sync acct_safe"));
-    assert!(error.contains("tersa account add"));
+    assert!(error.contains("tersa account reconnect acct_safe"));
     assert!(!error.contains('\x1b') && !error.contains('\u{202e}'));
     assert!(!error.contains("grant remains"));
     let hostile_email = AccountEmail::new("hostile\u{202e}@example.test").expect("provider label");
@@ -601,6 +603,7 @@ fn failed_confirmation_output_never_dispatches_and_result_output_keeps_its_phase
         Ok(Completion::Resynced {
             messages: 1,
             bodies: 1,
+            history: None,
         }),
     )
     .expect_err("output failed after completion");

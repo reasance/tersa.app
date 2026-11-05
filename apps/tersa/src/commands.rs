@@ -4,7 +4,7 @@
 
 //! Command implementations.
 
-use std::process::{Command as Process, Stdio};
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 
 use tersa_application::mailbox::{AccountId, MailboxReader, MessageId};
@@ -16,15 +16,18 @@ use tersa_application::unified_mailbox::{
 use tersa_keys::RootKey;
 use tersa_presentation::terminal::SafeText;
 use tersa_store_sqlcipher::SqlCipherMailboxStore;
-use tersa_sync_runtime::{
-    FlowError, Installation, InstallationLock, Revocation, Runtime, has_local_data,
-};
+use tersa_sync_runtime::{Installation, InstallationLock, Revocation, Runtime, has_local_data};
 use tersa_vault::{SlotKind, Vault, VaultError, VaultState};
 
 use crate::config::{Config, Paths};
 use crate::prompt;
 
+mod authorization;
+mod cached;
+mod control;
+mod history;
 mod reset;
+pub use authorization::{account_reconnect, account_upgrade};
 pub use reset::account_reset;
 
 const PASSPHRASE_ATTEMPTS: usize = 3;
@@ -64,7 +67,9 @@ fn lock(context: &Context) -> Result<InstallationLock, String> {
 fn lock_existing(context: &Context) -> Result<Option<InstallationLock>, String> {
     match std::fs::symlink_metadata(&context.paths.data_dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        _ => lock(context).map(Some),
+        _ => InstallationLock::acquire_existing(&context.paths.data_dir)
+            .map(Some)
+            .map_err(|error| error.to_string()),
     }
 }
 
@@ -148,6 +153,27 @@ fn unlock(
         UnlockPlan::Unlock => vault.unlock(None).map_err(|error| error.to_string())?,
         UnlockPlan::UnlockWithPassphrase => unlock_with_passphrase(&vault)?,
     };
+    if create == Create::Forbidden {
+        let key = tersa_keys::derive_installation_key(
+            &root,
+            tersa_keys::InstallationKeyPurpose::RegistryDatabaseV1,
+        )
+        .map_err(|error| error.to_string())?
+        .into_bytes();
+        let _registry = tersa_store_sqlcipher::registry::SqlCipherRegistry::open_existing(
+            &context.paths.data_dir.join("registry.sqlite3"),
+            &key,
+        )
+        .map_err(|error| error.to_string())?;
+        let accounts = std::fs::symlink_metadata(context.paths.data_dir.join("accounts"))
+            .map_err(|_error| "existing account directory is unavailable".to_owned())?;
+        let parent = std::fs::symlink_metadata(&context.paths.data_dir)
+            .map_err(|_error| "existing installation is unavailable".to_owned())?;
+        if !accounts.is_dir() || accounts.uid() != parent.uid() || accounts.mode() & 0o7777 != 0o700
+        {
+            return Err("existing account directory is unsafe".to_owned());
+        }
+    }
     let installation =
         Installation::open(&context.paths.data_dir, root).map_err(|error| error.to_string())?;
     Ok(Some(Arc::new(installation)))
@@ -204,42 +230,8 @@ fn executor() -> Result<tokio::runtime::Runtime, String> {
 }
 
 fn resolve_account(installation: &Installation, raw: &str) -> Result<AccountId, String> {
-    let accounts = installation.accounts().map_err(|error| error.to_string())?;
-    // An id, or a prefix of one, resolves without opening any store. Only an
-    // `@` argument pays for the per-account stored-address reads, and a read
-    // that fails is reported rather than silently becoming "no account
-    // matches".
-    let mut id_matches = accounts
-        .iter()
-        .filter(|account| account.as_str() == raw || account.as_str().starts_with(raw));
-    match (id_matches.next(), id_matches.next()) {
-        (Some(account), None) => return Ok(account.clone()),
-        (Some(_), Some(_)) => return Err(format!("`{raw}` matches more than one account")),
-        (None, _) => {}
-    }
-    if !raw.contains('@') {
-        return Err(format!(
-            "no account matches `{raw}`; see `tersa account list`"
-        ));
-    }
-    let raw_lowercase = raw.to_ascii_lowercase();
-    let mut address_matches = Vec::new();
-    for account in &accounts {
-        match installation.account_email(account) {
-            Ok(Some(email)) if email.as_str().eq_ignore_ascii_case(&raw_lowercase) => {
-                address_matches.push(account.clone());
-            }
-            Ok(_) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    match (address_matches.first(), address_matches.get(1)) {
-        (Some(account), None) => Ok(account.clone()),
-        (Some(_), Some(_)) => Err(format!("`{raw}` matches more than one account")),
-        (None, _) => Err(format!(
-            "no account matches `{raw}`; see `tersa account list`"
-        )),
-    }
+    reset::resolve_existing(installation, raw)
+        .map_err(|message| SafeText::single_line(&message).to_string())
 }
 
 fn describe_report(report: SyncReport) -> String {
@@ -252,20 +244,10 @@ fn describe_report(report: SyncReport) -> String {
 
 fn open_browser(url: &str) {
     eprintln!(
-        "Opening your browser to sign in with Google. If it does not open, visit:\n\n{url}\n"
+        "Opening your browser to sign in with Google. If it does not open, visit:\n\n{}\n",
+        SafeText::single_line(url)
     );
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    // Arguments are passed as a vector, never through a shell.
-    let _ = Process::new(opener)
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let _ = crate::browser::launch(url);
 }
 
 pub fn account_add(context: &Context) -> Result<(), String> {
@@ -286,9 +268,20 @@ pub fn account_add(context: &Context) -> Result<(), String> {
     } else {
         println!("Added account {}.", added.account.as_str());
     }
+    let followup = added.first_sync.is_ok();
+    let account = added.account.clone();
     match added.first_sync {
         Ok(report) => println!("First sync: {}.", describe_report(report)),
         Err(error) => eprintln!("The first sync failed: {error}. Run `tersa sync` to retry."),
+    }
+    if followup {
+        match executor()?.block_on(history::cycle(&runtime, &account)) {
+            Ok(notice) => println!("{notice}"),
+            Err(notice) => eprintln!(
+                "Grant remains saved. {notice} Use `tersa sync {}` to resume mail work.",
+                SafeText::single_line(account.as_str())
+            ),
+        }
     }
     Ok(())
 }
@@ -305,16 +298,33 @@ pub fn account_list(context: &Context) -> Result<(), String> {
     if accounts.is_empty() {
         println!("No accounts yet. Run `tersa account add`.");
     }
+    let runtime = Runtime::local(std::sync::Arc::clone(&locked.installation));
+    let executor = executor()?;
     for account in accounts {
-        match locked
-            .installation
-            .account_email(&account)
-            .ok()
-            .flatten()
-            .map(|email| SafeText::single_line(email.as_str()))
-        {
-            Some(email) => println!("{}  {}", email.as_str(), account.as_str()),
-            None => println!("{}", account.as_str()),
+        match executor.block_on(runtime.account_metadata(&account)) {
+            Ok(metadata) => {
+                let doc = tersa_presentation::triage::render_account(
+                    tersa_presentation::triage::AccountInput {
+                        name: metadata
+                            .email()
+                            .map_or(account.as_str(), |email| email.as_str()),
+                        identifier: account.as_str(),
+                        capability: if metadata.capability()
+                            == tersa_application::AccountCapability::Modify
+                        {
+                            tersa_presentation::triage::Capability::Modify
+                        } else {
+                            tersa_presentation::triage::Capability::ReadOnly
+                        },
+                        authority: tersa_presentation::triage::Authority::Unavailable,
+                    },
+                );
+                println!("{}  {}  {}", doc.name, doc.identifier, doc.capability);
+            }
+            Err(_) => println!(
+                "{}  cached account unavailable",
+                tersa_presentation::triage::render_identifier(account.as_str())
+            ),
         }
     }
     Ok(())
@@ -353,8 +363,8 @@ pub fn sync(context: &Context, raw: Option<&str>) -> Result<(), String> {
     let executor = executor()?;
     let mut failures = 0_usize;
     for account in &accounts {
-        match executor.block_on(runtime.sync_account(account)) {
-            Ok(report) => println!("{}: {}", account.as_str(), describe_report(report)),
+        match executor.block_on(history::cycle(&runtime, account)) {
+            Ok(report) => println!("{}: {}", SafeText::single_line(account.as_str()), report),
             Err(error) => {
                 failures += 1;
                 eprintln!("{}: {error}", account.as_str());
@@ -445,31 +455,37 @@ pub fn tui(context: &Context) -> Result<(), String> {
     if accounts.is_empty() {
         return Err(NO_ACCOUNTS.to_owned());
     }
-    let source = StoreSource::open(accounts, executor()?, |account| {
-        installation.open_store_for_display(account)
-    });
-    // Network work needs the OAuth client; without it the interface still
-    // reads the cache.
-    let remotes = match runtime(context, Arc::clone(&locked.installation)) {
-        Ok(runtime) => {
-            let runtime = Arc::new(runtime);
-            source
-                .stores
-                .iter()
-                .filter(|(_, store)| store.is_some())
-                .map(|(account, _)| {
-                    (
-                        account.clone(),
-                        Box::new(Network {
-                            runtime: Arc::clone(&runtime),
-                        }) as Box<dyn crate::tui::Remote>,
-                    )
-                })
-                .collect()
-        }
-        Err(_) => Vec::new(), // Offline cache reads remain available.
-    };
+    let (source, remotes) = tui_components(context, installation)?;
     crate::tui::run(&source, remotes)
+}
+
+/// One production composition root, shared by cached views and every account worker.
+type TuiComponents = (
+    cached::RuntimeSource,
+    Vec<(AccountId, Box<dyn crate::tui::Remote>)>,
+);
+pub(crate) fn tui_components(
+    context: &Context,
+    installation: Arc<Installation>,
+) -> Result<TuiComponents, String> {
+    let accounts = installation.accounts().map_err(|error| error.to_string())?;
+    let shared = Arc::new(
+        runtime(context, Arc::clone(&installation))
+            .unwrap_or_else(|_error| Runtime::local(installation)),
+    );
+    let source = cached::RuntimeSource::new(Arc::clone(&shared), executor()?);
+    let remotes = accounts
+        .into_iter()
+        .map(|account| {
+            (
+                account,
+                Box::new(Network {
+                    runtime: Arc::clone(&shared),
+                }) as Box<dyn crate::tui::Remote>,
+            )
+        })
+        .collect();
+    Ok((source, remotes))
 }
 
 /// Account-specific downloads and syncs through the existing identity gate.
@@ -493,15 +509,25 @@ impl crate::tui::Remote for Network {
 
     fn sync<'a>(&'a self, account: &'a AccountId) -> crate::tui::Pending<'a, ()> {
         Box::pin(async move {
-            self.runtime
-                .sync_account(account)
+            history::cycle(&self.runtime, account)
                 .await
-                .map(|_report| ())
-                .map_err(|error| match error {
-                    FlowError::Sync(error) => error.reason().to_owned(),
-                    other => other.to_string(),
+                .and_then(|report| {
+                    if report.complete {
+                        Ok(())
+                    } else {
+                        Err(report.notice)
+                    }
                 })
+                .map_err(|error| error.to_string())
         })
+    }
+    fn control<'a>(
+        &'a self,
+        account: &'a AccountId,
+        job: crate::tui::control::ControlJob,
+        progress: &'a crate::tui::control::ProgressSink,
+    ) -> crate::tui::Pending<'a, crate::tui::control::ControlResult> {
+        Box::pin(control::run(&self.runtime, account, job, progress))
     }
 }
 
@@ -611,10 +637,17 @@ impl crate::tui::MailSource for StoreSource {
     fn page(
         &self,
         scope: &crate::tui::ViewScope,
-        continuation: Option<&UnifiedMailboxContinuation>,
+        continuation: Option<&crate::tui::MailContinuation>,
         limit: u16,
     ) -> Result<crate::tui::MailPage, ()> {
-        self.document(scope, continuation, limit).map(Into::into)
+        self.document(
+            scope,
+            continuation
+                .map(crate::tui::MailContinuation::legacy)
+                .transpose()?,
+            limit,
+        )
+        .map(Into::into)
     }
 
     fn message(&self, account: &AccountId, id: &MessageId) -> Result<Option<Vec<u8>>, ()> {
@@ -641,6 +674,22 @@ impl crate::tui::MailSource for StoreSource {
                 (account.clone(), label)
             })
             .collect()
+    }
+    fn set_filter(&self, filter: &tersa_sync_runtime::CachedMailboxFilter) -> Result<(), ()> {
+        if *filter == tersa_sync_runtime::CachedMailboxFilter::Recent {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+    fn account_state(&self, _: &AccountId) -> Result<tersa_sync_runtime::AccountCommandStatus, ()> {
+        Err(())
+    }
+    fn label_catalog(
+        &self,
+        _: &AccountId,
+    ) -> Result<Option<tersa_application::mailbox_state::LabelCatalog>, ()> {
+        Err(())
     }
 }
 

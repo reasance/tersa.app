@@ -4,9 +4,10 @@
 
 //! Interface state and key handling, free of terminal I/O so it can be tested.
 
+use super::MailContinuation;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tersa_application::mailbox::{AccountId, MessageEnvelope, MessageId};
-use tersa_application::unified_mailbox::{UnavailableAccount, UnifiedMailboxContinuation};
+use tersa_application::unified_mailbox::UnavailableAccount;
 use tersa_presentation::html::decode_entities;
 use tersa_presentation::message::{BodyFormat, BodyPreference, RenderedMessage, render_message};
 use tersa_presentation::terminal::SafeText;
@@ -28,6 +29,10 @@ pub struct Row {
     pub preview: SafeText,
     pub received_at_millis: i64,
     pub unread: bool,
+    /// Sanitized observed/pending T4 facts; raw action keys remain account/id above.
+    pub triage: Option<tersa_presentation::triage::MessageStateDocument>,
+    pub capability: Option<tersa_application::AccountCapability>,
+    pub observed: Option<tersa_store_sqlcipher::CachedProviderState>,
     /// The lowercased text a search looks through: the full sender, the
     /// subject, and the preview.
     haystack: String,
@@ -78,6 +83,9 @@ impl Row {
             preview,
             received_at_millis,
             unread,
+            triage: None,
+            capability: None,
+            observed: None,
             haystack,
         }
     }
@@ -262,6 +270,12 @@ pub enum Request {
     Sync,
     /// Start a fresh inbox for this explicit view.
     ChangeScope(ViewScope),
+    /// Mechanical observed-filter routing; P9b owns user menu bindings.
+    #[expect(
+        dead_code,
+        reason = "P9b adds filter menu bindings; this slice implements actual filter routing"
+    )]
+    ChangeFilter(tersa_sync_runtime::CachedMailboxFilter),
 }
 
 /// The whole interface state.
@@ -272,12 +286,14 @@ pub struct App {
     /// stored Gmail address or its id.
     pub accounts: Vec<(AccountId, SafeText)>,
     pub scope: ViewScope,
+    pub filter: tersa_sync_runtime::CachedMailboxFilter,
+    pub control_results: std::collections::HashMap<AccountId, super::control::ControlEvent>,
     /// Changes only on a real view change, fencing old download completions.
     pub view_epoch: u64,
     /// Explicit query availability, retained independently of transient status.
     pub unavailable_accounts: Vec<UnavailableAccount>,
     /// Opaque application progress; never reconstructed from display rows.
-    pub continuation: Option<UnifiedMailboxContinuation>,
+    pub continuation: Option<MailContinuation>,
     /// Every loaded row, newest first.
     pub rows: Vec<Row>,
     /// Indexes into `rows` of the rows the list shows, in order.
@@ -336,6 +352,8 @@ impl App {
         Self {
             accounts,
             scope: ViewScope::All,
+            filter: tersa_sync_runtime::CachedMailboxFilter::Recent,
+            control_results: std::collections::HashMap::new(),
             view_epoch: 0,
             unavailable_accounts: Vec::new(),
             continuation: None,
@@ -428,8 +446,39 @@ impl App {
         {
             return Ok(false);
         }
-        let epoch = self.view_epoch.checked_add(1).ok_or(())?;
+        self.view_epoch.checked_add(1).ok_or(())?;
+        if let tersa_sync_runtime::CachedMailboxFilter::UserLabel(label) = &self.filter
+            && !scope.contains(label.account_id())
+        {
+            self.filter = tersa_sync_runtime::CachedMailboxFilter::Recent;
+        }
         self.scope = scope;
+        self.reset_view()?;
+        Ok(true)
+    }
+
+    pub fn set_filter(
+        &mut self,
+        filter: tersa_sync_runtime::CachedMailboxFilter,
+    ) -> Result<bool, ()> {
+        if filter == self.filter || self.search.editing {
+            return Ok(false);
+        }
+        if let tersa_sync_runtime::CachedMailboxFilter::UserLabel(label) = &filter
+            && (!self
+                .accounts
+                .iter()
+                .any(|(account, _)| account == label.account_id())
+                || !self.scope.contains(label.account_id()))
+        {
+            return Err(());
+        }
+        self.reset_view()?;
+        self.filter = filter;
+        Ok(true)
+    }
+    fn reset_view(&mut self) -> Result<(), ()> {
+        let epoch = self.view_epoch.checked_add(1).ok_or(())?;
         self.view_epoch = epoch;
         self.rows.clear();
         self.shown.clear();
@@ -447,7 +496,7 @@ impl App {
         self.status = None;
         self.help = false;
         self.repaint = true;
-        Ok(true)
+        Ok(())
     }
 
     fn cycle_scope(&self, backwards: bool) -> Option<ViewScope> {

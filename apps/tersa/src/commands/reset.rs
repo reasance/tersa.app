@@ -18,7 +18,11 @@ use super::{Context, Locked, executor, open_vault, unlock_with_passphrase};
 const CONFIRMATION_LIMIT: u64 = 256;
 
 enum Completion {
-    Resynced { messages: u16, bodies: u16 },
+    Resynced {
+        messages: u16,
+        bodies: u16,
+        history: Option<SafeText>,
+    },
     ResyncFailed(SafeText),
 }
 
@@ -119,7 +123,10 @@ fn validate_request(raw: &str, yes: bool, interactive: bool) -> Result<(), Strin
     Ok(())
 }
 
-fn resolve_existing(installation: &Installation, raw: &str) -> Result<AccountId, String> {
+pub(super) fn resolve_existing(
+    installation: &Installation,
+    raw: &str,
+) -> Result<AccountId, String> {
     let accounts = installation.accounts().map_err(|error| error.to_string())?;
     resolve_with(&accounts, raw, |account| {
         installation
@@ -205,10 +212,16 @@ fn execute_reset(
         .block_on(runtime.reset_cache(account))
         .map_err(|error| error.to_string())?;
     Ok(match outcome {
-        CacheResetOutcome::Resynced(report) => Completion::Resynced {
-            messages: report.progress().envelopes,
-            bodies: report.progress().bodies_cached,
-        },
+        CacheResetOutcome::Resynced(report) => {
+            match executor()?.block_on(super::history::cycle(&runtime, account)) {
+                Ok(notice) => Completion::Resynced {
+                    messages: report.progress().envelopes,
+                    bodies: report.progress().bodies_cached,
+                    history: Some(notice.notice),
+                },
+                Err(notice) => Completion::ResyncFailed(notice),
+            }
+        }
         CacheResetOutcome::ResyncFailed(error) => {
             Completion::ResyncFailed(SafeText::single_line(&error.to_string()))
         }
@@ -222,13 +235,23 @@ fn finish(
 ) -> Result<(), String> {
     let id = SafeText::single_line(account.as_str());
     match result {
-        Err(error) => Err(format!("Cache reset refused before clearing local mail: {}", SafeText::single_line(&error))),
-        Ok(Completion::Resynced { messages, bodies }) => {
+        Err(error) => Err(format!(
+            "Cache reset refused before clearing local mail: {}",
+            SafeText::single_line(&error)
+        )),
+        Ok(Completion::Resynced {
+            messages,
+            bodies,
+            history,
+        }) => {
+            if let Some(history) = history {
+                return writeln!(output, "Cache clear committed for {id}. Compatibility snapshot: {messages} messages, {bodies} bodies cached. {history}").map_err(|_error| "cache clear committed, but History follow-up status could not be displayed".to_owned());
+            }
             writeln!(output, "Cleared local cache for {id}. Recent-mail sync completed: {messages} messages, {bodies} bodies cached (normal bounded limit). The account remains registered.")
                 .map_err(|_error| "local cache clear and sync completed, but the result could not be written".to_owned())
         }
         Ok(Completion::ResyncFailed(error)) => Err(format!(
-            "Local cache clear committed for {id}, but sync failed: {error}. Partial new cache data may exist; the account remains registered. Run `tersa sync {id}` to retry. If sign-in is required, run `tersa account add`."
+            "Local cache clear committed for {id}, but sync failed: {error}. Partial new cache data may exist; the account remains registered. Run `tersa sync {id}` to retry. If sign-in is required, run `tersa account reconnect {id}`."
         )),
     }
 }

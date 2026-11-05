@@ -6,11 +6,14 @@
 
 #![forbid(unsafe_code)]
 
+mod browser;
 mod cli;
 mod commands;
 mod config;
 mod dates;
 mod prompt;
+#[cfg(test)]
+mod test_support;
 mod tui;
 
 use std::process::ExitCode;
@@ -56,6 +59,8 @@ fn run(command: Command) -> Result<(), String> {
         Command::Tui => commands::tui(&context),
         Command::AccountAdd => commands::account_add(&context),
         Command::AccountList => commands::account_list(&context),
+        Command::AccountUpgrade(account) => commands::account_upgrade(&context, &account),
+        Command::AccountReconnect(account) => commands::account_reconnect(&context, &account),
         Command::AccountRemove(account) => commands::account_remove(&context, &account),
         Command::AccountReset { account, yes } => commands::account_reset(&context, &account, yes),
         Command::Sync(account) => commands::sync(&context, account.as_deref()),

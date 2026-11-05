@@ -20,7 +20,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tersa_application::mailbox::AccountId;
 use tersa_application::unified_mailbox::MAX_ACCOUNTS;
 
+use super::control::{Binding, ControlEvent, ControlJob, MAX_CONTROLS, Progress, ProgressSink};
 use super::{MessageKey, Remote, SYNC_EVERY};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 
 /// Allows a short burst of navigation while bounding queued jobs and results.
 const MAX_FETCHES: usize = 8;
@@ -37,6 +42,7 @@ pub(super) enum Done {
     Fetched(MessageKey, Result<Vec<u8>, String>, u64),
     Skipped(MessageKey, u64),
     Synced(AccountId, Result<(), String>),
+    Control(ControlEvent),
 }
 
 pub(super) struct Workers {
@@ -67,6 +73,22 @@ impl Workers {
             joined &= worker.join_until(deadline);
         }
         joined
+    }
+
+    pub fn stop_all(&mut self) {
+        for worker in &mut self.accounts {
+            worker.stop();
+        }
+    }
+    pub fn interruption_notice(&self) -> Option<tersa_presentation::terminal::SafeText> {
+        let parts: Vec<_> = self.accounts.iter().filter_map(|worker| {
+            let first = worker.interrupted_controls.first()?;
+            let waiting = worker.interrupted_controls.iter().filter(|entry| entry.phase==InterruptedPhase::NotStarted).count();
+            let durable = worker.interrupted_controls.iter().filter(|entry| entry.phase==InterruptedPhase::DurableReceiptObserved).count();
+            Some(format!("Account {}: {waiting} submitted control requests never started; {durable} had consumed durable receipts; other unfinished outcomes require account-status reload.", tersa_presentation::triage::render_identifier(first.binding.account.as_str())))
+        }).collect();
+        (!parts.is_empty())
+            .then(|| tersa_presentation::terminal::SafeText::single_line(&parts.join(" ")))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -111,6 +133,24 @@ impl Drop for Workers {
     }
 }
 
+struct ControlRequest {
+    binding: Binding,
+    job: ControlJob,
+}
+
+/// Shutdown disposition is conservative; no missing result is called a cancellation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterruptedPhase {
+    NotStarted,
+    OutcomeUnknown,
+    DurableReceiptObserved,
+}
+#[derive(Clone, Debug)]
+pub struct InterruptedControl {
+    pub binding: Binding,
+    pub phase: InterruptedPhase,
+}
+
 pub(super) struct Worker {
     pub account: AccountId,
     jobs: tokio::sync::mpsc::UnboundedSender<Job>,
@@ -119,6 +159,12 @@ pub(super) struct Worker {
     open: tokio::sync::watch::Sender<Option<MessageKey>>,
     view: tokio::sync::watch::Sender<u64>,
     pub syncing: bool,
+    controls: tokio::sync::mpsc::UnboundedSender<ControlRequest>,
+    pending_controls: HashMap<u64, (u64, bool)>,
+    next_control: u64,
+    stopping_controls: Arc<AtomicBool>,
+    started_control: Arc<AtomicU64>,
+    pub interrupted_controls: Vec<InterruptedControl>,
     /// Starts, not repeated/coalesced requests, advance the five-minute clock.
     last_sync: Option<(Instant, SystemTime)>,
     pub dead: bool,
@@ -131,6 +177,11 @@ impl Worker {
     pub fn start(account: AccountId, remote: Box<dyn Remote>) -> Result<Self, String> {
         let (jobs, mut incoming) = tokio::sync::mpsc::unbounded_channel::<Job>();
         let (outgoing, done) = mpsc::channel();
+        let (controls, control_jobs) = tokio::sync::mpsc::unbounded_channel::<ControlRequest>();
+        let stopping_controls = Arc::new(AtomicBool::new(false));
+        let thread_stopping = Arc::clone(&stopping_controls);
+        let started_control = Arc::new(AtomicU64::new(0));
+        let thread_started = Arc::clone(&started_control);
         let (open, wanted) = tokio::sync::watch::channel(None::<MessageKey>);
         let (views, view) = tokio::sync::watch::channel(0_u64);
         let (shutdown, mut stopping) = tokio::sync::watch::channel(false);
@@ -152,6 +203,20 @@ impl Worker {
                 let remote: Rc<dyn Remote> = Rc::from(remote);
                 let tasks = tokio::task::LocalSet::new();
                 tasks.block_on(&executor, async move {
+                    // Exactly one consumer awaits a complete control request at a
+                    // time. Admission order follows UI channel order, independent
+                    // of spawn_local/future poll ordering or Runtime permit FIFO.
+                    let control_remote = Rc::clone(&remote);
+                    let control_outgoing = outgoing.clone();
+                    let control_stopping = stopping.clone();
+                    tokio::task::spawn_local(control_loop(
+                        control_remote,
+                        control_jobs,
+                        control_outgoing,
+                        control_stopping,
+                        thread_stopping,
+                        thread_started,
+                    ));
                     loop {
                         let job = match first(until_stopped(&mut stopping), incoming.recv()).await {
                             First::Left(()) | First::Right(None) => break,
@@ -191,6 +256,12 @@ impl Worker {
             view: views,
             syncing: false,
             last_sync: None,
+            controls,
+            pending_controls: HashMap::new(),
+            next_control: 1,
+            stopping_controls,
+            started_control,
+            interrupted_controls: Vec::new(),
             dead: false,
             shutdown,
             stopped,
@@ -239,6 +310,56 @@ impl Worker {
         true
     }
 
+    /// Admission bounds include completed events until `finish_control` consumes them.
+    pub fn control(&mut self, job: ControlJob, epoch: u64) -> Option<Binding> {
+        if self.dead || self.pending_controls.len() >= MAX_CONTROLS {
+            return None;
+        }
+        let request = self.next_control;
+        let next = request.checked_add(1)?;
+        let binding = Binding {
+            account: self.account.clone(),
+            request,
+            epoch,
+        };
+        self.pending_controls.insert(request, (epoch, false));
+        if self
+            .controls
+            .send(ControlRequest {
+                binding: binding.clone(),
+                job,
+            })
+            .is_err()
+        {
+            self.pending_controls.remove(&request);
+            return None;
+        }
+        self.next_control = next;
+        Some(binding)
+    }
+
+    /// Rejects foreign/stale results and releases admission only on final consumption.
+    pub fn finish_control(&mut self, event: &ControlEvent) -> bool {
+        let binding = event.binding();
+        if binding.account != self.account || !event.valid_owner() {
+            return false;
+        }
+        let Some((epoch, durable)) = self.pending_controls.get_mut(&binding.request) else {
+            return false;
+        };
+        if *epoch != binding.epoch {
+            return false;
+        }
+        match event {
+            ControlEvent::Progress(_, Progress::Durable(_)) => *durable = true,
+            ControlEvent::Progress(_, Progress::AuthorizationLink(_)) => {}
+            ControlEvent::Finished(_, _) => {
+                self.pending_controls.remove(&binding.request);
+            }
+        }
+        true
+    }
+
     pub fn sync_at(&mut self, monotonic: Instant, wall: SystemTime) -> bool {
         if self.dead {
             return false;
@@ -276,7 +397,32 @@ impl Worker {
 
     fn stop(&mut self) {
         self.dead = true;
+        if !self.stopping_controls.swap(true, Ordering::SeqCst) {
+            let started = self.started_control.load(Ordering::SeqCst);
+            self.interrupted_controls = self
+                .pending_controls
+                .iter()
+                .map(|(&request, &(epoch, durable))| InterruptedControl {
+                    binding: Binding {
+                        account: self.account.clone(),
+                        request,
+                        epoch,
+                    },
+                    phase: if durable {
+                        InterruptedPhase::DurableReceiptObserved
+                    } else if request > started {
+                        InterruptedPhase::NotStarted
+                    } else {
+                        InterruptedPhase::OutcomeUnknown
+                    },
+                })
+                .collect();
+            self.interrupted_controls
+                .sort_by_key(|entry| entry.binding.request);
+        }
         self.shutdown.send_replace(true);
+        let (closed_controls, _) = tokio::sync::mpsc::unbounded_channel();
+        drop(std::mem::replace(&mut self.controls, closed_controls));
         let (closed, _) = tokio::sync::mpsc::unbounded_channel();
         drop(std::mem::replace(&mut self.jobs, closed));
     }
@@ -343,6 +489,12 @@ impl Worker {
             open: tokio::sync::watch::channel(None).0,
             view: tokio::sync::watch::channel(0).0,
             last_sync: None,
+            controls: tokio::sync::mpsc::unbounded_channel().0,
+            pending_controls: HashMap::new(),
+            next_control: 1,
+            stopping_controls: Arc::new(AtomicBool::new(false)),
+            started_control: Arc::new(AtomicU64::new(0)),
+            interrupted_controls: Vec::new(),
             dead: false,
             shutdown: tokio::sync::watch::channel(false).0,
             stopped: mpsc::channel().1,
@@ -364,6 +516,40 @@ fn shutdown_deadline() -> Instant {
         return deadline;
     }
     Instant::now() + SHUTDOWN_WAIT
+}
+
+async fn control_loop(
+    remote: Rc<dyn Remote>,
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<ControlRequest>,
+    outgoing: mpsc::Sender<Done>,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
+    stop_flag: Arc<AtomicBool>,
+    started: Arc<AtomicU64>,
+) {
+    loop {
+        let request = match first(until_stopped(&mut stopping), requests.recv()).await {
+            First::Left(()) | First::Right(None) => break,
+            First::Right(Some(request)) => request,
+        };
+        if stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        started.store(request.binding.request, Ordering::SeqCst);
+        let progress = ProgressSink {
+            binding: request.binding.clone(),
+            outgoing: outgoing.clone(),
+            stopping: Arc::clone(&stop_flag),
+            emitted: Arc::new(AtomicUsize::new(0)),
+        };
+        let result = remote
+            .control(&request.binding.account, request.job, &progress)
+            .await
+            .map_err(|error| tersa_presentation::terminal::SafeText::single_line(&error));
+        let _ = outgoing.send(Done::Control(ControlEvent::Finished(
+            request.binding,
+            result.map(Box::new),
+        )));
+    }
 }
 
 async fn until_stopped(stopping: &mut tokio::sync::watch::Receiver<bool>) {
@@ -432,8 +618,8 @@ async fn first<A: Future, B: Future>(left: A, right: B) -> First<A::Output, B::O
 mod tests {
     use super::*;
     use crate::tui::Pending;
+    use std::sync::Mutex;
     use std::sync::mpsc::Sender;
-    use std::sync::{Arc, Mutex};
     use tersa_application::mailbox::MessageId;
     /// Records the order work finishes in; syncs wait for the test.
     struct Recorder {
@@ -459,6 +645,21 @@ mod tests {
                 }
                 let _ = self.log.send("sync".to_owned());
                 Err("offline".to_owned())
+            })
+        }
+        fn control<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            job: crate::tui::control::ControlJob,
+            _progress: &'a crate::tui::control::ProgressSink,
+        ) -> crate::tui::Pending<'a, crate::tui::control::ControlResult> {
+            Box::pin(async move {
+                match job {
+                    crate::tui::control::ControlJob::Status => {
+                        Err("status not provided by fetch/sync fixture".to_owned())
+                    }
+                    _ => panic!("unexpected control work in fetch/sync fixture"),
+                }
             })
         }
     }
@@ -593,6 +794,21 @@ mod tests {
 
         fn sync<'a>(&'a self, _account: &'a AccountId) -> Pending<'a, ()> {
             Box::pin(async { Ok(()) })
+        }
+        fn control<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            job: crate::tui::control::ControlJob,
+            _progress: &'a crate::tui::control::ProgressSink,
+        ) -> crate::tui::Pending<'a, crate::tui::control::ControlResult> {
+            Box::pin(async move {
+                match job {
+                    crate::tui::control::ControlJob::Status => {
+                        Err("status not provided by fetch/sync fixture".to_owned())
+                    }
+                    _ => panic!("unexpected control work in fetch/sync fixture"),
+                }
+            })
         }
     }
 
@@ -854,6 +1070,21 @@ mod tests {
                     Some(Gate::Store(gate)) => gate.recv_timeout(TEST_WAIT).expect("store gate"),
                     Some(Gate::Ready(result)) => result,
                     None => Ok(()),
+                }
+            })
+        }
+        fn control<'a>(
+            &'a self,
+            _account: &'a AccountId,
+            job: crate::tui::control::ControlJob,
+            _progress: &'a crate::tui::control::ProgressSink,
+        ) -> crate::tui::Pending<'a, crate::tui::control::ControlResult> {
+            Box::pin(async move {
+                match job {
+                    crate::tui::control::ControlJob::Status => {
+                        Err("status not provided by fetch/sync fixture".to_owned())
+                    }
+                    _ => panic!("unexpected control work in fetch/sync fixture"),
                 }
             })
         }
@@ -1179,6 +1410,21 @@ mod tests {
                     });
                     let _ = lookup.await;
                     Ok(())
+                })
+            }
+            fn control<'a>(
+                &'a self,
+                _account: &'a AccountId,
+                job: crate::tui::control::ControlJob,
+                _progress: &'a crate::tui::control::ProgressSink,
+            ) -> crate::tui::Pending<'a, crate::tui::control::ControlResult> {
+                Box::pin(async move {
+                    match job {
+                        crate::tui::control::ControlJob::Status => {
+                            Err("status not provided by fetch/sync fixture".to_owned())
+                        }
+                        _ => panic!("unexpected control work in fetch/sync fixture"),
+                    }
                 })
             }
         }
