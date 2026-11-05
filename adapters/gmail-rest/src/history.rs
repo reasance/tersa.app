@@ -39,9 +39,10 @@ use tersa_domain::{
     label::{LabelCatalog, LabelDefinition, LabelId, LabelKind, LabelMembership, LabelName},
 };
 
+type ProfileBaseline = Object<ProfileBaselineFields>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProfileBaseline {
+struct ProfileBaselineFields {
     history_id: String,
 }
 
@@ -118,7 +119,7 @@ impl GmailHistoryFeed for GmailMailbox {
     ) -> BoxFuture<'a, Result<CapturedBaseline, MetadataReadError>> {
         Box::pin(async move {
             self.checked_account(account).map_err(map_read)?;
-            let profile: ProfileBaseline = self
+            let Object(profile): ProfileBaseline = self
                 .request_json(
                     read_request(&["profile"], &[("fields", "historyId".to_owned())])?,
                     JSON_LIMIT,
@@ -144,7 +145,7 @@ impl GmailHistoryFeed for GmailMailbox {
                 .map_err(map_read)?;
             let size = PageSize::new(u16::try_from(SNAPSHOT_PAGE_SIZE).map_err(|_e| invalid())?)
                 .map_err(|_e| invalid())?;
-            let list: SnapshotList = self
+            let Object(list): SnapshotList = self
                 .request_json(list_request(size, token).map_err(map_read)?, JSON_LIMIT)
                 .await
                 .map_err(map_read)?;
@@ -156,7 +157,7 @@ impl GmailHistoryFeed for GmailMailbox {
             let mut seen = BTreeSet::new();
             // Validate the complete list before hydration; omission is never
             // used as target-absence proof for pending commands.
-            for item in list.messages {
+            for Object(item) in list.messages {
                 let id = MessageId::new(item.id).map_err(|_e| invalid())?;
                 let thread = ThreadId::new(item.thread_id).map_err(|_e| invalid())?;
                 if !seen.insert(id.as_str().to_owned()) {
@@ -202,7 +203,8 @@ impl GmailHistoryFeed for GmailMailbox {
                 }
                 Err(error) => return Err(map_read(error)),
             };
-            let message: MinimalMessage = serde_json::from_slice(&body).map_err(|_e| invalid())?;
+            let Object(message): MinimalMessage =
+                serde_json::from_slice(&body).map_err(|_e| invalid())?;
             if message.id != key.message_id().as_str() {
                 return Err(invalid());
             }
@@ -231,7 +233,7 @@ impl GmailHistoryFeed for GmailMailbox {
                 Err(error) => return Err(map_read(error)),
             };
             let message: GmailMetadata = serde_json::from_slice(&body).map_err(|_e| invalid())?;
-            let membership = complete_membership(key.account_id(), message.label_ids.clone())?;
+            let membership = complete_membership(key.account_id(), message.0.label_ids.clone())?;
             let envelope = envelope_from(message, key.message_id()).map_err(map_read)?;
             MessageMetadata::new(key.clone(), envelope, membership)
                 .map(MetadataObservation::Known)
@@ -240,9 +242,10 @@ impl GmailHistoryFeed for GmailMailbox {
     }
 }
 
+type SnapshotList = Object<SnapshotListFields>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SnapshotList {
+struct SnapshotListFields {
     #[serde(default)]
     messages: Vec<super::ListedMessage>,
     #[serde(default, deserialize_with = "present_string")]
@@ -254,9 +257,10 @@ fn present_string<'de, D: serde::Deserializer<'de>>(
     String::deserialize(deserializer).map(Some)
 }
 
+type MinimalMessage = Object<MinimalMessageFields>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MinimalMessage {
+struct MinimalMessageFields {
     id: String,
     // This is a fixed exact messages.get requesting labelIds. ProtoJSON omits
     // empty repeated fields; missing means the observed empty set here only.
@@ -364,18 +368,20 @@ pub(super) async fn read_label_definition(
     }
     Ok(Some(definition))
 }
+type HistoryDocument = Object<HistoryDocumentFields>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct HistoryDocument {
+struct HistoryDocumentFields {
     history_id: String,
     #[serde(default)]
     history: Vec<RecordDocument>,
     #[serde(default, deserialize_with = "present_value")]
     next_page_token: Option<Value>,
 }
+type RecordDocument = Object<RecordDocumentFields>;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RecordDocument {
+struct RecordDocumentFields {
     id: String,
     #[serde(default, deserialize_with = "present_value")]
     messages: Option<Value>,
@@ -403,7 +409,8 @@ fn decode_history(body: &[u8], query: &HistoryQuery) -> Result<HistoryPage, Hist
     // Reject duplicate JSON keys instead of letting a generic Value silently
     // choose one message/cursor identity. The raw document is capped at 2 MiB.
     let strict: StrictValue = serde_json::from_slice(body).map_err(|_e| history_invalid())?;
-    let page: HistoryDocument = serde_json::from_value(strict.0).map_err(|_e| history_invalid())?;
+    let Object(page): HistoryDocument =
+        serde_json::from_value(strict.0).map_err(|_e| history_invalid())?;
     if page.history.len() > MAX_HISTORY_RECORDS {
         return Err(history_invalid());
     }
@@ -421,7 +428,7 @@ fn decode_history(body: &[u8], query: &HistoryQuery) -> Result<HistoryPage, Hist
     }
     // Validate ALL record IDs/order, including those beyond a local prefix.
     for raw in &page.history {
-        let id = HistoryCursor::new(raw.id.as_str()).map_err(|_e| history_invalid())?;
+        let id = HistoryCursor::new(raw.0.id.as_str()).map_err(|_e| history_invalid())?;
         if &id <= previous || id > head {
             return Err(history_invalid());
         }
@@ -464,6 +471,7 @@ fn decode_record(
     raw: RecordDocument,
     remaining: usize,
 ) -> Result<HistoryRecord, LocalHistoryStop> {
+    let Object(raw) = raw;
     let bad = LocalHistoryStop::RecoveryRequired;
     let arrays = [
         raw.messages,
