@@ -173,3 +173,106 @@ binding/capability/credential/identity/disconnect recovery. Purge clears the gra
 and resets capability/purpose with the existing subject/identity teardown. Legacy
 reset/prune rollback tests remain intact. No T4 runtime, History transaction,
 queue method, provider call, retention algorithm or live acceptance is claimed.
+
+## P5b History and cached-read implementation
+
+P5b implements `HistoryCursorStore` on `SqlCipherMailboxStore` using the fixed
+v3 layout. No canonical SQL, version, migration, registry or credential behavior
+changes. P5c command admission/transitions/settlement/retention and P7 runtime
+activation remain pending. Directly seeded command rows in P5b fixtures prove
+History retention/relationship behavior, not successful P5c admission.
+
+Each write takes one immediate transaction, checks existing ownership and actual
+algorithm-2 identity against `AccountFence`, compares the expected cursor, then
+commits every decision plus exactly the record ID, or all snapshot metadata plus
+the retained captured baseline. A later failed record preserves the prior
+committed prefix. The terminal-head method accepts the approved
+`TerminalHistoryCheckpoint` document and requires its final-record predecessor
+already durable; a stale or skipped predecessor cannot advance it. These methods
+do not reinterpret provider events, synthesize continuation/checkpoint values,
+require Modify capability or load a usable credential. Runtime still owns
+provider authorization, provenance, complete-chain acquisition, account-operation
+serialization and recovery policy. No network work occurs in these transactions.
+
+`classify_record` reads bounded cache/pin presence without bodies. Application
+classification is planning evidence: `apply_record` rechecks each Irrelevant key
+against actual cache/pins under the writer lock. Newly pinned/cached targets
+reject the whole record, including earlier attempted writes. An exact accessed
+provider parent/child inconsistency also fails instead of becoming Unknown.
+Metadata-only updates preserve existing bodies and sticky `messages.unread`.
+Complete provider membership remains independent of that local-read display.
+
+New metadata competes with retained metadata for the first 100 messages ordered
+by `received_at DESC, message_id ASC`; all pending and undo targets remain pinned
+in addition to those recent survivors. Snapshot omission does not delete pinned
+metadata, synthesize Missing, or settle command items. An exact observed Missing
+may delete the cached envelope/body, but command/item/touched/undo evidence is
+untouched. Missing observations persist for pinned targets. Once a target has
+neither a cached envelope nor a pin, its observations are discarded and reads
+return Unknown; there is no unbounded outside-cache missing/tombstone log.
+Snapshot metadata joins the same deterministic recent competition, rather than
+interpreting omitted list entries as exact-key deletions.
+
+Pin derivation validates at most 33 command bodies, one undo slot, 5,096 target
+references and 10,192 touched-field rows, using one extra rejection sentinel at
+each bound. It checks command IDs/status/kind/revision/attempt/FIFO shape,
+label-intent shape, each target's owning aggregate, nonempty message-command
+coverage, per-command and account target bounds, undo's Complete message-command
+ancestry, and each touched-state footprint/required retained pre/post state.
+Orphan item/field/undo relationships are errors; no inner join silently drops
+those references. This does not walk per-item reconciliation membership (which
+P5c must validate when consuming it), implement queue transitions or inspect
+terminal summary payloads. New History pruning reads only bounded envelope
+identity/time and provider-parent identities, with at most 6,196 transient rows:
+4,096 pending references + 1,000 undo targets + 100 recent + 1,000 new record
+candidates. An over-bound or malformed accessed row fails and rolls back, rather
+than silently truncating. Exact provider membership is validated before replacing
+or discarding an accessed observation. Legacy reset/purge/identity-clear and
+legacy reconcile/prune keep their P5a conservative refusals; only the new History
+path performs pin-aware pruning.
+
+`cached_provider_state` and `cached_provider_states` read one exact key or at
+most 200 unique requested IDs, retaining request order and explicit account/key
+pairing. They distinguish Unknown, observed Missing and Known (including empty).
+Each exact membership query admits at most 512 labels plus one rejection row,
+checks type/byte length before Rust allocation, validates label IDs and checks
+children even when the parent is absent. It never loads bodies or performs a
+global membership scan. Unrelated membership is not read as a side effect.
+`cached_label_catalog` distinguishes Unknown from complete empty, and rejects
+overflow/malformed definitions or catalog rows under an unknown marker. Catalog
+replacement compares actual identity and atomically replaces a complete typed
+catalog of at most 500 labels, leaving message membership untouched. Names retain
+exact UTF-8/control/NUL bytes. None of these cached values proves fresh command
+reconciliation, continued User classification or provider eligibility.
+
+Both store and readonly reader implement `AccountMetadataReader`. Known accounts
+may legitimately have no email; another requested account returns None without
+provisioning. Upgrade bindings contain the bounded immutable subject and reject
+unreadable/foreign identity rows or missing/invalid subject, rather than claiming
+unknown account. A missing identity is valid interrupted registration; a supplied
+History fence still requires an actual matching identity. Legacy readonly v1/v2
+return ReadOnly capability and Unknown provider state/catalog without migration.
+A reader held over a legitimate writer migration uses one coherent version in
+its new read transaction, or fails closed.
+
+The new readonly cached/profile/binding entrypoints strengthen the previous
+constructor-only file boundary: a narrow helper locks once, checks the retained
+main/WAL/SHM identities and modes plus held-main movement, disables/verifies
+checkpoint-on-close and confirms readonly connection authority, then validates
+canonical ownership/singleton metadata and readonly health flags in a deferred
+transaction. It repeats movement/leaf checks after the transaction before
+returning data. It uses Skip health, without repeating full page/FK walks.
+Original constructor checks and all legacy read methods are unchanged. These are
+observable pre/post checks, not continuous filesystem custody: same-user
+swap-and-restore races can remain undetected, and SQLite/VFS sidecar bookkeeping
+residuals from the constructor still apply. The helper does not migrate, create,
+checkpoint, repair permissions or return a cached success after observed drift.
+
+SQLCipher tests cover attempted-write and deferred-commit rollback (including
+snapshot pruning), predecessor/identity/owner refusal, preserved committed prefix,
+Irrelevant-to-pinned/cached races, deterministic retention with seeded pending and
+undo pins, Missing versus snapshot omission, the full 1,000-target record path,
+500-label catalog and 512-membership successful bounds, malformed/overflow/orphan
+reads, readonly v1/v2/v3 no-write reads and migration coexistence, new read-time
+main/sidecar refusals, and damaged-body/unrelated-membership noninterference.
+They make no live provider, runtime, recovery-coordinator or P5c completion claim.

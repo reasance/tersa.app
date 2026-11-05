@@ -12,8 +12,14 @@
 
 #![deny(unsafe_code)]
 
+mod cached;
 mod credentials;
+mod history_store;
+mod pins;
 mod schema_v3;
+
+#[doc(inline)]
+pub use cached::{CachedProviderMessage, CachedProviderState};
 
 #[doc(inline)]
 pub use credentials::{CredentialSnapshot, CredentialStoreError, StoreCredential};
@@ -115,8 +121,8 @@ mod store {
 
     /// Stores one account's mailbox in one `SQLCipher` database file.
     pub struct SqlCipherMailboxStore {
-        account: AccountId,
-        connection: Mutex<Connection>,
+        pub(super) account: AccountId,
+        pub(super) connection: Mutex<Connection>,
         #[cfg(test)]
         fail_next_mutation: Mutex<Option<usize>>,
     }
@@ -185,8 +191,10 @@ mod store {
     /// require_store::<SqlCipherMailboxReader>();
     /// ```
     pub struct SqlCipherMailboxReader {
-        account: AccountId,
+        pub(super) account: AccountId,
         connection: Mutex<Connection>,
+        path: PathBuf,
+        identities: ReadOnlyFileIdentities,
     }
 
     impl fmt::Debug for SqlCipherMailboxReader {
@@ -275,10 +283,56 @@ mod store {
                 Ok(Self {
                     account,
                     connection: Mutex::new(connection),
+                    path: canonical_path,
+                    identities,
                 })
             })();
             key.0.zeroize();
             outcome.map_err(mailbox_open_error)
+        }
+
+        pub(super) fn with_cached_read_transaction<T>(
+            &self,
+            operation: impl FnOnce(
+                &Transaction<'_>,
+                i64,
+            )
+                -> Result<T, tersa_application::mailbox_state::TriageStoreError>,
+        ) -> Result<T, tersa_application::mailbox_state::TriageStoreError> {
+            use tersa_application::mailbox_state::TriageStoreError as Error;
+            let mut connection = self.connection.lock().map_err(|_error| Error::Storage)?;
+            let check = || -> Result<(), Error> {
+                disable_and_verify_checkpoint_on_close(&connection)
+                    .map_err(|kind| crate::cached::mailbox_error(mailbox_open_error(kind)))?;
+                opened_file_has_moved(&connection)
+                    .map_err(|kind| crate::cached::mailbox_error(mailbox_open_error(kind)))?;
+                verify_read_only_file_identities(&self.path, self.identities)
+                    .map_err(|kind| crate::cached::mailbox_error(mailbox_open_error(kind)))?;
+                if !connection
+                    .is_readonly("main")
+                    .map_err(crate::cached::sql_error)?
+                {
+                    return Err(Error::Corrupt);
+                }
+                Ok(())
+            };
+            check()?;
+            let outcome = (|| {
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Deferred)
+                    .map_err(crate::cached::sql_error)?;
+                let version = triage_version(&transaction, &self.account)?;
+                validate_health(&transaction, IntegrityScan::Skip)
+                    .map_err(|kind| crate::cached::mailbox_error(mailbox_open_error(kind)))?;
+                let result = operation(&transaction, version)?;
+                transaction.commit().map_err(crate::cached::sql_error)?;
+                Ok(result)
+            })();
+            opened_file_has_moved(&connection)
+                .map_err(|kind| crate::cached::mailbox_error(mailbox_open_error(kind)))?;
+            verify_read_only_file_identities(&self.path, self.identities)
+                .map_err(|kind| crate::cached::mailbox_error(mailbox_open_error(kind)))?;
+            outcome
         }
 
         /// Reads a validated address from an authenticated read-only account.
@@ -749,6 +803,36 @@ mod store {
                 .lock()
                 .map_err(|_poison| MailboxStoreError::Storage)?;
             operation(&mut connection)
+        }
+
+        /// Atomically replaces a complete identity-bound catalog without changing message membership.
+        /// # Errors
+        /// Rejects a foreign owner/catalog, stale identity, corrupt prior catalog or storage failure.
+        pub fn replace_cached_label_catalog(
+            &self,
+            fence: &tersa_application::profile::AccountFence,
+            value: &tersa_domain::label::LabelCatalog,
+        ) -> Result<(), tersa_application::mailbox_state::TriageStoreError> {
+            crate::cached::replace_catalog(self, fence, value)
+        }
+
+        pub(super) fn with_cached_read_transaction<T>(
+            &self,
+            operation: impl FnOnce(
+                &Transaction<'_>,
+                i64,
+            )
+                -> Result<T, tersa_application::mailbox_state::TriageStoreError>,
+        ) -> Result<T, tersa_application::mailbox_state::TriageStoreError> {
+            use tersa_application::mailbox_state::TriageStoreError as Error;
+            let mut connection = self.connection.lock().map_err(|_error| Error::Storage)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(crate::cached::sql_error)?;
+            let version = triage_version(&transaction, &self.account)?;
+            let result = operation(&transaction, version)?;
+            transaction.commit().map_err(crate::cached::sql_error)?;
+            Ok(result)
         }
 
         /// Loads one consistent, bounded owning-account credential snapshot.
@@ -3232,7 +3316,7 @@ mod store {
         }
     }
 
-    fn write_envelope(
+    pub(super) fn write_envelope(
         transaction: &Transaction<'_>,
         envelope: &MessageEnvelope,
         content: Option<&[u8]>,
@@ -3497,6 +3581,22 @@ mod store {
         }
         schema_v3::validate_metadata(connection, user_version).map_err(classify_open)?;
         Ok(false)
+    }
+
+    pub(super) fn triage_version(
+        connection: &Connection,
+        account: &AccountId,
+    ) -> Result<i64, tersa_application::mailbox_state::TriageStoreError> {
+        use tersa_application::mailbox_state::TriageStoreError as Error;
+        if validate_identity(connection, account).map_err(|kind| match kind {
+            OpenFailure::Corrupted => Error::Corrupt,
+            OpenFailure::Storage => Error::Storage,
+        })? {
+            return Err(Error::Corrupt);
+        }
+        connection
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(crate::cached::sql_error)
     }
 
     fn configure_owned_storage(connection: &Connection) -> Result<(), OpenFailure> {
@@ -3852,6 +3952,7 @@ mod store {
         use super::*;
 
         include!("p5a_tests.rs");
+        include!("p5b_tests.rs");
 
         static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
