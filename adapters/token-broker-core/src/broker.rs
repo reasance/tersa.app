@@ -44,6 +44,10 @@ use crate::ports::{RefreshTokenStore, SessionHandleEntropy};
 use crate::registry::SessionRegistry;
 use crate::subject::ValidatedSubject;
 
+mod capability;
+#[doc(inline)]
+pub use capability::{AuthorizationIntent, CapabilityBrokerToken};
+
 // Rust guideline compliant 1.0.
 
 /// The only accepted redirect prefix: plain HTTP on the literal dotted-quad
@@ -827,7 +831,8 @@ fn map_oauth_error(error: OAuthError) -> BrokerError {
         OAuthError::ProviderRejected => BrokerError::ProviderRejected,
         OAuthError::InsufficientScope => BrokerError::InsufficientScope,
         OAuthError::Expired | OAuthError::AlreadyConsumed => BrokerError::SessionUnknown,
-        OAuthError::MissingParameter(_)
+        OAuthError::InvalidScopeEvidence
+        | OAuthError::MissingParameter(_)
         | OAuthError::DuplicateParameter
         | OAuthError::ConflictingCallback
         | OAuthError::RedirectMismatch
@@ -856,6 +861,8 @@ fn map_token_error(error: TokenError) -> BrokerError {
         TokenError::InsufficientScope => BrokerError::InsufficientScope,
         TokenError::ConsentRevoked => BrokerError::ConsentRevoked,
         TokenError::IdentityUnverified => BrokerError::IdentityUnverified,
+        TokenError::IdentityMismatch => BrokerError::IdentityMismatch,
+        TokenError::ScopeEvidenceUnavailable => BrokerError::ScopeEvidenceUnavailable,
         // Any future variant fails closed as an internal failure.
         _ => BrokerError::Unavailable,
     }
@@ -867,6 +874,8 @@ mod tests {
         clippy::unwrap_used,
         reason = "test fixtures use static URLs and assert setup success before behavior"
     )]
+
+    mod capability_tests;
 
     use std::collections::{HashMap, VecDeque};
     use std::fmt;
@@ -1047,6 +1056,8 @@ mod tests {
         rotated_refresh_token: Option<Zeroizing<String>>,
         id_token_claims: Option<IdTokenClaims>,
         gmail_read_granted: bool,
+        scope_evidence: Option<tersa_application::scope::ScopeEvidence>,
+        exchange_gate: Option<Arc<AtomicBool>>,
         revoke_error: Option<TokenTransportError>,
         revoke_script: Arc<Mutex<VecDeque<Result<(), TokenTransportError>>>>,
         refresh_error: Option<TokenTransportError>,
@@ -1067,6 +1078,8 @@ mod tests {
                     .map(|token| Zeroizing::new(token.to_owned())),
                 id_token_claims: Some(valid_claims()),
                 gmail_read_granted: true,
+                scope_evidence: None,
+                exchange_gate: None,
                 revoke_error: None,
                 revoke_script: Arc::new(Mutex::new(VecDeque::new())),
                 refresh_error: None,
@@ -1138,6 +1151,15 @@ mod tests {
         }
 
         fn response(&self) -> TokenResponse {
+            if let Some(evidence) = self.scope_evidence {
+                return TokenResponse::with_scope_evidence(
+                    self.access_token.clone(),
+                    self.expires_in,
+                    self.rotated_refresh_token.clone(),
+                    self.id_token_claims.clone(),
+                    evidence,
+                );
+            }
             TokenResponse::new(
                 self.access_token.clone(),
                 self.expires_in,
@@ -1185,6 +1207,16 @@ mod tests {
             Box::pin(async move {
                 self.events.lock().unwrap().push(Event::Exchange);
                 self.recorded.lock().unwrap().push(request);
+                if let Some(gate) = &self.exchange_gate {
+                    std::future::poll_fn(|_cx| {
+                        if gate.load(Ordering::Relaxed) {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
                 if let Some(error) = self.exchange_error {
                     return Err(error);
                 }
