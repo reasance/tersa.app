@@ -1,13 +1,18 @@
 # T4 execution plan
 
-Status: **T4 prerequisite contract; source implementation pending**.
-Contract date: 2026-11-04. Baseline:
+Status: **source delivered on candidate `771bacbf19766ffa3d4cbb29b981489607283c89`; T4 is not complete**.
+Tree: `e6caedd32cea7d13309ef356897c12e1a0acef8c`, the same tree as reviewed
+commit `ea594784394067173d24c6123612dcc4d8721add`. Lineage ends at
+[pull request 170](https://github.com/reasance/tersa.app/pull/170).
+Contract date: 2026-11-04. Prerequisite baseline:
 `a00b8257945ce2dcc08f175f91aa314633ab9fca`.
 
-This plan records the T4 prerequisite contract and its implementation order.
-Source slices require reviewed and integrated prerequisites. The lead owns
-decisions, verification and protected-branch integration. Baseline facts and
-future design requirements remain distinct; no T4 behavior is implemented yet.
+This plan records the T4 contract, the order in which it was implemented, and
+the merged slice status. The lead owns decisions, verification and
+protected-branch integration. Live Modify acceptance has not been run. The
+[protocol](t4-live-acceptance-protocol.md) and
+[report](t4-live-acceptance-report.md) keep automated proof, source approval,
+CLI/TUI wiring, sampled live observation and release readiness separate.
 
 ## Outcome and scope
 
@@ -28,9 +33,46 @@ T3 acceptance remains delivered under its
 [candidate-bound report](t3-live-acceptance-2026-11-04.md). This plan neither
 reopens that gate nor extends its evidence to T4 provider writes.
 
+## Merged source slices
+
+Every source slice below is merged on the candidate. T4 stays open until the
+live protocol has observations in the report. This documentation slice does
+not add those observations.
+
+| Slice | Merge |
+| --- | --- |
+| P0 docs | [#146](https://github.com/reasance/tersa.app/pull/146) |
+| P1 domain values | [#147](https://github.com/reasance/tersa.app/pull/147) |
+| P2a OAuth and token capability | [#148](https://github.com/reasance/tersa.app/pull/148) |
+| P2b History and command ports | [#149](https://github.com/reasance/tersa.app/pull/149) |
+| P3 token broker | [#150](https://github.com/reasance/tersa.app/pull/150) |
+| P4a History and capability-aware reads | [#151](https://github.com/reasance/tersa.app/pull/151) |
+| P4b closed Modify transport | [#152](https://github.com/reasance/tersa.app/pull/152) |
+| P4 object-boundary fix | [#153](https://github.com/reasance/tersa.app/pull/153) |
+| P5a schema v3 | [#155](https://github.com/reasance/tersa.app/pull/155) |
+| P5b History persistence | [#156](https://github.com/reasance/tersa.app/pull/156) |
+| P5c durable commands and conditional undo | [#157](https://github.com/reasance/tersa.app/pull/157) |
+| P6a History coordinator | [#158](https://github.com/reasance/tersa.app/pull/158) |
+| P6b command coordinator | [#159](https://github.com/reasance/tersa.app/pull/159) |
+| P7a capability grants and sessions | [#162](https://github.com/reasance/tersa.app/pull/162) |
+| P7b History and command composition | [#166](https://github.com/reasance/tersa.app/pull/166) |
+| P7 undo admission binding | [#169](https://github.com/reasance/tersa.app/pull/169) |
+| P8 presentation documents | [#167](https://github.com/reasance/tersa.app/pull/167) |
+| P9a runtime views and account controls | [#168](https://github.com/reasance/tersa.app/pull/168) |
+| P9b triage and recovery controls | [#170](https://github.com/reasance/tersa.app/pull/170) |
+
+Supporting merges on the same lineage, outside the original slice names:
+[#154](https://github.com/reasance/tersa.app/pull/154) mismatched-binding fixture,
+[#160](https://github.com/reasance/tersa.app/pull/160) existing-store scan policy,
+[#161](https://github.com/reasance/tersa.app/pull/161) and
+[#163](https://github.com/reasance/tersa.app/pull/163) reset CLI fixtures,
+[#164](https://github.com/reasance/tersa.app/pull/164) mailbox value reexports,
+and [#165](https://github.com/reasance/tersa.app/pull/165) cached triage reads.
+
 ## Baseline implementation constraints
 
-The code inventory for the baseline establishes these implementation facts:
+The code inventory for baseline `a00b825` establishes these historical facts.
+It is not the candidate's implemented surface.
 
 | Surface | Existing owner and constraint |
 | --- | --- |
@@ -80,8 +122,8 @@ choose local recovery, checkpoint or undo policy.
 
 ## T4 prerequisite contract
 
-This prerequisite contract defines the source implementation requirements.
-Source implementation and live acceptance remain pending. The detailed contract is
+This contract is the semantics implemented on the candidate above. Live
+acceptance has not been run. The detailed contract is
 [ADR 0027](../architecture/adr-0027-gmail-modify-history-and-mailbox-commands.md#t4-prerequisite-contract);
 [ADR 0017](../architecture/adr-0017-production-account-store.md#t4-account-schema-v3-prerequisite-contract)
 owns schema/transaction policy and the security documents record custody and
@@ -116,7 +158,10 @@ implementers. The selected budgets do not add a tool, dependency or CI job.
 
 ## Ordered implementation slices
 
-These are implementation slices, not dispatch authorization. Each slice owns
+The rows below are the implementation order and ownership contract. Their exit
+text is the check that applied to that slice. Merged status is in
+[Merged source slices](#merged-source-slices). These rows are not dispatch
+authorization. Each slice owns
 exactly one [change class](agent-playbook.md); files named below are existing
 touchpoints or explicitly planned new modules. The implementer owns only that
 row's paths. The lead freezes dependencies and acceptance checks before dispatch.
@@ -145,7 +190,7 @@ P6 supplies `HistorySync` and `MailboxCommandCoordinator` over those ports.
 | P7 / `adapter-rust` | Only `adapters/sync-runtime/**`: `flows.rs`, `installation.rs`, `session.rs`, `session_cache.rs`, `gate.rs`, `cache_reset.rs` and focused new modules. Compose upgrade, process-local generation, stores/transports, serialization, restart reconciliation and lifecycle guards. | P3/P4/P5c/P6b; capability and account remain bound across refresh, restart and recovery; no UI bypass or unsafe read-retry reuse for writes. | `cargo xtask preflight adapter --package tersa-sync-runtime` |
 | P8 / `presentation` | Only `crates/presentation/**`: sanitized capability/action/recovery documents and bounded closed display statuses. | P1/P2/P6b; pending projection and authoritative state remain distinguishable; provider strings enter `SafeText`. | `cargo xtask preflight presentation` |
 | P9 / `tui` | Only `apps/**`: `commands.rs`, `cli.rs` if required, `tui/{app,mod,worker,view}.rs`. Explicit upgrade, account-partitioned actions, batches, labels, Retry/Abandon with uncertainty/duplicate-risk confirmations, pending recovery and offline conditional undo with pre-dispatch validation. | P7/P8; preserve account routing/view generations and owned shutdown; all writes pass through the coordinator. Offline intent survives reopen and converges through the runtime. | `cargo xtask preflight tui` |
-| P10 / `docs-only` | This plan, roadmap/source-delivery status and a candidate-bound T4 acceptance protocol/report under `docs/development/`. | Reviewed source candidate; document automated results separately from authorized macOS provider observations. Protocol can precede the run; results follow observations only. | Documentation checks as P0. |
+| P10 / `docs-only` | This plan, roadmap/source-delivery status and a candidate-bound T4 acceptance protocol/report under `docs/development/`. | Reviewed source candidate; document automated results separately from authorized macOS provider observations. Protocol precedes the run. The current report records every live case as not run. | Documentation checks as P0. |
 
 P4 and P5 do not depend on each other's concrete implementation. P6 uses ports,
 not adapter imports; its placement after storage makes transaction assumptions
@@ -212,9 +257,9 @@ lead's separate protected-branch workflow, not implementer authority.
 
 ## Rollback and non-claims
 
-Before runtime activation, additive contracts leave the existing readonly path
-usable. After migration, reverting code does not restore old-format readability;
-after dispatch, reverting code does not undo provider writes. Owned migration
+ReadOnly accounts keep the readonly command path. After v3 migration,
+reverting code does not restore old-format readability; after dispatch,
+reverting code does not undo provider writes. Owned migration
 failures roll back atomically; v3 stores stay preserved on old-binary refusal.
 Stop further dispatch on unresolved recovery rather than pretend code rollback
 compensates provider state.
@@ -234,21 +279,23 @@ readiness, Linux consent acceptance or T5-T8 completion.
 
 ## Separate live acceptance
 
-Automated source delivery and live acceptance are separate records. After source
-checks and independent review, the lead must select a frozen candidate and obtain
-explicit authorization for the account, message/label targets and concrete actions
-before any live modify call. This document authorizes no mailbox mutation.
+Automated source delivery and live acceptance are separate records. The frozen
+candidate is the commit and tree at the top of this plan. Live Modify calls
+still require the user's account, message, label and OAuth selections in the
+[protocol](t4-live-acceptance-protocol.md). This document authorizes no mailbox
+mutation.
 
-The planned macOS acceptance protocol should demonstrate same-account capability
-upgrade, an approved command followed by History convergence, and offline intent
-surviving reopen and reconciling after reconnect. Include approved undo and
-multi-account routing observations where applicable; record selections and limits
-without publishing account identities or message content. Denied consent,
-malformed responses, expired History, ambiguous transport and crash ordering stay
-primarily under deterministic fixtures; do not induce arbitrary failures in a real
-mailbox to manufacture evidence.
+The protocol covers same-account ReadOnly-to-Modify upgrade, an allowed command
+followed by observed reconciliation, label create/rename/apply/remove/delete,
+conditional Undo, queued cancel, recovery and Abandon where a real command
+already exists, TUI use, restart and process-local offline intent, bounded
+History progress and stale views. Record aliases and redacted status only.
+Denied consent, malformed responses, expired History, ambiguous transport and
+crash ordering stay under deterministic fixtures. Do not induce those failures
+in a real mailbox.
 
-P10 records exact candidate/check results, observed versus unexercised cases and
-redacted evidence. Offline/fake/CI success cannot stand in for provider writes;
-T3 observations cannot close T4 acceptance. macOS T4 evidence does not certify
-Linux consent, packaging or release readiness.
+The [report](t4-live-acceptance-report.md) records the candidate checks and
+lists every live case as not run. It contains no live observations. Offline,
+fake and CI success do not stand in for provider writes. T3 observations do
+not close T4 acceptance. macOS T4 evidence would not certify Linux consent,
+packaging or release readiness.

@@ -6,29 +6,29 @@ one at https://mozilla.org/MPL/2.0/.
 
 # ADR 0027: Gmail modify, History, and mailbox commands
 
-- Status: T4 prerequisite contract; source implementation pending
+- Status: implemented on candidate `771bacbf19766ffa3d4cbb29b981489607283c89` (tree `e6caedd32cea7d13309ef356897c12e1a0acef8c`); live Modify acceptance has not been run; T4 is not complete
 - Amended by: [ADR 0031](adr-0031-tui-only-pivot.md) (terminal-only pivot)
 - Date: 2026-08-29
 - T4 prerequisite contract: 2026-11-04
 
 ## Implementation status and accepted boundary
 
-History, Modify capability and mailbox commands are future T4 work. At baseline
-`a00b825`, OAuth is fixed to ReadOnly, `GmailMailbox` is GET-only, account schema
-is v2, and no History/command store or coordinator exists. The current profile
-contains an email address; `application::identity::AccountProfile` is a validated
-subject trait, not the future persisted profile value. Preserve that trait and
-existing readonly APIs during additive staging.
+History, Modify capability and the closed mailbox-command set are implemented
+in the candidate above. Baseline `a00b825` had fixed ReadOnly OAuth, a GET-only
+`GmailMailbox`, account schema v2, and no History or command store. That
+baseline is historical. `application::identity::AccountProfile` remains a
+validated subject trait. Persisted capability and email are store fields and
+do not replace that trait. ReadOnly accounts keep the readonly path.
 
-The accepted requirements remain: official Gmail API access, broker-only token
+The implemented requirements are: official Gmail API access, broker-only token
 custody, account-local encrypted persistence, transactional History/cursor
 application, durable desired state before dispatch, per-message reconciliation
 of ambiguous batches, bounded sanitized status and the closed triage command
-set. The detailed prerequisite contract below defines implementation semantics;
-it is not evidence of source delivery or live acceptance.
-See the [execution plan](../development/t4-execution-plan.md) for one-class
-slices and test ownership. Source work requires reviewed and integrated
-prerequisites; the contract alone does not deliver T4 behavior.
+set. The contract below is that implemented behavior. It is not live Gmail
+Modify acceptance.
+See the [execution plan](../development/t4-execution-plan.md) for slice merges
+and the [live protocol](../development/t4-live-acceptance-protocol.md) for the
+unrun provider gate.
 
 The closed command set is read/unread, star/unstar, archive, trash/restore,
 spam/clear spam, user-label create/rename/delete/apply/remove, and account-local
@@ -39,9 +39,9 @@ T4 does not promise lossless full-mailbox synchronization.
 
 ## T4 prerequisite contract
 
-This section defines the T4 prerequisite design; source implementation and live
-acceptance are pending. Provider facts constrain the design but do not guarantee
-local atomicity, label-create idempotency or read-after-write consistency.
+This section is the contract implemented on the candidate. Live acceptance has
+not been run. Provider facts still do not guarantee local atomicity,
+label-create idempotency or read-after-write consistency.
 
 ### Capability and grant custody
 
@@ -366,7 +366,8 @@ membership while retaining registration, capability, grant, identity and
 disconnect recovery. Guarded removal/purge deletes all T4 account rows in the
 existing account-local transaction. Identity mismatch/replacement likewise
 refuses destructive change while nonterminal evidence exists, preserving a
-recoverable state. These are future T4 guards, not baseline reset behavior.
+recoverable state. These guards are implemented in the v3 store and the
+existing-only reset path. They were not v2 reset behavior.
 
 ## Test and evidence gates
 
@@ -386,22 +387,28 @@ equality before dispatch and no writes on any mismatch. Preserve
 readonly behavior during additive staging; no fake atomic defaults or duplicate
 implementation-mirroring tests.
 
-Use scoped preflights while editing, full `cargo xtask verify` at source slice
-boundaries and before independent review, with no new CI job/tool/dependency
-implied. Separately authorized exact-candidate macOS evidence must demonstrate
-same-account upgrade, command/History convergence and offline intent after
-reconnect. Fixtures do not prove provider writes, keyring behavior or release
-acceptance. T3 acceptance remains unchanged.
+Scoped preflights applied while editing, and full `cargo xtask verify` applied
+at source slice boundaries and before independent review, with no new CI
+job, tool or dependency. The candidate's recorded results are in the
+[acceptance report](../development/t4-live-acceptance-report.md). Separately
+authorized macOS evidence, specified in the
+[live protocol](../development/t4-live-acceptance-protocol.md), still has to
+demonstrate same-account upgrade, command/History convergence and offline
+intent after reconnect. That run has not happened. Fixtures do not prove
+provider writes, keyring behavior or release acceptance. T3 acceptance remains
+unchanged.
 
 ## Non-claims and consequences
 
-The prerequisite contract implements no ports, migration, command or provider
-write and claims no Google verification, full-mailbox replay,
-secure erasure, app lock or release readiness. Unknown schemas remain preserved;
-old binaries cannot read v3 and no implicit downgrade/reset/quarantine exists.
-Stranded under-scoped grants, same-user token/key co-residence, grant-wide
-revocation effects and the filesystem residuals in ADRs 0017/0024/0031 remain.
+The candidate implements the ports, v3 migration, durable commands and closed
+Modify transport covered by automated fixtures and CLI/TUI wiring. It claims
+no live Google verification, full-mailbox replay, secure erasure, app lock or
+release readiness. Unknown schemas remain preserved; old binaries cannot read
+v3 and no implicit downgrade/reset/quarantine exists. Stranded under-scoped
+grants, same-user token/key co-residence, grant-wide revocation effects and
+the filesystem residuals in ADRs 0017/0024/0031 remain.
 
-T4's planned result is account-scoped recoverable desired state with Gmail as
-authority after reconciliation, rather than ad-hoc UI writes. The bounded
-protocol can require visible recovery instead of silently discarding work.
+The delivered source result is account-scoped recoverable desired state with
+Gmail as authority after reconciliation. The bounded recovery path keeps
+unresolved work visible. Live exercise of that path is recorded only in the
+acceptance report, which currently has no observations.

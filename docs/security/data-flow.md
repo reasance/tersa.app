@@ -9,11 +9,13 @@ candidate `06a7e0f`; see the [redacted report](../development/t3-live-acceptance
 That acceptance is not exhaustive security proof or release readiness; live
 cache reset remains untested.
 
-T4 prerequisite details in
+T4 details in
 [ADR 0027](../architecture/adr-0027-gmail-modify-history-and-mailbox-commands.md)
-and the [execution plan](../development/t4-execution-plan.md) define the **T4
-prerequisite contract; source implementation pending**. They do not change any
-flow's implemented status or authorize live writes.
+and the [execution plan](../development/t4-execution-plan.md) describe source
+implemented on candidate `771bacb`. The
+[live report](../development/t4-live-acceptance-report.md) has no Modify
+observations. Implemented below means source and automated coverage. It does
+not authorize live writes or close T4.
 
 ## End-to-end flow
 
@@ -40,17 +42,17 @@ flowchart LR
 | Flow | Data | Controls | Status |
 |---|---|---|---|
 | OAuth | Client ID/secret from user config, PKCE verifier, state, code, tokens | Loopback redirect, exact state check, PKCE S256, `id_token` audience/issuer/subject validation, identity gate | Implemented: PKCE, token lifecycle, identity gate (`tersa-application`), in-process token service (`tersa-token-broker-core`), IPv4 loopback listener and account flows (`tersa-sync-runtime`) |
-| Gmail sync | Account-scoped IDs, headers, bounded raw bodies | Official Gmail REST API, identity gate, bounded pages/bodies, independent workers and status | Implemented: automatic startup/5-minute sync for every account; Ctrl-R follows the selected All/single-account view; opened bodies download on demand. History sync and mutations remain planned (T4) |
+| Gmail sync | Account-scoped IDs, headers, bounded raw bodies, History pages, closed label patches | Official Gmail REST API, identity gate, bounded pages/bodies, independent workers and status, separate Modify transport | Implemented: automatic startup/5-minute sync for every account; Ctrl-R follows the selected All/single-account view; opened bodies download on demand. `tersa sync` runs one bounded History cycle and, when pending commands exist, one command pass. Live provider convergence is not accepted |
 | Key hierarchy | Root key, HKDF-derived registry/account/dedup keys | OS keyring or Argon2id + XChaCha20-Poly1305 wrapped slot; owner-only, no-follow key file; zeroization | Implemented in `tersa-keys` and `tersa-vault`, used by `tersa` |
-| Structured storage | Account-local envelopes, bodies, subject, refresh token, address, identity and freshness; registry of `(AccountId, dedup tag, position)` | Per-account SQLCipher/key, separate SQLCipher registry, exact schema validation, owner-only modes | Implemented (`tersa-store-sqlcipher`, used by `tersa-sync-runtime`); drafts/pending actions remain planned |
-| Unified reading | Rows carrying `(AccountId, MessageId)`, per-account continuations and opaque unavailable states | Application query caps global pages at 200; deterministic merge; fresh scoped queries and stale-result rejection on view change | Implemented: All/single-account inbox via Tab / Shift-Tab; search filters loaded sanitized rows in memory, not FTS |
+| Structured storage | Account-local envelopes, bodies, subject, refresh token, capability, address, identity, freshness, History cursor, labels, command evidence and one undo candidate; registry of `(AccountId, dedup tag, position)` | Per-account SQLCipher/key, separate SQLCipher registry, exact schema validation, owner-only modes, v3 migration in one writer transaction | Implemented (`tersa-store-sqlcipher`, used by `tersa-sync-runtime`). Drafts remain planned |
+| Unified reading | Rows carrying `(AccountId, MessageId)`, per-account continuations and opaque unavailable states | Each merged query page returns at most 200 rows; a 200-row page reads at most 201 rows from each ready account. Deterministic merge; fresh scoped queries and stale-result rejection on view change | Implemented: All/single-account inbox via Tab / Shift-Tab; search filters loaded sanitized rows in memory, not FTS. A page of 200 is not a total-view truncation |
 | Cache-only reset | One account's cached envelopes/bodies and sync freshness | Existing-only readonly preview, exact resolution, explicit confirmation/`--yes`, held installation lock, transactional clear then normal same-account sync | Implemented: `tersa account reset <account> [--yes]`; pre-clear refusal and committed-clear/sync-failure outcomes are distinct |
 | Display | Headers, bodies, labels, filenames | Sanitizer strips control and bidi characters; HTML to text with limits; no remote fetch | Implemented: `tersa inbox` and the full-screen interface (T2b) display only `SafeText`; MIME decoding and a linear HTML-to-text converter (T2a); search runs in memory over sanitized rows and never leaves the process (T2c) |
 | Composition | Draft plaintext | `$EDITOR` on an owner-only temp file removed afterwards; local-first draft in SQLCipher | Planned (T5) |
 | Attachments | Attachment bytes | On-demand fetch, size limits, sanitized names, saved only on request, never auto-opened | Planned (T5–T6) |
 | Logs | Counts, durations, error classes | No content, addresses, queries, tokens, or stable IDs | Redacted error types implemented |
-| Capability upgrade | Selected account/expected immutable subject, requested capability, replacement credential | Broker validation; atomic token/capability persistence; account permit, generation fence and cached-session invalidation | T4 prerequisite contract; source implementation pending |
-| History and triage | Account-local cursors, observed labels, desired patches, target IDs and recovery evidence | Bounded reads; record-atomic cursor/data commits; durable pre-dispatch marker; per-item observation and closed sanitized status | T4 prerequisite contract; source implementation pending |
+| Capability upgrade | Selected account/expected immutable subject, requested capability, replacement credential | Broker validation; atomic token/capability persistence; account permit, generation fence and cached-session invalidation. The external browser launcher keeps at most five child handles, reaps them without blocking, and does not kill or wait on account cancellation. It does not own browser descendants | Implemented in source. `account add` requests ReadOnly. Upgrade and reconnect are explicit. Live consent for Modify has not been accepted |
+| History and triage | Account-local cursors, observed labels, desired patches, target IDs and recovery evidence | Bounded reads; record-atomic cursor/data commits; durable pre-dispatch marker; per-item observation and closed sanitized status | Implemented in source for the closed command set, user-label create/rename/delete/apply/remove, conditional Undo, queued cancel, and warned Abandon. Live Modify acceptance has not been run |
 
 ## Cache reset boundary
 
@@ -68,12 +70,16 @@ export or create-capable installation reopen. Generic store openers are not a
 readonly capability and are excluded from preview. The existing-only clear
 commits and drops its connection before the normal sync opens a writer.
 
-Clear preserves account identity, subject, token, address, recovery metadata,
+Clear preserves account identity, subject, token, capability, address, recovery metadata,
 registry and keys; sync follows ordinary token rotation/revocation rules.
-Pre-clear failure leaves cached mail intact. Post-clear sync failure is a
-nonzero outcome that reports the committed clear and possible partial new
-cache. This is logical cache deletion, not secure erasure, full-mailbox
-restoration or the deferred incompatible-schema/new-ID/quarantine protocol in
+A nonterminal command, including Queued, refuses the clear and leaves the cache
+intact. A successful clear also removes the History cursor, terminal summaries,
+undo state, and cached provider membership. Pre-clear failure leaves cached mail
+intact. Post-clear sync failure is a nonzero outcome that reports the committed
+clear and possible partial new cache. The CLI then attempts one History cycle
+and reports a follow-up failure the same way. This is logical cache deletion,
+not secure erasure, full-mailbox restoration or the deferred
+incompatible-schema/new-ID/quarantine protocol in
 [ADR 0026](../architecture/adr-0026-multi-account-and-unified-mailbox.md).
 
 ## Account worker shutdown
@@ -87,8 +93,8 @@ finish detached with no store state, retaining the existing DNS exception.
 
 ## T4 flow and custody
 
-This section records the T4 prerequisite design; source implementation and live
-acceptance remain pending. Broker custody, account-local keys and sanitized terminal
+This section records the implemented T4 flow. Live acceptance has not been run.
+Broker custody, account-local keys and sanitized terminal
 models remain the boundaries. No new backend, plaintext index, file, export,
 backup facility or diagnostic payload is introduced.
 
@@ -103,9 +109,12 @@ Account-bound user intent
   -> bounded sanitized status and observed-membership views
 ```
 
-Connect admits only a validated new subject. Selected-account Upgrade/reconnect
+Connect admits only a validated new subject and requests ReadOnly. Selected-account Upgrade/reconnect
 captures account and expected immutable subject before the browser; mismatch
-registers, writes and revokes nothing. Token plus capability change atomically
+registers, writes and revokes nothing. The browser is an external process:
+the launcher keeps at most five child handles, reaps finished launchers without
+blocking, and does not kill or wait when consent finishes or the account task
+is cancelled. It does not own descendants. Token plus capability change atomically
 inside the owning account store. Duplicate Connect cannot overwrite/downgrade a
 grant. Absent scope inherits the immutable requested/stored capability;
 explicit scope insufficiency/mismatch yields no usable access. Refresh never
@@ -158,9 +167,9 @@ TLS/no-redirect/no-proxy, bounded responses and redacted failures remain.
 owns the v1/v2-to-v3 transaction and complete canonical object set. Registry v1
 and identity algorithm 2 stay unchanged. Readonly known-version opens do not
 migrate; old binaries cannot read v3 and cannot trigger implicit reset or
-downgrade. These are future store rules, not a claim that v3 exists.
+downgrade. Schema v3 is the implemented account format.
 
-| Sensitive account-local data | Planned protection and retention |
+| Sensitive account-local data | Protection and retention |
 | --- | --- |
 | Capability, profile/subject and token | Same owning SQLCipher database/key; token/capability atomic replacement; no keys/tokens/raw scopes in terminal documents. Credential generation is process-local, not persisted. |
 | History cursor, labels and observed membership | One complete record/data transaction and its cursor, yielding contiguous progress. Full membership up to 512 IDs or fail closed; catalog up to 500, names 1-1,024 UTF-8 bytes. Keep exact names encrypted; sanitize at display. |
@@ -196,7 +205,9 @@ identity or persisting partial evidence.
 Provider state, legacy local-read display and pending projection are distinct.
 Opening a message does not send a mutation. Recent/all-cached stays default;
 Inbox/Trash/Spam/User-label filters use observed membership only within existing
-All/single-account scopes and 200-row global caps. Unknown migrated rows remain
+All/single-account scopes. Each merged query page holds at most 200 rows. A
+200-row page reads at most 201 rows from each ready account. That
+page size is not a cap on the whole view. Unknown migrated rows remain
 readable in Recent with missing metadata disclosed.
 
 Undo uses the last Complete message-state command. At admission only, refuse
@@ -223,8 +234,8 @@ release only after terminal disposition commits. Identity replacement also refus
 destructive change while evidence exists. Guarded cache reset clears cursor,
 terminal summaries, undo and cached membership, preserving registration,
 capability, grant, identity and disconnect recovery. Guarded removal/purge
-deletes all T4 account rows in its account-local transaction. These future guards
-extend, rather than describe, the implemented reset boundary above.
+deletes all T4 account rows in its account-local transaction. These guards
+are the implemented reset and removal behavior described above.
 
 ## Local persistence inventory
 
