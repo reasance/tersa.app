@@ -523,7 +523,7 @@ impl CommandReconciliation {
         })
     }
 }
-fn required_user_label(command: &MailboxCommand) -> Option<&UserLabel> {
+pub(crate) fn required_user_label(command: &MailboxCommand) -> Option<&UserLabel> {
     let desired = match command.kind() {
         MailboxCommandKind::MessageState { desired, .. } => desired,
         MailboxCommandKind::Compensate(batch) => {
@@ -1045,6 +1045,46 @@ pub trait RemoteMailboxCommands: Send + Sync {
         &'a self,
         target: &'a UserLabel,
     ) -> BoxFuture<'a, Result<UserLabelObservation, MetadataReadError>>;
+}
+
+/// Supplies fresh label reads without requiring a Modify writer or Modify session.
+///
+/// P7 may implement this facet over its accepted readonly Gmail reader. Methods
+/// have the same complete-catalog/exact-User-ID contracts as the corresponding
+/// `RemoteMailboxCommands` reads. No cached result or partial catalog is evidence.
+/// Existing command-port implementations forward their reads through this facet.
+pub trait CommandLabelReader: Send + Sync {
+    /// Reads a fresh complete bounded catalog; overflow and read errors fail closed.
+    ///
+    /// # Errors
+    /// Returns a closed metadata failure, never a partial catalog.
+    fn read_label_catalog<'a>(
+        &'a self,
+        account: &'a AccountId,
+    ) -> BoxFuture<'a, Result<LabelCatalog, MetadataReadError>>;
+    /// Reads the exact immutable User ID or establishes its actual absence.
+    ///
+    /// # Errors
+    /// Returns a closed metadata failure, never absence inferred from a read error.
+    fn read_user_label<'a>(
+        &'a self,
+        target: &'a UserLabel,
+    ) -> BoxFuture<'a, Result<UserLabelObservation, MetadataReadError>>;
+}
+
+impl<T: RemoteMailboxCommands + ?Sized> CommandLabelReader for T {
+    fn read_label_catalog<'a>(
+        &'a self,
+        account: &'a AccountId,
+    ) -> BoxFuture<'a, Result<LabelCatalog, MetadataReadError>> {
+        RemoteMailboxCommands::label_catalog(self, account)
+    }
+    fn read_user_label<'a>(
+        &'a self,
+        target: &'a UserLabel,
+    ) -> BoxFuture<'a, Result<UserLabelObservation, MetadataReadError>> {
+        RemoteMailboxCommands::observe_user_label(self, target)
+    }
 }
 
 /// Retains command family without raw intent or compacted item rows.

@@ -12,6 +12,8 @@ pub use tersa_domain::account::AccountCapability;
 
 /// Closed mailbox command transport and durable lifecycle contracts.
 pub mod command;
+/// Offline command intents and bounded fresh reconciliation/guarded dispatch.
+pub mod command_coordinator;
 /// Bounded History, metadata and atomic cursor transaction contracts.
 pub mod history;
 /// Pure bounded History and baseline-first snapshot orchestration.
