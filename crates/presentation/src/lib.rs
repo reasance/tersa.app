@@ -10,5 +10,7 @@
 pub mod html;
 pub mod message;
 pub mod terminal;
+/// Bounded triage documents without action routing or command authority.
+pub mod triage;
 
 // Rust guideline compliant 1.0.
